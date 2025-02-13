@@ -1,9 +1,10 @@
 This code is for my own personal use. I do not have premision to pull information from halotracker.com.
 This bot pulls information from the front end of halotracker.com then takes a screenshot crops and uploads it to discord.
 
-Command prefix = #
+Commands prefix = #
 
-Commands
-#ranked = pulls all basic ranked stats.
-#stats  = pulls all basic halo stats, ranked and casual.
-#help   = gives basic bot information.
+#ranked = pulls all basic ranked stats.    <---->    example #ranked 'gamertag'
+
+#stats  = pulls all basic halo stats, ranked and casual.    <---->    example #stats 'gamertag'
+
+#help   = gives basic bot information.   <---->   example #help
