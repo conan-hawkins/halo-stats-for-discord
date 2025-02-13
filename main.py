@@ -57,7 +57,7 @@ def ranked_com(gamertag):
     pyautogui.press('enter')
     
     # Wait for page to load
-    time.sleep(10)
+    time.sleep(6)
     screen_shot(driver)
 
 #==========================================================#==========================================================
@@ -98,7 +98,7 @@ def stats_com(gamertag):
     pyautogui.press('enter')
     
     # Wait for page to load
-    time.sleep(10)
+    time.sleep(7)
     screen_shot(driver)
 
 #==========================================================#==========================================================
