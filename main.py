@@ -33,9 +33,9 @@ def ranked_com(gamertag):
     # Open the web page 
     driver.get('https://halotracker.com/')
 
-#==========================================================
-# Coockie pop up handling
-#==========================================================
+    #==========================================================
+    # Coockie pop up handling
+    #==========================================================
     # Wait for the cookie banner to appear
     wait = WebDriverWait(driver, 7)
     x = wait.until(EC.presence_of_element_located((By.ID, "qc-cmp2-ui")))
@@ -45,9 +45,9 @@ def ranked_com(gamertag):
     accept_button = driver.find_element(By.CLASS_NAME, "css-47sehv")
     accept_button.click()
 
-#==========================================================
-# Search gammertags and wait for page to load
-#==========================================================
+    #==========================================================
+    # Search gammertags and wait for page to load
+    #==========================================================
     # Find and click the search bar
     search_bar = driver.find_element(By.CLASS_NAME, "search-box__bar")
     search_bar.click() 
@@ -74,9 +74,9 @@ def stats_com(gamertag):
     # Open the web page 
     driver.get('https://halotracker.com/')
 
-#==========================================================
-# Coockie pop up handling
-#==========================================================
+    #==========================================================
+    # Coockie pop up handling
+    #==========================================================
     # Wait for the cookie banner to appear
     wait = WebDriverWait(driver, 7)
     x = wait.until(EC.presence_of_element_located((By.ID, "qc-cmp2-ui")))
@@ -86,9 +86,9 @@ def stats_com(gamertag):
     accept_button = driver.find_element(By.CLASS_NAME, "css-47sehv")
     accept_button.click()
 
-#==========================================================
-# Search gammertags and wait for page to load
-#==========================================================
+    #==========================================================
+    # Search gammertags and wait for page to load
+    #==========================================================
     # Find and click the search bar
     search_bar = driver.find_element(By.CLASS_NAME, "search-box__bar")
     search_bar.click() 
@@ -123,4 +123,4 @@ def screen_shot(driver):
     img_res.save('cropped_example.png')
 
     #Close the browser
-   # driver.quit()
+    driver.quit()
