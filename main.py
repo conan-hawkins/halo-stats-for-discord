@@ -29,7 +29,6 @@ from PIL import Image
 def ranked_com(gamertag):
     # Set up the WebDriver (e.g., Chrome)
     driver = webdriver.Edge()
-
     # Open the web page 
     driver.get('https://halotracker.com/')
 
@@ -39,8 +38,6 @@ def ranked_com(gamertag):
     # Wait for the cookie banner to appear
     wait = WebDriverWait(driver, 7)
     x = wait.until(EC.presence_of_element_located((By.ID, "qc-cmp2-ui")))
-
-
     # Click the cookie
     accept_button = driver.find_element(By.CLASS_NAME, "css-47sehv")
     accept_button.click()
@@ -51,13 +48,12 @@ def ranked_com(gamertag):
     # Find and click the search bar
     search_bar = driver.find_element(By.CLASS_NAME, "search-box__bar")
     search_bar.click() 
-
     # Type 'gamertag' into search bar and press enter key
     pyautogui.typewrite(gamertag, interval=0.000001)
     pyautogui.press('enter')
-    
     # Wait for page to load
     time.sleep(6)
+    # Open screen shot function
     screen_shot(driver)
 
 #==========================================================#==========================================================
@@ -70,7 +66,6 @@ def ranked_com(gamertag):
 def stats_com(gamertag):
     # Set up the WebDriver (e.g., Chrome)
     driver = webdriver.Edge()
-
     # Open the web page 
     driver.get('https://halotracker.com/')
 
@@ -80,8 +75,6 @@ def stats_com(gamertag):
     # Wait for the cookie banner to appear
     wait = WebDriverWait(driver, 7)
     x = wait.until(EC.presence_of_element_located((By.ID, "qc-cmp2-ui")))
-
-
     # Click the cookie
     accept_button = driver.find_element(By.CLASS_NAME, "css-47sehv")
     accept_button.click()
@@ -91,14 +84,19 @@ def stats_com(gamertag):
     #==========================================================
     # Find and click the search bar
     search_bar = driver.find_element(By.CLASS_NAME, "search-box__bar")
-    search_bar.click() 
-
+    search_bar.click()
     # Type 'gamertag' into search bar and press enter key
     pyautogui.typewrite(gamertag, interval=0.000001)
-    pyautogui.press('enter')
+    pyautogui.press('enter')    
+    
+                                                                         # Open overall stats page      
+        # Doesn't work look up how to edit query strings    >>     >>    current_url = driver.current_url[:-6] + "overall" https://halotrackeoverall/  
+        #                                                   >>           print(current_url)
+        #                                                   >>     >>    driver.get(current_url)
     
     # Wait for page to load
     time.sleep(7)
+    # Open screen shot function
     screen_shot(driver)
 
 #==========================================================#==========================================================
