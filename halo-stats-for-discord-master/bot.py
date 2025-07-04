@@ -78,7 +78,7 @@ async def ranked_and_stats(ctx, stat_type, *inputs):
     elif len(inputs) == 4:
         inputs = inputs[0] + " " + inputs[1] + " " + inputs[2] + " " + inputs[3]
     # Exit program and send error message if input merging catches and error
-    else:
+    else: 
         print("ERROR: Number of inputs are invalid")
         exit()
     inputs = ( '-'.join(inputs) ) # turns list into string
