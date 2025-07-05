@@ -1,5 +1,5 @@
 This code is for my own personal use. I do not have premision to pull information from halotracker.com.
-This bot pulls information from the front end of halotracker.com then takes a screenshot crops and uploads it to discord.
+This bot pulls information from the front end of halotracker.com using CSS selectors and uploads it to discord.
 
 Commands prefix = #
 

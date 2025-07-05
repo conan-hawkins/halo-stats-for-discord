@@ -2,15 +2,16 @@ import os
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from main import ranked_com
-from main import stats_com
+from main import StatsFind1
+from datetime import datetime
+import asyncio
 
-# Made by XxUK D3STROYxX 
+# Made by XxUK D3STROYxX
 # 12/02/2025
 #============================================================================#
 #                                                                            #
 # Sets up a discord bot and some basic commands, the commands are mostly     #
-# executed in attached files they are only initiated here                    #
+# executed in attached files they are only initiated and returned here       #
 #                                                                            #
 #============================================================================#
 
@@ -19,7 +20,6 @@ from main import stats_com
 #==========================================================
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-
 #==========================================================
 # Sets intents for the bot = needed for a bot to function
 #==========================================================
@@ -27,46 +27,48 @@ intents = discord.Intents.all()
 intents.members = True
 # set a prefix
 bot = commands.Bot(command_prefix="#", intents=intents) 
+#==========================================================
+# Sets global variables to avoid circular import issues 
+#==========================================================
+global gamertag
+global stat_type
 
 #==========================================================#==========================================================
            
                                 #==========================================================
-                                # Halo stat tracker commands
+                                # Halo stat tracker commands Initialisation 
                                 #==========================================================
 
 #==========================================================#==========================================================
-
-
 #==========================================================
-# makes a stats function that can take multiple inputs
+# makes a stats and a ranked function that passes the 
+# correct stat_type marker into ranked_and_stats function
 #==========================================================
-# sets up command name
-@bot.command(name='stats', help='Use command prefix followed by stats or ranked and gamertag to search. Example - #stats XxUK D3STROYxX')
-# takes one or multiple inputs and combines them into one gamertag format
+# sets up stats and help command
+@bot.command(name='stats', help='Use command prefix followed by stats or ranked and gamertag to search. Example - #stats XxUK D3STROYxX') 
 async def stats(ctx, *inputs):
-    if len(inputs) == 1:
-        pass
-    elif len(inputs) == 2:
-        inputs = inputs[0] + " " + inputs[1]
-    elif len(inputs) == 3:
-        inputs = inputs[0] + " " + inputs[1] + " " + inputs[2]
-    elif len(inputs) == 4:
-        inputs = inputs[0] + " " + inputs[1] + " " + inputs[2] + " " + inputs[3]
-    gamertag = inputs
+    stat_type = "stats" # This is used for path selection later. If stat_type = "stats" do this ect.
+    await ranked_and_stats(ctx, stat_type, *inputs)
 
-# opens the main file and run stats_com function
-    stats_com(gamertag)
-# sends the gamertag and output of the stats_com function
-    await ctx.send(gamertag, file=discord.File("cropped_example.png"))
-
-
-#==========================================================
-# makes a ranked function that can take multiple inputs
-#==========================================================
-# sets up command name
+# sets up ranked command
 @bot.command(name='ranked')
-# takes one or multiple inputs and combines them into one gamertag format
 async def ranked(ctx, *inputs):
+    stat_type = "ranked" # This is used for path selection later. If stat_type = "ranked" do this ect.
+    await ranked_and_stats(ctx, stat_type, *inputs)
+
+#==========================================================#==========================================================
+           
+                                #==========================================================
+                                # Main command functions  
+                                #==========================================================
+
+#==========================================================#==========================================================
+#==========================================================
+# makes a ranked_and_stats function that can run the ranked 
+# or stats commands using the stat_type marker
+#==========================================================
+async def ranked_and_stats(ctx, stat_type, *inputs):
+    # Merge inputs for gamertags with spaces in them
     if len(inputs) == 1:
         pass
     elif len(inputs) == 2:
@@ -75,14 +77,75 @@ async def ranked(ctx, *inputs):
         inputs = inputs[0] + " " + inputs[1] + " " + inputs[2]
     elif len(inputs) == 4:
         inputs = inputs[0] + " " + inputs[1] + " " + inputs[2] + " " + inputs[3]
-    gamertag = inputs
+    # Exit program and send error message if input merging catches and error
+    else: 
+        print("ERROR: Number of inputs are invalid")
+        exit()
+    inputs = ( '-'.join(inputs) ) # turns list into string
+    gamertag = inputs 
+    
+    print("Test point 1", gamertag, stat_type) # !!!==== For testing to be removed later ====!!!
 
-# opens the main file and run ranked_com function
-    ranked_com(gamertag)
-# sends the gamertag and output of the ranked_com function to the discord guild
-    await ctx.send(gamertag, file=discord.File("cropped_example.png"))
+# opens the main file and run page_getter function   
+    StatsFind1.page_getter(gamertag, stat_type)
+    
+    # Makes template for stats command
+    if stat_type == "stats":
+        title = ((gamertag+" - overall stats").upper())
+        embed = discord.Embed(title=title,
+                            colour=0x00b0f4,
+                            timestamp=datetime.now())
+    
+    # Makes template for ranked command
+    else:    
+        title = ((gamertag+" - ranked stats").upper())
+        embed = discord.Embed(title=title,
+                            colour=0xFF0000,
+                            timestamp=datetime.now())
+    print("Test point 4", stat_type) # !!!==== For testing to be removed later ====!!! 
+    # Adds all information retreived in the main file to the template
+    embed.add_field(name="WIN RATE",
+                    value= StatsFind1.stats_list[1],
+                    inline=True)
+    embed.add_field(name="KD RATIO",
+                    value= StatsFind1.stats_list[0],
+                    inline=True)
+    embed.add_field(name="AVG KDA",
+                    value= StatsFind1.stats_list[2],
+                    inline=True)
+    embed.add_field(name="KILLS",
+                    value= StatsFind1.stats_list[4],
+                    inline=True)
+    embed.add_field(name="DEATHS",
+                    value= StatsFind1.stats_list[6],
+                    inline=True)
+    embed.add_field(name="ASSISTS",
+                    value= StatsFind1.stats_list[5],
+                    inline=True)
+    
+    print("Test point 5", stat_type) # !!!==== For testing to be removed later ====!!! 
+    
+    # Adds large image to the template
+    embed.set_image(url="https://gaming-cdn.com/images/products/2674/screenshot/halo-infinite-campaign-pc-xbox-one-game-microsoft-store-wallpaper-2-thumbv2.jpg?v=1732013222")
+
+    # Adds footer with icon to template
+    embed.set_footer(text="Project Goliath",
+                    icon_url="https://www.freeiconspng.com/img/36668")
+    
+    print("Test final before send") # !!!==== For testing to be removed later ====!!!
+    
+    # Sends finished template to discord
+    await ctx.send(embed=embed)
+
+async def main():
+    async with bot:
+        await bot.start(TOKEN)
+
+asyncio.run(main())
 
 """
+Needs to be implemented in the future!!!
+
 #==========================================================
 # event executed when a valid command catches an error
 #==========================================================
