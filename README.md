@@ -9,20 +9,18 @@ Commands prefix = #
 
 #help   = gives basic bot information.   <---->   example #help
 
-#---------------------------------------------------------------------------------------
+
+
+
 Install versions.
-Python 3.11.9           # Won't work with any version of python 3.12+ <-#inclusive
+Python 3.11.9       # Won't work with any version of python 3.12+ <-#inclusive
 
 Main.py
-#------
 pyautogui 0.9.54
 undetected_chromedriver 3.5.5
-# ----- pyvirtualdisplay 3.0
+pyvirtualdisplay 3.0
 selenium 4.34.0
-#------------------------------
+
 bot.py
-#-----
 discord 2.3.2
 dotenv 0.9.9
-#------------------------------
-#---------------------------------------------------------------------------------------
