@@ -56,6 +56,38 @@ async def ranked(ctx, *inputs):
     stat_type = "ranked" # This is used for path selection later. If stat_type = "ranked" do this ect.
     await ranked_and_stats(ctx, stat_type, *inputs)
 
+#==========================================================
+# event executed when a command catches an error
+#==========================================================
+async def on_command_error(ctx, error_no):
+    # The code in this event is executed every time a normal valid or invalid command catches an error.
+    print("Test final before error send") # !!!==== For testing to be removed later ====!!!
+    if error_no == 1: # The use of unauthorised characters detected in input
+         title = (("Error - Use of unauthorised characters detected.").upper())
+    elif error_no == 2: # Player was not found
+        print(404,"was found in main file") # !!!==== For testing to be removed later ====!!!
+        title = (("Error - Player not found. Please check spelling.").upper())
+    elif error_no == 3: # Players profile was set to private
+        print(404,"was found in main file") # !!!==== For testing to be removed later ====!!!
+        title = (("Error - Players profile is set to private.").upper())
+    elif error_no == 4: # Unexpected error in main file
+        print(404,"was found in main file") # !!!==== For testing to be removed later ====!!!
+        title = (("Error - Something unexpected happened.").upper())
+    else:
+        pass
+    
+    embed = discord.Embed(title=title,
+                                colour=0xFF0000,
+                                timestamp=datetime.now())
+    # Adds footer with icon to template
+    embed.set_footer(text="Project Goliath", 
+                     icon_url = 'https://www.iconsdb.com/icons/preview/dark-gray/error-4-xxl.png')
+    
+    print("Test final before error send2") # !!!==== For testing to be removed later ====!!!
+    
+    # Sends finished error message to discord
+    await ctx.send(embed=embed)
+
 #==========================================================#==========================================================
            
                                 #==========================================================
@@ -67,7 +99,19 @@ async def ranked(ctx, *inputs):
 # makes a ranked_and_stats function that can run the ranked 
 # or stats commands using the stat_type marker
 #==========================================================
-async def ranked_and_stats(ctx, stat_type, *inputs):
+async def ranked_and_stats(ctx, stat_type, *inputs): 
+    inputs = ( ''.join(inputs) )
+    
+    '''
+    # Basic input security needs to be updated before wider test hosting.
+    for i in inputs:
+        print(i)
+        if i == '"' or "'" or "\\" or "" or "(" or ")" or "[" or "]" or "{" or "}" or ",":
+            error_no = 1
+            on_command_error(ctx, error_no) # Opens error function
+        else:
+            pass
+    
     # Merge inputs for gamertags with spaces in them
     if len(inputs) == 1:
         pass
@@ -79,16 +123,23 @@ async def ranked_and_stats(ctx, stat_type, *inputs):
         inputs = inputs[0] + " " + inputs[1] + " " + inputs[2] + " " + inputs[3]
     # Exit program and send error message if input merging catches and error
     else: 
-        print("ERROR: Number of inputs are invalid")
-        exit()
-    inputs = ( '-'.join(inputs) ) # turns list into string
-    gamertag = inputs 
+        error_no = 1
+        on_command_error(ctx, error_no) # Opens error function
+    '''
     
+    gamertag = inputs 
     print("Test point 1", gamertag, stat_type) # !!!==== For testing to be removed later ====!!!
 
-# opens the main file and run page_getter function   
+    # opens the main file and run page_getter function   
     StatsFind1.page_getter(gamertag, stat_type)
     
+    # Checks if main file returns error
+    if StatsFind1.error_no != 0:
+        await on_command_error(ctx, StatsFind1.error_no)
+    else:
+        await format_and_send(ctx, stat_type, gamertag)
+
+async def format_and_send(ctx, stat_type, gamertag): 
     # Makes template for stats command
     if stat_type == "stats":
         title = ((gamertag+" - overall stats").upper())
@@ -104,24 +155,30 @@ async def ranked_and_stats(ctx, stat_type, *inputs):
                             timestamp=datetime.now())
     print("Test point 4", stat_type) # !!!==== For testing to be removed later ====!!! 
     # Adds all information retreived in the main file to the template
-    embed.add_field(name="WIN RATE",
-                    value= StatsFind1.stats_list[1],
-                    inline=True)
-    embed.add_field(name="KD RATIO",
-                    value= StatsFind1.stats_list[0],
-                    inline=True)
-    embed.add_field(name="AVG KDA",
-                    value= StatsFind1.stats_list[2],
-                    inline=True)
-    embed.add_field(name="KILLS",
-                    value= StatsFind1.stats_list[4],
-                    inline=True)
-    embed.add_field(name="DEATHS",
-                    value= StatsFind1.stats_list[6],
-                    inline=True)
-    embed.add_field(name="ASSISTS",
-                    value= StatsFind1.stats_list[5],
-                    inline=True)
+    embed.add_field(name="WIN RATE - "+StatsFind1.stats_list[1]+"           KD RATIO - "+StatsFind1.stats_list[0],
+                    value="",
+                    inline=False)
+    embed.add_field(name="AVG KDA  - "+StatsFind1.stats_list[2]+"               KILLS    - "+StatsFind1.stats_list[4],
+                    value="",
+                    inline=False)
+    embed.add_field(name="DEATHS   - "+StatsFind1.stats_list[2]+"                ASSISTS  - "+StatsFind1.stats_list[4],
+                    value="",
+                    inline=False)
+    #embed.add_field(name="KD RATIO",
+    #                value= StatsFind1.stats_list[0],
+    #                inline=True)
+    #embed.add_field(name="AVG KDA",
+    #                value= StatsFind1.stats_list[2],
+    #                inline=True)
+    #embed.add_field(name="KILLS",
+    #                value= StatsFind1.stats_list[4],
+    #                inline=True)
+    #embed.add_field(name="DEATHS",
+    #                value= StatsFind1.stats_list[6],
+    #                inline=True)
+    #embed.add_field(name="ASSISTS",
+    #                value= StatsFind1.stats_list[5],
+    #                inline=True)
     
     print("Test point 5", stat_type) # !!!==== For testing to be removed later ====!!! 
     
@@ -130,7 +187,7 @@ async def ranked_and_stats(ctx, stat_type, *inputs):
 
     # Adds footer with icon to template
     embed.set_footer(text="Project Goliath",
-                    icon_url="https://www.freeiconspng.com/img/36668")
+                    icon_url="https://static.wikia.nocookie.net/halo/images/a/a6/H3_Difficulty_LegendaryIcon.png/revision/latest/scale-to-width-down/150?cb=20160930195427")
     
     print("Test final before send") # !!!==== For testing to be removed later ====!!!
     
@@ -143,18 +200,6 @@ async def main():
 
 asyncio.run(main())
 
-"""
-Needs to be implemented in the future!!!
 
-#==========================================================
-# event executed when a valid command catches an error
-#==========================================================
-#async def on_command_error(self, context: Context, error) -> None:
-    
-    The code in this event is executed every time a normal valid command catches an error.
-
-    :param context: The context of the normal command that failed executing.
-    :param error: The error that has been faced.
-"""
 
 bot.run(TOKEN)
