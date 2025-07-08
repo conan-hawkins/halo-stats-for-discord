@@ -8,7 +8,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
- 
+from pyvirtualdisplay import Display
+
 
 
 # Made by XxUK D3STROYxX 
@@ -37,12 +38,21 @@ class StatsFind:
         self.stats_list = stats_list
         self.stat_type = stat_type
         self.error_no = error_no
+        
     def page_getter(self, gamertag, stat_type):
+        print("Test point 1.0001", gamertag) # !!!==== For testing to be removed later ====!!!
+        display = Display(visible=True, size=(800, 600))
+        print("Test point 1.1", gamertag) # !!!==== For testing to be removed later ====!!!
+        display.start()
+        print("Test point 2", gamertag) # !!!==== For testing to be removed later ====!!!
         options = uc.ChromeOptions()
+        #print("Test point 3", gamertag) # !!!==== For testing to be removed later ====!!!
         #options.add_argument("--headless=new")  # Optional: headless mode
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36")
+        #print("Test point 4", gamertag) # !!!==== For testing to be removed later ====!!!
+        #options.add_argument("--disable-blink-features=AutomationControlled")
+        #options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36")
         driver = uc.Chrome(options=options)
+        
         
         print("Test point 2", gamertag) # !!!==== For testing to be removed later ====!!!
         
@@ -93,7 +103,8 @@ class StatsFind:
             is_button_visible = driver.find_element(By.XPATH, "/html/body/div[2]/div/div[2]/div[3]/div/main/div[3]/h1").is_displayed() # Looks for error message for player not found
             if is_button_visible == True: # if error message 1 is located
                 self.error_no = 2
-                driver.quit()  
+                driver.quit()
+                display.stop()  
             else:
                 pass # if no error message is located                              
         except:
@@ -104,6 +115,7 @@ class StatsFind:
             if is_button_visible2 == True: # if error message 2 is located
                 self.error_no = 3
                 driver.quit()
+                display.stop()
             else:
                 pass # if no error message is located      
         except:
@@ -119,16 +131,17 @@ class StatsFind:
            print("passed111")      
         elif stat_type == "ranked":
             print("passed222")
-            self.stats_getter(driver, gamertag)
+            self.stats_getter(driver, gamertag, display)
         elif stat_type == "stats":
             print("passed333")
             change_tab = driver.find_element(By.XPATH, '//*[@id="app"]/div[2]/div[3]/div/main/div[3]/div[2]/div[1]/div/div/div/ul/li[1]')
             change_tab.click()
             time.sleep(1)
-            self.stats_getter(driver, gamertag)
+            self.stats_getter(driver, gamertag, display)
         else:
             self.error_no = 4
-            driver.quit()
+        driver.quit()
+        display.stop()
     #==========================================================#==========================================================
                 
                                     #==========================================================
@@ -136,7 +149,7 @@ class StatsFind:
                                     #==========================================================
 
     #==========================================================#==========================================================
-    def stats_getter(self, driver, gamertag):
+    def stats_getter(self, driver, gamertag, display):
             # Get all stat values from webpage
             stats = driver.find_elements(By.CSS_SELECTOR, ".stat .numbers .value[data-v-51a9f6a4]") # 92b64b15 = Edge selector
             self.stats_list = []
@@ -146,6 +159,7 @@ class StatsFind:
             print (self.stats_list)
             #Close the browser
             driver.quit()
+            display.stop()
 
 StatsFind1 = StatsFind()
 if __name__ == "__main__":
