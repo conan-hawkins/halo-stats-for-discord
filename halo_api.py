@@ -554,6 +554,15 @@ class HaloAPIClient:
                     stats_data = await response.json()
                     players = stats_data.get('Players', [])
                     
+                    # Extract XUIDs of all players in the match
+                    player_xuids = []
+                    for p in players:
+                        player_id = p.get('PlayerId', '')
+                        # Extract XUID from format: 'xuid(2533274924643541)'
+                        if 'xuid(' in player_id:
+                            xuid_str = player_id.replace('xuid(', '').replace(')', '')
+                            player_xuids.append(xuid_str)
+                    
                     # Find our player's stats
                     for player in players:
                         player_id = player.get('PlayerId', '')
@@ -563,7 +572,30 @@ class HaloAPIClient:
                                 core_stats = team_stats[0].get('Stats', {}).get('CoreStats', {})
                                 match_info = stats_data.get('MatchInfo', {})
                                 
-                                # Build match data with essential info only
+                                # Extract playlist information
+                                playlist_info = match_info.get('Playlist', {})
+                                playlist_asset_id = playlist_info.get('AssetId')
+                                playlist_version_id = playlist_info.get('VersionId')
+                                
+                                # Extract map information
+                                map_info = match_info.get('MapVariant', {})
+                                map_asset_id = map_info.get('AssetId')
+                                map_version_id = map_info.get('VersionId')
+                                
+                                # Determine if ranked or social based on playlist ID
+                                # Common ranked playlists in Halo Infinite have specific asset IDs
+                                # You can expand this list based on actual playlist IDs
+                                is_ranked = False
+                                if playlist_asset_id:
+                                    # These are example IDs - you may need to update based on actual API data
+                                    ranked_playlist_ids = [
+                                        '6e4e9372-5d49-4f87-b0a7-4489b5e96a0b',  # Ranked Arena
+                                        'edfef3ac-9cbe-4fa2-b949-8f29deafd483',  # Ranked Slayer
+                                        # Add more ranked playlist IDs as discovered
+                                    ]
+                                    is_ranked = playlist_asset_id in ranked_playlist_ids
+                                
+                                # Build match data with playlist information, map, and player XUIDs
                                 match_data = {
                                     'match_id': match_id,
                                     'outcome': player.get('Outcome', 0),  # 2=Win, 3=Loss, 4=DNF
@@ -572,7 +604,13 @@ class HaloAPIClient:
                                     'assists': core_stats.get('Assists', 0),
                                     'start_time': match_info.get('StartTime', ''),
                                     'duration': match_info.get('Duration', 'Unknown'),
-                                    'medals': core_stats.get('Medals', [])
+                                    'medals': core_stats.get('Medals', []),
+                                    'playlist_id': playlist_asset_id,
+                                    'playlist_version': playlist_version_id,
+                                    'is_ranked': is_ranked,
+                                    'map_id': map_asset_id,
+                                    'map_version': map_version_id,
+                                    'players': player_xuids
                                 }
                                 return match_data
                 else:
@@ -906,33 +944,25 @@ class HaloAPIClient:
                 
                 print(f"Processed {new_matches_processed} new matches, total: {len(all_processed_matches)}")
                 
-                # Calculate aggregate stats
-                total_kills = sum(m.get('kills', 0) for m in all_processed_matches)
-                total_deaths = sum(m.get('deaths', 0) for m in all_processed_matches)
-                total_assists = sum(m.get('assists', 0) for m in all_processed_matches)
-                
-                wins = sum(1 for m in all_processed_matches if m.get('outcome') == 2)
-                losses = sum(1 for m in all_processed_matches if m.get('outcome') == 3)
-                ties = sum(1 for m in all_processed_matches if m.get('outcome') == 1)  # Rare
-                dnf = sum(1 for m in all_processed_matches if m.get('outcome') == 4)  # Did Not Finish
-                
-                games_played = len(all_processed_matches)
-                kd_ratio = round(total_kills / total_deaths if total_deaths > 0 else total_kills, 2)
-                kda = round((total_kills + (total_assists / 3)) - total_deaths, 2)
-                avg_kda = round(kda / games_played if games_played > 0 else 0, 2)
-                win_rate = f"{round(wins / games_played * 100 if games_played > 0 else 0, 1)}%"
-                
-                # Prepare cache data
-                cache_data = {
-                    'last_update': datetime.now().isoformat(),
-                    'gamertag': gamertag,
-                    'xuid': xuid,
-                    'stat_type': stat_type,
-                    'processed_matches': all_processed_matches,
-                    'incomplete_data': len(failed_matches) > 0,  # Flag if any matches failed
-                    'failed_match_count': len(failed_matches),
-                    'failed_matches': failed_matches[:50] if len(failed_matches) <= 50 else failed_matches[:50] + ['...truncated'],  # Save up to 50 failed match IDs
-                    'stats': {
+                # Helper function to calculate stats for a set of matches
+                def calculate_stats_for_matches(matches):
+                    """Calculate aggregate stats from a list of matches"""
+                    total_kills = sum(m.get('kills', 0) for m in matches)
+                    total_deaths = sum(m.get('deaths', 0) for m in matches)
+                    total_assists = sum(m.get('assists', 0) for m in matches)
+                    
+                    wins = sum(1 for m in matches if m.get('outcome') == 2)
+                    losses = sum(1 for m in matches if m.get('outcome') == 3)
+                    ties = sum(1 for m in matches if m.get('outcome') == 1)
+                    dnf = sum(1 for m in matches if m.get('outcome') == 4)
+                    
+                    games_played = len(matches)
+                    kd_ratio = round(total_kills / total_deaths if total_deaths > 0 else total_kills, 2)
+                    kda = round((total_kills + (total_assists / 3)) - total_deaths, 2)
+                    avg_kda = round(kda / games_played if games_played > 0 else 0, 2)
+                    win_rate = f"{round(wins / games_played * 100 if games_played > 0 else 0, 1)}%"
+                    
+                    return {
                         'total_kills': total_kills,
                         'total_deaths': total_deaths,
                         'total_assists': total_assists,
@@ -946,15 +976,49 @@ class HaloAPIClient:
                         'avg_kda': avg_kda,
                         'win_rate': win_rate
                     }
+                
+                # Calculate stats for all three types: overall, ranked, and social
+                ranked_matches = [m for m in all_processed_matches if m.get('is_ranked', False)]
+                social_matches = [m for m in all_processed_matches if not m.get('is_ranked', False)]
+                
+                print(f"Match breakdown: {len(all_processed_matches)} total, {len(ranked_matches)} ranked, {len(social_matches)} social")
+                
+                overall_stats = calculate_stats_for_matches(all_processed_matches)
+                ranked_stats = calculate_stats_for_matches(ranked_matches)
+                social_stats = calculate_stats_for_matches(social_matches)
+                
+                # Prepare cache data with all three stat types
+                cache_data = {
+                    'last_update': datetime.now().isoformat(),
+                    'gamertag': gamertag,
+                    'xuid': xuid,
+                    'stat_type': stat_type,
+                    'processed_matches': all_processed_matches,
+                    'incomplete_data': len(failed_matches) > 0,
+                    'failed_match_count': len(failed_matches),
+                    'failed_matches': failed_matches[:50] if len(failed_matches) <= 50 else failed_matches[:50] + ['...truncated'],
+                    'stats': {
+                        'overall': overall_stats,
+                        'ranked': ranked_stats,
+                        'social': social_stats
+                    }
                 }
                 
                 # Save to cache
                 self.save_stats_cache(xuid, stat_type, cache_data, gamertag)
                 
+                # Return the appropriate stats based on stat_type
+                if stat_type == "ranked":
+                    selected_stats = ranked_stats
+                elif stat_type == "social":
+                    selected_stats = social_stats
+                else:
+                    selected_stats = overall_stats
+                
                 return {
                     'error': 0,
-                    'stats': cache_data['stats'],
-                    'matches_processed': games_played,
+                    'stats': selected_stats,
+                    'matches_processed': selected_stats['games_played'],
                     'new_matches': new_matches_processed,
                     'processed_matches': all_processed_matches
                     }

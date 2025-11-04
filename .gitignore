@@ -41,3 +41,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Project specific
+*.json
+bot_docs/
