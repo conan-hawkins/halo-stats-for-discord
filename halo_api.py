@@ -135,6 +135,10 @@ class HaloAPIClient:
         self.spartan_token = None
         self.user_agent = "HaloWaypoint/2021.01.10.01"
         
+        # Multiple account support for Spartan tokens
+        self.spartan_accounts = []  # List of {id, token, name}
+        self.current_account_index = 0  # Round-robin index
+        
         # OAuth credentials (environment variables)
         self.client_id = os.getenv('client_id')
         self.client_secret = os.getenv('client_secret')
@@ -150,7 +154,7 @@ class HaloAPIClient:
     async def ensure_valid_tokens(self):
         """
         Centralized token validation and refresh
-        Checks ALL tokens (Spartan + Xbox Live XSTS) and refreshes if needed
+        Checks ALL tokens (Spartan + XSTS + Xbox Live XSTS) for BOTH accounts and refreshes if needed
         Returns True if valid tokens loaded, False otherwise
         """
         # Prevent concurrent refresh attempts
@@ -158,73 +162,177 @@ class HaloAPIClient:
             print("Token refresh already in progress, waiting...")
             return False
         
+        # Check Account 1 tokens
+        cache = safe_read_json("token_cache.json", default={})
+        if not cache:
+            print("No token cache found for Account 1")
+            print("Run: python get_auth_tokens.py")
+            return False
+        
+        # Check ALL required tokens for Account 1
+        spartan_info = cache.get("spartan")
+        xsts_info = cache.get("xsts")  # Main XSTS token for Halo API
+        xsts_xbox_info = cache.get("xsts_xbox")  # XSTS token for Xbox Live
+        
+        spartan_valid = spartan_info and is_token_valid(spartan_info)
+        xsts_valid = xsts_info and is_token_valid(xsts_info)
+        xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
+        
+        account1_valid = spartan_valid and xsts_valid and xbox_valid
+        
+        # Check Account 2 tokens
+        cache2 = safe_read_json("token_cache_account2.json", default={})
+        account2_valid = False
+        if cache2:
+            spartan_info2 = cache2.get("spartan")
+            xsts_info2 = cache2.get("xsts")
+            xsts_xbox_info2 = cache2.get("xsts_xbox")
+            
+            spartan_valid2 = spartan_info2 and is_token_valid(spartan_info2)
+            xsts_valid2 = xsts_info2 and is_token_valid(xsts_info2)
+            xbox_valid2 = xsts_xbox_info2 and is_token_valid(xsts_xbox_info2)
+            
+            account2_valid = spartan_valid2 and xsts_valid2 and xbox_valid2
+        
+        # If Account 1 valid, load tokens
+        if account1_valid:
+            self.spartan_token = spartan_info.get("token")
+            
+            # Load Spartan accounts
+            self.spartan_accounts = []
+            self.spartan_accounts.append({
+                'id': 'account1',
+                'token': spartan_info.get("token"),
+                'name': 'Account 1'
+            })
+            
+            # Add Account 2 if valid
+            if account2_valid:
+                self.spartan_accounts.append({
+                    'id': 'account2',
+                    'token': spartan_info2.get("token"),
+                    'name': 'Account 2'
+                })
+                print(f"Loaded {len(self.spartan_accounts)} Spartan accounts for match fetching")
+            else:
+                print(f"Loaded 1 Spartan account (Account 2 tokens need refresh)")
+            
+            return True
+        
+        # Need to refresh - check cooldown (1 minute minimum between refreshes)
+        time_since_last = time.time() - self._last_refresh_time
+        if time_since_last < 60:
+            print(f"Refresh cooldown active ({60-time_since_last:.0f}s remaining)")
+            return False
+        
+        # Perform refresh for both accounts
+        self._refresh_in_progress = True
+        self._last_refresh_time = time.time()
+        
         try:
-            cache = safe_read_json("token_cache.json", default={})
-            if not cache:
-                print("No token cache found")
-                print("Run: python get_auth_tokens.py")
-                return False
+            # Refresh Account 1
+            if not account1_valid:
+                oauth_info = cache.get("oauth")
+                if not oauth_info or not oauth_info.get("refresh_token"):
+                    print("No OAuth refresh token available for Account 1")
+                    print("Run: python get_auth_tokens.py")
+                    return False
+                
+                print("Refreshing Account 1 tokens...")
+                
+                # Force expiry of all tokens for Account 1
+                for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
+                    if key in cache:
+                        cache[key]["expires_at"] = 0
+                safe_write_json("token_cache.json", cache)
+                
+                # Run auth flow for Account 1
+                await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+                
+                # Reload and validate Account 1
+                cache = safe_read_json("token_cache.json", default={})
+                spartan_info = cache.get("spartan")
+                xsts_info = cache.get("xsts")
+                xsts_xbox_info = cache.get("xsts_xbox")
+                
+                spartan_valid = spartan_info and is_token_valid(spartan_info)
+                xsts_valid = xsts_info and is_token_valid(xsts_info)
+                xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
+                account1_valid = spartan_valid and xsts_valid and xbox_valid
+                
+                if account1_valid:
+                    print("Account 1 tokens refreshed successfully")
+                else:
+                    print("Account 1 token refresh failed - tokens still invalid")
+                    return False
             
-            # Check both required tokens
-            spartan_info = cache.get("spartan")
-            xsts_xbox_info = cache.get("xsts_xbox")
+            # Refresh Account 2
+            if cache2 and not account2_valid:
+                oauth_info2 = cache2.get("oauth")
+                if oauth_info2 and oauth_info2.get("refresh_token"):
+                    print("Refreshing Account 2 tokens...")
+                    
+                    # Force expiry of all tokens for Account 2
+                    for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
+                        if key in cache2:
+                            cache2[key]["expires_at"] = 0
+                    safe_write_json("token_cache_account2.json", cache2)
+                    
+                    # Run auth flow for Account 2
+                    await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+                    
+                    # Move the tokens from account1 file to account2 file
+                    temp_cache = safe_read_json("token_cache.json", default={})
+                    if temp_cache:
+                        safe_write_json("token_cache_account2.json", temp_cache)
+                        # Restore account1's original tokens
+                        safe_write_json("token_cache.json", cache)
+                    
+                    # Reload and validate Account 2
+                    cache2 = safe_read_json("token_cache_account2.json", default={})
+                    spartan_info2 = cache2.get("spartan")
+                    xsts_info2 = cache2.get("xsts")
+                    xsts_xbox_info2 = cache2.get("xsts_xbox")
+                    
+                    spartan_valid2 = spartan_info2 and is_token_valid(spartan_info2)
+                    xsts_valid2 = xsts_info2 and is_token_valid(xsts_info2)
+                    xbox_valid2 = xsts_xbox_info2 and is_token_valid(xsts_xbox_info2)
+                    account2_valid = spartan_valid2 and xsts_valid2 and xbox_valid2
+                    
+                    if account2_valid:
+                        print("Account 2 tokens refreshed successfully")
+                    else:
+                        print("Account 2 token refresh failed - tokens still invalid")
+                else:
+                    print("No OAuth refresh token available for Account 2")
+                    print("Run: python setup_account2.py")
             
-            spartan_valid = spartan_info and is_token_valid(spartan_info)
-            xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
-            
-            # If both valid, load and return
-            if spartan_valid and xbox_valid:
+            # Load tokens if Account 1 is valid (Account 2 is optional)
+            if account1_valid:
                 self.spartan_token = spartan_info.get("token")
-                return True
-            
-            # Need to refresh - check cooldown (1 minute minimum between refreshes)
-            time_since_last = time.time() - self._last_refresh_time
-            if time_since_last < 60:
-                print(f"Refresh cooldown active ({60-time_since_last:.0f}s remaining)")
-                return False
-            
-            # Check if we have OAuth refresh token
-            oauth_info = cache.get("oauth")
-            if not oauth_info or not oauth_info.get("refresh_token"):
-                print("No OAuth refresh token available")
-                print("Run: python get_auth_tokens.py")
-                return False
-            
-            # Perform refresh
-            self._refresh_in_progress = True
-            self._last_refresh_time = time.time()
-            
-            print("Refreshing authentication tokens...")
-            
-            # Force expiry of all tokens
-            for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
-                if key in cache:
-                    cache[key]["expires_at"] = 0
-            safe_write_json("token_cache.json", cache)
-            
-            # Run auth flow
-            await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
-            
-            # Reload and validate
-            cache = safe_read_json("token_cache.json", default={})
-            spartan_info = cache.get("spartan")
-            xsts_xbox_info = cache.get("xsts_xbox")
-            
-            # Debug: Check what we got
-            print(f"Validating refreshed tokens...")
-            print(f"   Spartan: {spartan_info is not None}, Valid: {is_token_valid(spartan_info) if spartan_info else False}")
-            if spartan_info:
-                print(f"   Spartan expires_at: {spartan_info.get('expires_at')}, Current: {time.time()}")
-            print(f"   Xbox: {xsts_xbox_info is not None}, Valid: {is_token_valid(xsts_xbox_info) if xsts_xbox_info else False}")
-            if xsts_xbox_info:
-                print(f"   Xbox expires_at: {xsts_xbox_info.get('expires_at')}, Current: {time.time()}")
-            
-            if spartan_info and is_token_valid(spartan_info) and xsts_xbox_info and is_token_valid(xsts_xbox_info):
-                self.spartan_token = spartan_info.get("token")
-                print(f"All tokens refreshed successfully")
+                
+                # Load Spartan accounts
+                self.spartan_accounts = []
+                self.spartan_accounts.append({
+                    'id': 'account1',
+                    'token': spartan_info.get("token"),
+                    'name': 'Account 1'
+                })
+                
+                # Add Account 2 if now valid
+                if account2_valid:
+                    self.spartan_accounts.append({
+                        'id': 'account2',
+                        'token': spartan_info2.get("token"),
+                        'name': 'Account 2'
+                    })
+                    print(f"All tokens refreshed - Loaded {len(self.spartan_accounts)} Spartan accounts")
+                else:
+                    print("Account 1 tokens refreshed - Account 2 needs manual refresh")
+                
                 return True
             else:
-                print("Token refresh failed - tokens still invalid after refresh")
+                print("Token refresh failed for Account 1")
                 return False
                 
         except Exception as e:
@@ -234,6 +342,16 @@ class HaloAPIClient:
             return False
         finally:
             self._refresh_in_progress = False
+    
+    def get_next_spartan_token(self):
+        """Get the next Spartan token in round-robin fashion for load balancing"""
+        if not self.spartan_accounts:
+            return self.spartan_token  # Fallback to single token
+        
+        # Round-robin selection across all accounts
+        account = self.spartan_accounts[self.current_account_index % len(self.spartan_accounts)]
+        self.current_account_index += 1
+        return account['token']
     
     async def get_clearance_token(self):
         """Get or refresh the clearance token for API access"""
@@ -533,10 +651,11 @@ class HaloAPIClient:
     async def get_match_stats_for_match(self, match_id: str, player_xuid: str, session: aiohttp.ClientSession) -> Optional[Dict]:
         """Get detailed stats for a specific match using a shared session"""
         try:
-            if not self.spartan_token:
+            # Use round-robin Spartan token selection
+            spartan_token = self.get_next_spartan_token()
+            if not spartan_token:
                 return None
                 
-            spartan_token = self.spartan_token
             if isinstance(spartan_token, dict) and 'token' in spartan_token:
                 spartan_token = spartan_token['token']
             
@@ -551,8 +670,21 @@ class HaloAPIClient:
             
             async with session.get(stats_url, headers=headers) as response:
                 if response.status == 200:
-                    stats_data = await response.json()
+                    try:
+                        stats_data = await response.json()
+                    except Exception as json_error:
+                        print(f"⚠️ Match {match_id}: JSON parsing error - {json_error}")
+                        return None
+                    
+                    # Check if API returned None or invalid data
+                    if stats_data is None or not isinstance(stats_data, dict):
+                        print(f"⚠️ Match {match_id}: API returned invalid data (None or not a dict)")
+                        return None
+                    
                     players = stats_data.get('Players', [])
+                    if not players:
+                        # No player data in response
+                        return None
                     
                     # Extract XUIDs of all players in the match
                     player_xuids = []
@@ -613,8 +745,21 @@ class HaloAPIClient:
                                     'players': player_xuids
                                 }
                                 return match_data
+                    
+                    # If we get here, player wasn't found in match
+                    # This can happen if the match data is incomplete
+                    return None
+                    
+                elif response.status == 404:
+                    # Match not found - possibly old or invalid match ID
+                    return None
+                elif response.status == 500:
+                    # Server error - API issue, not our fault
+                    return None
                 else:
+                    # Other error status
                     print(f"Failed to get match stats for {match_id}: {response.status}")
+                    return None
         except Exception as e:
             print(f"Error getting match stats for {match_id}: {e}")
         
@@ -677,13 +822,13 @@ class HaloAPIClient:
                 }
             
             # Get match history
-            if not self.spartan_token:
+            if not self.spartan_token and not self.spartan_accounts:
                 return {"error": 4, "message": "No authentication token"}
                 
-            # Function to get current headers (always uses latest token)
+            # Function to get current headers with round-robin Spartan token
             def get_headers():
-                """Get headers with current Spartan token"""
-                spartan_token = self.spartan_token
+                """Get headers with next Spartan token (round-robin)"""
+                spartan_token = self.get_next_spartan_token()
                 if isinstance(spartan_token, dict) and 'token' in spartan_token:
                     spartan_token = spartan_token['token']
                 return {
@@ -770,10 +915,13 @@ class HaloAPIClient:
                             break
                         
                         if not page:
-                            # Check if we got a 401 error (token expired)
-                            # If first page fails, it might be a 401
+                            # Empty page could mean:
+                            # 1. Player has 0 matches (first page, valid scenario)
+                            # 2. Reached end of matches (later page)
+                            # 3. API error (not 401, would be None)
                             if page_num == 0:
-                                got_401_error = True
+                                # First page empty = player has no match history, not an error
+                                print(f"Player has no match history")
                                 break
                             print(f"Failed to fetch page {page_num}, stopping search")
                             break
@@ -832,16 +980,24 @@ class HaloAPIClient:
                         # Check for empty pages
                         found_matches = False
                         for page in batch_results:
-                            if page and len(page) > 0:
+                            if page is None:
+                                # Got 401 error
+                                got_401_error = True
+                                break
+                            elif page and len(page) > 0:
                                 all_matches.extend(page)
                                 found_matches = True
-                            elif not page or len(page) == 0:
+                            elif len(page) == 0:
                                 # Hit empty page, stop fetching
                                 break
                         
-                        # If first batch completely failed, likely 401 error
-                        if current_page == 0 and not found_matches:
-                            got_401_error = True
+                        # If got 401, stop immediately
+                        if got_401_error:
+                            break
+                        
+                        # If first batch returned 0 matches (not 401), player has no history
+                        if current_page == 0 and not found_matches and not got_401_error:
+                            print(f"Player has no match history")
                             break
                         
                         current_page += page_batch_size
@@ -1170,13 +1326,74 @@ async def get_players_from_recent_matches(gamertag: str, num_matches: int = 50, 
             return []
         
         # Get comprehensive stats for main player (this includes match history)
-        # Force full fetch to ensure we get ALL matches, not just new ones
+        # First, try to use cached data
         main_stats = await api_client.calculate_comprehensive_stats(
             main_xuid, 
             "overall", 
             gamertag=gamertag, 
             matches_to_process=num_matches,
-            force_full_fetch=True  # Always fetch all matches for populate
+            force_full_fetch=False  # Try cache first
+        )
+        
+        # Check if we got matches from cache
+        processed_matches = main_stats.get('processed_matches', [])
+        
+        if processed_matches:
+            # We have cached matches! Extract players directly from cache
+            print(f"Using cached match data ({len(processed_matches)} matches)")
+            unique_players = set()
+            
+            for match in processed_matches[:num_matches]:
+                # Extract players from the cached match data
+                players = match.get('players', [])
+                for player_xuid in players:
+                    # Skip the main player
+                    if str(player_xuid) != str(main_xuid):
+                        unique_players.add(str(player_xuid))
+            
+            print(f"Extracted {len(unique_players)} unique players from cache")
+            
+            # Now resolve XUIDs to gamertags
+            xuid_cache = load_xuid_cache()
+            resolved_gamertags = []
+            xuids_to_resolve = []
+            
+            for xuid in unique_players:
+                # Check if already in cache (format: xuid -> gamertag)
+                if xuid in xuid_cache:
+                    resolved_gamertags.append(xuid_cache[xuid])
+                else:
+                    xuids_to_resolve.append(xuid)
+            
+            print(f"Found {len(resolved_gamertags)} gamertags in cache, need to resolve {len(xuids_to_resolve)} XUIDs")
+            
+            # Resolve remaining XUIDs
+            if xuids_to_resolve:
+                print(f"Resolving {len(xuids_to_resolve)} XUIDs to gamertags...")
+                for xuid in xuids_to_resolve:
+                    try:
+                        gamertag_result = await api_client.resolve_xuid_to_gamertag(xuid)
+                        if gamertag_result:
+                            resolved_gamertags.append(gamertag_result)
+                            xuid_cache[xuid] = gamertag_result
+                        await asyncio.sleep(0.1)  # Small delay
+                    except:
+                        continue
+                
+                # Save updated cache
+                save_xuid_cache(xuid_cache)
+            
+            print(f"Total: {len(resolved_gamertags)} gamertags resolved")
+            return resolved_gamertags
+        
+        # Cache miss - fall back to full match history fetch
+        print(f"No cached match data, fetching full match history...")
+        main_stats = await api_client.calculate_comprehensive_stats(
+            main_xuid, 
+            "overall", 
+            gamertag=gamertag, 
+            matches_to_process=num_matches,
+            force_full_fetch=True  # Force fetch from API
         )
         
         # Check if we got matches (even if there was an error fetching new ones)

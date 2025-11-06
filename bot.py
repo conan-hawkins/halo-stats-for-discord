@@ -8,13 +8,14 @@ Main entry point for the Discord bot
 
 import os
 import asyncio
+import json
 from datetime import datetime
 
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from halo_api import StatsFind1, get_players_from_recent_matches
+from halo_api import StatsFind1, get_players_from_recent_matches, api_client
 from commands import fetch_and_display_stats, collect_server_stats
 
 # ============================================================================
@@ -85,6 +86,70 @@ async def populate_cache(ctx, *inputs):
         await loading_message.edit(content=f"Error: {e}")
         print(f"Error in populate_cache: {e}")
 
+
+@bot.command(name='cachestatus', help='Check background caching progress')
+async def cache_status(ctx):
+    """Display the current status of background stats caching"""
+    try:
+        # Load XUID cache
+        with open("xuid_gamertag_cache.json", 'r') as f:
+            xuid_cache = json.load(f)
+        total_players = len(xuid_cache)
+        
+        # Count cached players
+        cached_count = 0
+        for xuid in xuid_cache.keys():
+            xuid_dir = os.path.join("player_stats_cache", str(xuid))
+            if os.path.exists(xuid_dir) and any(f.endswith('.json') for f in os.listdir(xuid_dir)):
+                cached_count += 1
+        
+        # Load progress
+        progress_file = "cache_progress.json"
+        current_index = 0
+        if os.path.exists(progress_file):
+            with open(progress_file, 'r') as f:
+                progress = json.load(f)
+                current_index = progress.get('last_processed_index', 0)
+        
+        # Calculate percentages
+        percent_cached = (cached_count / total_players * 100) if total_players > 0 else 0
+        percent_processed = (current_index / total_players * 100) if total_players > 0 else 0
+        
+        # Estimate remaining time (rough estimate based on ~5 players per 12 seconds with parallelization)
+        remaining = total_players - cached_count
+        est_hours = (remaining * 2.4) / 3600  # 2.4 seconds per player with 5x parallelization
+        
+        embed = discord.Embed(
+            title="📊 Background Caching Status",
+            colour=0x00BFFF,
+            timestamp=datetime.now()
+        )
+        embed.add_field(
+            name="Overall Progress",
+            value=f"**{cached_count:,}** / **{total_players:,}** players cached\n"
+                  f"Progress: {percent_cached:.1f}%",
+            inline=False
+        )
+        embed.add_field(
+            name="Current Session",
+            value=f"Processing index: {current_index:,} / {total_players:,}\n"
+                  f"Session progress: {percent_processed:.1f}%",
+            inline=False
+        )
+        embed.add_field(
+            name="Estimated Time Remaining",
+            value=f"~{est_hours:.1f} hours ({est_hours/24:.1f} days)\n"
+                  f"*Based on 5x parallel processing*",
+            inline=False
+        )
+        embed.set_footer(text="Project Goliath • Caching runs every 24 hours")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"Error checking cache status: {e}")
+        print(f"Error in cache_status: {e}")
+
 # ============================================================================
 # Background Tasks & Events
 # ============================================================================
@@ -100,6 +165,141 @@ async def auto_refresh_tokens():
         print("Token validation/refresh failed")
 
 
+@tasks.loop(hours=24)
+async def auto_cache_all_players():
+    """Background process: Cache full stats for all players in XUID cache if not already cached
+    
+    Performance optimizations:
+    - Parallel processing: Process 5 players concurrently (with 2 accounts = 10 req/10s)
+    - Progress tracking: Resume from last position on restart
+    - Smart skipping: Pre-filter cached players before processing
+    """
+    print("Starting background stats caching...")
+    
+    try:
+        with open("xuid_gamertag_cache.json", 'r') as f:
+            xuid_cache = json.load(f)
+    except Exception as e:
+        print(f"Error loading XUID cache: {e}")
+        return
+    
+    # Load progress tracker
+    progress_file = "cache_progress.json"
+    progress = {"last_processed_index": 0, "completed_xuids": []}
+    
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, 'r') as f:
+                progress = json.load(f)
+            print(f"Resuming from player index {progress['last_processed_index']}")
+        except:
+            pass
+    
+    # Convert to list for indexing
+    xuid_items = list(xuid_cache.items())
+    total = len(xuid_items)
+    
+    # Pre-filter: Skip players who already have cache
+    players_to_process = []
+    skipped = 0
+    
+    start_idx = progress['last_processed_index']
+    completed_set = set(progress['completed_xuids'])
+    
+    for idx in range(start_idx, total):
+        xuid, gamertag = xuid_items[idx]
+        
+        # Skip if already completed in this session
+        if xuid in completed_set:
+            skipped += 1
+            continue
+        
+        # Skip if cache exists
+        xuid_dir = os.path.join("player_stats_cache", str(xuid))
+        if os.path.exists(xuid_dir) and any(f.endswith('.json') for f in os.listdir(xuid_dir)):
+            skipped += 1
+            completed_set.add(xuid)
+            continue
+        
+        players_to_process.append((idx, xuid, gamertag))
+    
+    print(f"Total: {total}, Already cached: {skipped}, To process: {len(players_to_process)}")
+    
+    if not players_to_process:
+        print("All players already cached!")
+        return
+    
+    # Process in parallel batches
+    cached = errors = 0
+    batch_size = 5  # Process 5 players concurrently (conservative with 2 accounts)
+    
+    async def process_player(idx, xuid, gamertag):
+        """Process a single player and return result"""
+        try:
+            print(f"[{idx+1}/{total}] Caching: {gamertag} (XUID: {xuid})")
+            result = await api_client.calculate_comprehensive_stats(xuid, "overall", gamertag, None)
+            
+            if result and result.get('error') == 0:
+                return ('success', idx, xuid)
+            else:
+                return ('error', idx, xuid)
+        except Exception as e:
+            print(f"Error caching {gamertag}: {e}")
+            return ('error', idx, xuid)
+    
+    # Process in batches
+    for batch_start in range(0, len(players_to_process), batch_size):
+        batch = players_to_process[batch_start:batch_start + batch_size]
+        
+        # Proactively check and refresh tokens before each batch
+        # This prevents 401 errors during processing
+        try:
+            await api_client.ensure_valid_tokens()
+        except Exception as e:
+            print(f"Warning: Token validation failed before batch: {e}")
+        
+        # Process batch concurrently
+        tasks_list = [process_player(idx, xuid, gamertag) for idx, xuid, gamertag in batch]
+        results = await asyncio.gather(*tasks_list, return_exceptions=True)
+        
+        # Update counters and progress
+        for result in results:
+            if isinstance(result, Exception):
+                errors += 1
+            elif result[0] == 'success':
+                cached += 1
+                completed_set.add(result[2])
+            else:
+                errors += 1
+        
+        # Save progress every batch
+        last_idx = batch[-1][0]
+        progress['last_processed_index'] = last_idx + 1
+        progress['completed_xuids'] = list(completed_set)
+        
+        try:
+            with open(progress_file, 'w') as f:
+                json.dump(progress, f)
+        except:
+            pass
+        
+        # Small delay between batches to avoid overwhelming API
+        await asyncio.sleep(1)
+        
+        # Progress update every 10 batches
+        if (batch_start // batch_size) % 10 == 0:
+            print(f"Progress: {cached} cached, {errors} errors, {skipped + len(completed_set)} total completed")
+    
+    print(f"Caching complete: {cached} new, {skipped} skipped, {errors} errors")
+    
+    # Reset progress file when complete
+    try:
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+    except:
+        pass
+
+
 @bot.event
 async def on_ready():
     """Initialize bot and start background tasks"""
@@ -109,6 +309,10 @@ async def on_ready():
     if not auto_refresh_tokens.is_running():
         auto_refresh_tokens.start()
         print("Automatic token refresh enabled (checks every hour)")
+    
+    if not auto_cache_all_players.is_running():
+        auto_cache_all_players.start()
+        print("Background stats caching enabled (runs every 24 hours)")
 
 # ============================================================================
 # Main Entry Point
