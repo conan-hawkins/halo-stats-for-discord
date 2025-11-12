@@ -180,19 +180,32 @@ class HaloAPIClient:
         
         account1_valid = spartan_valid and xsts_valid and xbox_valid
         
-        # Check Account 2 tokens
+        # Check tokens for additional accounts (2-5)
+        additional_accounts = []
+        for i in range(2, 6):  # Accounts 2, 3, 4, 5
+            cache_file = f"token_cache_account{i}.json"
+            cache_data = safe_read_json(cache_file, default={})
+            
+            if cache_data:
+                spartan_info = cache_data.get("spartan")
+                xsts_info = cache_data.get("xsts")
+                xsts_xbox_info = cache_data.get("xsts_xbox")
+                
+                spartan_valid = spartan_info and is_token_valid(spartan_info)
+                xsts_valid = xsts_info and is_token_valid(xsts_info)
+                xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
+                
+                if spartan_valid and xsts_valid and xbox_valid:
+                    additional_accounts.append({
+                        'id': f'account{i}',
+                        'token': spartan_info.get("token"),
+                        'name': f'Account {i}',
+                        'cache_file': cache_file
+                    })
+        
+        # Keep backwards compatibility
         cache2 = safe_read_json("token_cache_account2.json", default={})
-        account2_valid = False
-        if cache2:
-            spartan_info2 = cache2.get("spartan")
-            xsts_info2 = cache2.get("xsts")
-            xsts_xbox_info2 = cache2.get("xsts_xbox")
-            
-            spartan_valid2 = spartan_info2 and is_token_valid(spartan_info2)
-            xsts_valid2 = xsts_info2 and is_token_valid(xsts_info2)
-            xbox_valid2 = xsts_xbox_info2 and is_token_valid(xsts_xbox_info2)
-            
-            account2_valid = spartan_valid2 and xsts_valid2 and xbox_valid2
+        account2_valid = any(acc['id'] == 'account2' for acc in additional_accounts)
         
         # If Account 1 valid, load tokens
         if account1_valid:
@@ -206,16 +219,10 @@ class HaloAPIClient:
                 'name': 'Account 1'
             })
             
-            # Add Account 2 if valid
-            if account2_valid:
-                self.spartan_accounts.append({
-                    'id': 'account2',
-                    'token': spartan_info2.get("token"),
-                    'name': 'Account 2'
-                })
-                print(f"Loaded {len(self.spartan_accounts)} Spartan accounts for match fetching")
-            else:
-                print(f"Loaded 1 Spartan account (Account 2 tokens need refresh)")
+            # Add all additional valid accounts (2-5)
+            self.spartan_accounts.extend(additional_accounts)
+            
+            print(f"Loaded {len(self.spartan_accounts)} Spartan account(s) for match fetching")
             
             return True
         
@@ -266,50 +273,76 @@ class HaloAPIClient:
                     print("Account 1 token refresh failed - tokens still invalid")
                     return False
             
-            # Refresh Account 2
-            if cache2 and not account2_valid:
-                oauth_info2 = cache2.get("oauth")
-                if oauth_info2 and oauth_info2.get("refresh_token"):
-                    print("Refreshing Account 2 tokens...")
-                    
-                    # Force expiry of all tokens for Account 2
-                    for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
-                        if key in cache2:
-                            cache2[key]["expires_at"] = 0
-                    safe_write_json("token_cache_account2.json", cache2)
-                    
-                    # Run auth flow for Account 2
-                    await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
-                    
-                    # Move the tokens from account1 file to account2 file
-                    temp_cache = safe_read_json("token_cache.json", default={})
-                    if temp_cache:
-                        safe_write_json("token_cache_account2.json", temp_cache)
-                        # Restore account1's original tokens
-                        safe_write_json("token_cache.json", cache)
-                    
-                    # Reload and validate Account 2
-                    cache2 = safe_read_json("token_cache_account2.json", default={})
-                    spartan_info2 = cache2.get("spartan")
-                    xsts_info2 = cache2.get("xsts")
-                    xsts_xbox_info2 = cache2.get("xsts_xbox")
-                    
-                    spartan_valid2 = spartan_info2 and is_token_valid(spartan_info2)
-                    xsts_valid2 = xsts_info2 and is_token_valid(xsts_info2)
-                    xbox_valid2 = xsts_xbox_info2 and is_token_valid(xsts_xbox_info2)
-                    account2_valid = spartan_valid2 and xsts_valid2 and xbox_valid2
-                    
-                    if account2_valid:
-                        print("Account 2 tokens refreshed successfully")
+            # Refresh additional accounts (2-5) if needed
+            for i in range(2, 6):
+                cache_file = f"token_cache_account{i}.json"
+                account_cache = safe_read_json(cache_file, default={})
+                
+                if not account_cache:
+                    continue
+                
+                # Check if this account needs refresh
+                spartan_info = account_cache.get("spartan")
+                xsts_info = account_cache.get("xsts")
+                xsts_xbox_info = account_cache.get("xsts_xbox")
+                
+                spartan_valid = spartan_info and is_token_valid(spartan_info)
+                xsts_valid = xsts_info and is_token_valid(xsts_info)
+                xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
+                account_valid = spartan_valid and xsts_valid and xbox_valid
+                
+                if not account_valid:
+                    oauth_info = account_cache.get("oauth")
+                    if oauth_info and oauth_info.get("refresh_token"):
+                        print(f"Refreshing Account {i} tokens...")
+                        
+                        # Force expiry of all tokens
+                        for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
+                            if key in account_cache:
+                                account_cache[key]["expires_at"] = 0
+                        safe_write_json(cache_file, account_cache)
+                        
+                        # Run auth flow
+                        await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+                        
+                        # Move tokens from account1 file to this account's file
+                        temp_cache = safe_read_json("token_cache.json", default={})
+                        if temp_cache:
+                            safe_write_json(cache_file, temp_cache)
+                            # Restore account1's original tokens
+                            safe_write_json("token_cache.json", cache)
+                        
+                        print(f"Account {i} tokens refreshed")
                     else:
-                        print("Account 2 token refresh failed - tokens still invalid")
-                else:
-                    print("No OAuth refresh token available for Account 2")
-                    print("Run: python setup_account2.py")
+                        print(f"No OAuth refresh token for Account {i}")
+                        print(f"Run: python setup_account{i}.py")
             
-            # Load tokens if Account 1 is valid (Account 2 is optional)
+            # Load tokens if Account 1 is valid (other accounts are optional)
             if account1_valid:
                 self.spartan_token = spartan_info.get("token")
+                
+                # Reload all accounts after refresh
+                additional_accounts = []
+                for i in range(2, 6):
+                    cache_file = f"token_cache_account{i}.json"
+                    cache_data = safe_read_json(cache_file, default={})
+                    
+                    if cache_data:
+                        spartan_info_acc = cache_data.get("spartan")
+                        xsts_info_acc = cache_data.get("xsts")
+                        xsts_xbox_info_acc = cache_data.get("xsts_xbox")
+                        
+                        spartan_valid = spartan_info_acc and is_token_valid(spartan_info_acc)
+                        xsts_valid = xsts_info_acc and is_token_valid(xsts_info_acc)
+                        xbox_valid = xsts_xbox_info_acc and is_token_valid(xsts_xbox_info_acc)
+                        
+                        if spartan_valid and xsts_valid and xbox_valid:
+                            additional_accounts.append({
+                                'id': f'account{i}',
+                                'token': spartan_info_acc.get("token"),
+                                'name': f'Account {i}',
+                                'cache_file': cache_file
+                            })
                 
                 # Load Spartan accounts
                 self.spartan_accounts = []
@@ -319,16 +352,9 @@ class HaloAPIClient:
                     'name': 'Account 1'
                 })
                 
-                # Add Account 2 if now valid
-                if account2_valid:
-                    self.spartan_accounts.append({
-                        'id': 'account2',
-                        'token': spartan_info2.get("token"),
-                        'name': 'Account 2'
-                    })
-                    print(f"All tokens refreshed - Loaded {len(self.spartan_accounts)} Spartan accounts")
-                else:
-                    print("Account 1 tokens refreshed - Account 2 needs manual refresh")
+                # Add all valid additional accounts
+                self.spartan_accounts.extend(additional_accounts)
+                print(f"All tokens refreshed - Loaded {len(self.spartan_accounts)} Spartan accounts")
                 
                 return True
             else:
@@ -967,7 +993,7 @@ class HaloAPIClient:
                     # Fetch pages in batches to avoid rate limiting
                     # With PAGE_SIZE=25, fetch more pages per batch
                     all_matches = []
-                    page_batch_size = 40  # 40 pages per batch (1000 matches)
+                    page_batch_size = 50  # 50 pages per batch (1250 matches)
                     current_page = 0
                     max_pages = 999999  # Effectively unlimited - stop when API returns empty pages
                     
@@ -1077,7 +1103,7 @@ class HaloAPIClient:
                     
                     # Add delay between batches to reduce API pressure
                     if batch_end < len(matches_to_fetch):
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(3)  # Increased from 2 to 3 seconds
                 
                 all_processed_matches.extend(new_stats)
                 new_matches_processed = len(new_stats)

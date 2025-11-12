@@ -45,3 +45,4 @@ Thumbs.db
 # Project specific
 *.json
 bot_docs/
+analysis_results/

@@ -115,9 +115,11 @@ async def cache_status(ctx):
         percent_cached = (cached_count / total_players * 100) if total_players > 0 else 0
         percent_processed = (current_index / total_players * 100) if total_players > 0 else 0
         
-        # Estimate remaining time (rough estimate based on ~5 players per 12 seconds with parallelization)
+        # Estimate remaining time (realistic estimate based on actual performance)
         remaining = total_players - cached_count
-        est_hours = (remaining * 2.4) / 3600  # 2.4 seconds per player with 5x parallelization
+        est_seconds = remaining * 10  # With 5 accounts: ~10 seconds per player average
+        est_hours = est_seconds / 3600
+        est_days = est_hours / 24
         
         embed = discord.Embed(
             title="📊 Background Caching Status",
@@ -138,8 +140,8 @@ async def cache_status(ctx):
         )
         embed.add_field(
             name="Estimated Time Remaining",
-            value=f"~{est_hours:.1f} hours ({est_hours/24:.1f} days)\n"
-                  f"*Based on 5x parallel processing*",
+            value=f"~{est_hours:.1f} hours ({est_days:.1f} days)\n"
+                  f"*Based on 50x parallel processing (5 accounts)*",
             inline=False
         )
         embed.set_footer(text="Project Goliath • Caching runs every 24 hours")
@@ -170,7 +172,7 @@ async def auto_cache_all_players():
     """Background process: Cache full stats for all players in XUID cache if not already cached
     
     Performance optimizations:
-    - Parallel processing: Process 5 players concurrently (with 2 accounts = 10 req/10s)
+    - Parallel processing: Process 20 players concurrently (with 2 accounts = 40 req/10s)
     - Progress tracking: Resume from last position on restart
     - Smart skipping: Pre-filter cached players before processing
     """
@@ -231,7 +233,7 @@ async def auto_cache_all_players():
     
     # Process in parallel batches
     cached = errors = 0
-    batch_size = 5  # Process 5 players concurrently (conservative with 2 accounts)
+    batch_size = 50  # Process 50 players concurrently with 5 accounts (10 per account)
     
     async def process_player(idx, xuid, gamertag):
         """Process a single player and return result"""
