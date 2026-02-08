@@ -1,0 +1,3 @@
+'''
+Tests are overrated ;)
+'''

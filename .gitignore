@@ -24,6 +24,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+data/blacklistpop.py
 
 # Virtual environments
 venv/
@@ -43,6 +44,15 @@ env/
 Thumbs.db
 
 # Project specific
+# Sensitive data and secrets
+data/auth/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*_cache.json
+data/*_blacklist.json
+data/token_cache*.json
 *.json
 bot_docs/
 analysis_results/
+auth/
