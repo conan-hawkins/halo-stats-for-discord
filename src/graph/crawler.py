@@ -9,7 +9,7 @@ Implements a depth-limited graph crawler that:
 - Integrates with existing HaloAPIClient
 
 Key Design Decisions:
-- Halo-only filter: Only expand nodes for players active in Halo since Nov 2025
+- Halo-only filter: Only expand nodes for players active in Halo since Sept 2025
 - Depth limit: Default max depth of 3 hops
 - Rate limiting: Uses existing Xbox account pool for parallel requests
 - Incremental: Saves progress continuously for resumability
@@ -41,7 +41,7 @@ class CrawlStatus(Enum):
 class CrawlConfig:
     """Configuration for graph crawl"""
     max_depth: int = 3
-    halo_active_since: datetime = field(default_factory=lambda: datetime(2025, 11, 1))
+    halo_active_since: datetime = field(default_factory=lambda: datetime(2025, 9, 1))
     concurrency: int = 3
     batch_size: int = 10
     collect_stats: bool = True
@@ -119,11 +119,19 @@ class GraphCrawler:
         
         print(f"[CRAWLER] Starting crawl from seed XUID: {seed_xuid}")
         
-        # Initialize seed player
+        # Check if seed is Halo-active using the API
+        from datetime import datetime
+        CUTOFF_DATE = self.config.halo_active_since if hasattr(self.config, 'halo_active_since') else datetime(2025, 9, 1)
+        is_active = False
+        try:
+            is_active, _ = await self.api.check_recent_halo_activity(seed_xuid, CUTOFF_DATE)
+        except Exception as e:
+            print(f"[CRAWLER] Error checking seed activity: {e}")
+
         self.db.insert_or_update_player(
             xuid=seed_xuid,
             gamertag=seed_gamertag,
-            halo_active=True,  # Assume seed is active
+            halo_active=is_active,
             crawl_depth=0,
             is_seed=True
         )
