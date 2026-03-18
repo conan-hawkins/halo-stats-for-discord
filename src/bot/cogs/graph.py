@@ -10,6 +10,7 @@ Contains commands for social graph analysis:
 """
 
 import asyncio
+import io
 from datetime import datetime
 from typing import Optional
 
@@ -159,7 +160,7 @@ class GraphCog(commands.Cog, name="Graph"):
                 gt = p.get('gamertag', p.get('xuid', 'Unknown'))
                 embed.add_field(
                     name=f"{i}. {gt}",
-                    value=f"CSR: {p.get('csr', 0):.0f} | K/D: {p.get('kd_ratio', 0):.2f} | Win: {p.get('win_rate', 0):.1f}%\nMatches: {p.get('matches_played', 0)}",
+                    value=f"CSR: {p.get('csr') or 0:.0f} | K/D: {p.get('kd_ratio') or 0:.2f} | Win: {p.get('win_rate') or 0:.1f}%\nMatches: {p.get('matches_played') or 0}",
                     inline=True
                 )
             
@@ -192,8 +193,8 @@ class GraphCog(commands.Cog, name="Graph"):
             
             for i, hub in enumerate(hubs[:10], 1):
                 gt = hub.get('gamertag', hub.get('xuid', 'Unknown'))
-                csr = hub.get('csr', 0)
-                kd = hub.get('kd_ratio', 0)
+                csr = hub.get('csr') or 0
+                kd = hub.get('kd_ratio') or 0
                 
                 embed.add_field(
                     name=f"{i}. {gt}",
@@ -209,79 +210,237 @@ class GraphCog(commands.Cog, name="Graph"):
     
     @commands.command(name='network', help='Show a player\'s Halo friend network. Example - #network XxUK D3STROYxX')
     async def show_network(self, ctx: commands.Context, *inputs):
-        """Show a player's Halo-active friend network"""
+        """Show a player's Halo-active friend network with a visual graph image"""
         if not inputs:
             await ctx.send("Please provide a gamertag. Example: `#network GAMERTAG`")
             return
-        
+
         gamertag = ' '.join(inputs)
-        
+
+        loading_embed = discord.Embed(
+            title="Building Network Graph...",
+            description=f"Fetching data for **{gamertag}**",
+            colour=0xFFA500,
+            timestamp=datetime.now()
+        )
+        loading_msg = await ctx.send(embed=loading_embed)
+
         try:
             # Resolve gamertag
             xuid = await api_client.resolve_gamertag_to_xuid(gamertag)
             if not xuid:
+                await loading_msg.delete()
                 await ctx.send(f"Could not find player **{gamertag}**")
                 return
-            
+
             # Get player info
             player = self.db.get_player(xuid)
             if not player:
+                await loading_msg.delete()
                 await ctx.send(f"**{gamertag}** is not in the graph database. Run a crawl first.")
                 return
-            
-            # Get Halo friends
+
+            # Get friends
             halo_friends = self.db.get_halo_friends(xuid)
             all_friends = self.db.get_friends(xuid)
-            
+            features = self.db.get_halo_features(xuid)
+
+            # Build summary embed
             embed = discord.Embed(
                 title=f"Network: {gamertag}",
                 colour=0x3498DB,
                 timestamp=datetime.now()
             )
-            
-            # Summary
+
             embed.add_field(
                 name="Summary",
-                value=f"Total friends: **{len(all_friends)}**\nHalo friends: **{len(halo_friends)}**\nCrawl depth: **{player.get('crawl_depth', '?')}**",
+                value=(
+                    f"Total friends: **{len(all_friends)}**\n"
+                    f"Halo friends: **{len(halo_friends)}**\n"
+                    f"Crawl depth: **{player.get('crawl_depth', '?')}**"
+                ),
                 inline=True
             )
-            
-            # Top Halo friends by CSR
+
+            if features and (features.get('matches_played') or 0) > 0:
+                embed.add_field(
+                    name="Player Stats",
+                    value=(
+                        f"CSR: {features.get('csr') or 0:.0f}\n"
+                        f"K/D: {features.get('kd_ratio') or 0:.2f}\n"
+                        f"Win Rate: {features.get('win_rate') or 0:.1f}%\n"
+                        f"Matches: {features.get('matches_played') or 0}"
+                    ),
+                    inline=True
+                )
+
             if halo_friends:
                 sorted_friends = sorted(
-                    halo_friends, 
-                    key=lambda x: x.get('csr') or 0, 
+                    halo_friends,
+                    key=lambda x: x.get('csr') or 0,
                     reverse=True
                 )
-                
                 top_str = ""
                 for f in sorted_friends[:5]:
-                    gt = f.get('gamertag', f.get('dst_xuid', 'Unknown'))
-                    csr = f.get('csr', 0)
-                    kd = f.get('kd_ratio', 0)
+                    gt = f.get('gamertag') or f.get('dst_xuid', 'Unknown')
+                    csr = f.get('csr') or 0
+                    kd = f.get('kd_ratio') or 0
                     top_str += f"**{gt}**: CSR {csr:.0f}, K/D {kd:.2f}\n"
-                
                 embed.add_field(
                     name="Top Halo Friends (by CSR)",
                     value=top_str or "None",
                     inline=False
                 )
-            
-            # Get player's own stats if available
-            features = self.db.get_halo_features(xuid)
-            if features and features.get('matches_played', 0) > 0:
-                embed.add_field(
-                    name="Player Stats",
-                    value=f"CSR: {features.get('csr', 0):.0f}\nK/D: {features.get('kd_ratio', 0):.2f}\nWin Rate: {features.get('win_rate', 0):.1f}%\nMatches: {features.get('matches_played', 0)}",
-                    inline=True
-                )
-            
-            embed.set_footer(text=f"XUID: {xuid}")
-            await ctx.send(embed=embed)
-            
+
+            embed.set_footer(text=f"XUID: {xuid} | Gold node = {gamertag} | Colour = CSR")
+
+            await loading_msg.delete()
+
+            if not halo_friends:
+                await ctx.send(embed=embed)
+                return
+
+            # Render graph image in a thread to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            buf = await loop.run_in_executor(
+                None,
+                lambda: self._render_network_graph(xuid, gamertag, halo_friends, features)
+            )
+            file = discord.File(fp=buf, filename="network.png")
+            embed.set_image(url="attachment://network.png")
+            await ctx.send(embed=embed, file=file)
+
         except Exception as e:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
             await ctx.send(f"Error showing network: {str(e)}")
+            raise
     
+    def _render_network_graph(
+        self,
+        center_xuid: str,
+        center_gamertag: str,
+        halo_friends: list,
+        center_features: Optional[dict],
+    ) -> io.BytesIO:
+        """Render the friend network as a PNG and return a BytesIO buffer (sync)."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        import networkx as nx
+
+        MAX_FRIENDS = 60
+        friends_to_show = halo_friends[:MAX_FRIENDS]
+
+        friend_xuids = [f['dst_xuid'] for f in friends_to_show]
+        all_xuids = [center_xuid] + friend_xuids
+
+        # Cross-edges between friends (not touching center node)
+        cross_edges_raw = self.db.get_edges_within_set(all_xuids)
+        cross_edge_set = {
+            (e['src_xuid'], e['dst_xuid'])
+            for e in cross_edges_raw
+            if e['src_xuid'] != center_xuid and e['dst_xuid'] != center_xuid
+        }
+
+        G = nx.Graph()
+
+        # Center node
+        center_csr = (center_features.get('csr') or 0) if center_features else 0
+        G.add_node(center_xuid, label=center_gamertag, is_center=True, csr=center_csr)
+
+        # Friend nodes + spoke edges
+        for f in friends_to_show:
+            fxuid = f['dst_xuid']
+            fgt = f.get('gamertag') or fxuid[:10]
+            G.add_node(fxuid, label=fgt, is_center=False, csr=f.get('csr') or 0)
+            G.add_edge(center_xuid, fxuid)
+
+        # Cross-edges
+        for src, dst in cross_edge_set:
+            if G.has_node(src) and G.has_node(dst) and not G.has_edge(src, dst):
+                G.add_edge(src, dst)
+
+        # Layout
+        k = 2.5 / max(1, len(G.nodes) ** 0.5)
+        pos = nx.spring_layout(G, seed=42, k=k, iterations=50)
+
+        # Colour scale: friends coloured by CSR
+        friend_csrs = [G.nodes[n]['csr'] for n in friend_xuids if G.has_node(n)]
+        csr_min = min(friend_csrs) if friend_csrs else 0
+        csr_max = max(friend_csrs) if friend_csrs else 1
+        csr_range = max(csr_max - csr_min, 1)
+        colormap = cm.plasma
+        norm = mcolors.Normalize(vmin=csr_min, vmax=csr_max)
+
+        node_colors = []
+        node_sizes = []
+        labels = {}
+        for n in G.nodes:
+            data = G.nodes[n]
+            labels[n] = data['label']
+            if data.get('is_center'):
+                node_colors.append('#FFD700')  # gold for center
+                node_sizes.append(700)
+            else:
+                node_colors.append(colormap(norm(data['csr'])))
+                node_sizes.append(150 + G.degree(n) * 35)
+
+        # Only label center + top-15 friends by CSR to avoid clutter
+        top_xuids = {center_xuid} | {
+            f['dst_xuid']
+            for f in sorted(friends_to_show, key=lambda x: x.get('csr') or 0, reverse=True)[:15]
+        }
+        visible_labels = {n: labels[n] for n in G.nodes if n in top_xuids}
+
+        # Plot
+        bg = '#1a1a2e'
+        fig, ax = plt.subplots(figsize=(13, 10), facecolor=bg)
+        ax.set_facecolor(bg)
+
+        # Spoke edges (center -> friends)
+        spoke_edges = [(u, v) for u, v in G.edges() if center_xuid in (u, v)]
+        cross_list = [(u, v) for u, v in G.edges() if center_xuid not in (u, v)]
+
+        nx.draw_networkx_edges(G, pos, edgelist=spoke_edges,
+                               edge_color='#4a90d9', width=1.0, alpha=0.5, ax=ax)
+        if cross_list:
+            nx.draw_networkx_edges(G, pos, edgelist=cross_list,
+                                   edge_color='#aaaaaa', width=0.5, alpha=0.25, ax=ax)
+
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors,
+                               node_size=node_sizes, linewidths=0.5,
+                               edgecolors='white', ax=ax)
+        nx.draw_networkx_labels(G, pos, labels=visible_labels,
+                                font_size=7, font_color='white', ax=ax)
+
+        # Colourbar (CSR scale)
+        sm = cm.ScalarMappable(cmap=colormap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
+        cbar.set_label('CSR', color='white', fontsize=9)
+        cbar.ax.yaxis.set_tick_params(color='white')
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+
+        shown = len(friends_to_show)
+        total = len(halo_friends)
+        title = f"Halo Network: {center_gamertag}"
+        if total > shown:
+            title += f"  (showing {shown} of {total} Halo friends)"
+        ax.set_title(title, color='white', fontsize=13, pad=12)
+        ax.axis('off')
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor=bg)
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+
     @commands.command(name='crawl', help='Start a background crawl from a seed player. Admin only.')
     @commands.has_permissions(administrator=True)
     async def start_crawl(self, ctx: commands.Context, *inputs):

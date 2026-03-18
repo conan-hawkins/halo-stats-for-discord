@@ -491,7 +491,21 @@ class HaloSocialGraphDB:
             (src_xuid, dst_xuid)
         )
         return cursor.fetchone() is not None
-    
+
+    def get_edges_within_set(self, xuids: list) -> List[Dict]:
+        """Return all graph_friends edges where both endpoints are in the given XUID set."""
+        if len(xuids) < 2:
+            return []
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(xuids))
+        cursor.execute(
+            f"SELECT src_xuid, dst_xuid FROM graph_friends "
+            f"WHERE src_xuid IN ({placeholders}) AND dst_xuid IN ({placeholders})",
+            xuids + xuids
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     # =========================================================================
     # HALO FEATURES OPERATIONS
     # =========================================================================
