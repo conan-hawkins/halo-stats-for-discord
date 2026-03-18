@@ -484,8 +484,14 @@ class HaloStatsDBv2:
         
         # Get all medal columns
         cursor.execute("PRAGMA table_info(medal_sets)")
-        columns = [row['name'] for row in cursor.fetchall() 
-                   if row['name'].startswith('medal_')]
+        columns = []
+        for row in cursor.fetchall():
+            col = row['name']
+            if not col.startswith('medal_'):
+                continue
+            medal_suffix = col.replace('medal_', '', 1)
+            if medal_suffix.isdigit():
+                columns.append(col)
         
         if not columns:
             return {}

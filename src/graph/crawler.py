@@ -19,7 +19,7 @@ Author: Graph Analysis Extension
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
@@ -509,7 +509,11 @@ class GraphCrawler:
                 start_time = m.get('start_time')
                 if start_time:
                     try:
-                        match_times.append(datetime.fromisoformat(start_time.replace('Z', '+00:00')))
+                        parsed = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                        # Normalize all timestamps to naive UTC so mixed timezone inputs compare safely.
+                        if parsed.tzinfo is not None:
+                            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                        match_times.append(parsed)
                     except:
                         pass
             

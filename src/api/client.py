@@ -148,6 +148,7 @@ class HaloAPIClient:
         spartan_info = cache.get("spartan")
         xsts_info = cache.get("xsts")  # Main XSTS token for Halo API
         xsts_xbox_info = cache.get("xsts_xbox")  # XSTS token for Xbox Live
+        account1_spartan_info = spartan_info
         
         spartan_valid = spartan_info and is_token_valid(spartan_info)
         xsts_valid = xsts_info and is_token_valid(xsts_info)
@@ -250,13 +251,13 @@ class HaloAPIClient:
                 if not refresh_success:
                     print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
             
-            self.spartan_token = spartan_info.get("token")
+            self.spartan_token = account1_spartan_info.get("token")
             
             # Load Spartan accounts
             self.spartan_accounts = []
             self.spartan_accounts.append({
                 'id': 'account1',
-                'token': spartan_info.get("token"),
+                'token': account1_spartan_info.get("token"),
                 'name': 'Account 1'
             })
             
@@ -313,6 +314,7 @@ class HaloAPIClient:
                 xsts_valid = xsts_info and is_token_valid(xsts_info)
                 xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
                 account1_valid = spartan_valid and xsts_valid and xbox_valid
+                account1_spartan_info = spartan_info
                 
                 if account1_valid:
                     print("Account 1 tokens refreshed successfully")
@@ -368,7 +370,7 @@ class HaloAPIClient:
             
             # Load tokens if Account 1 is valid (other accounts are optional)
             if account1_valid:
-                self.spartan_token = spartan_info.get("token")
+                self.spartan_token = account1_spartan_info.get("token")
                 
                 # Reload all accounts after refresh
                 additional_accounts = []
@@ -397,7 +399,7 @@ class HaloAPIClient:
                 self.spartan_accounts = []
                 self.spartan_accounts.append({
                     'id': 'account1',
-                    'token': spartan_info.get("token"),
+                    'token': account1_spartan_info.get("token"),
                     'name': 'Account 1'
                 })
                 

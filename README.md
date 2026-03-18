@@ -94,6 +94,29 @@ Each opens an incognito browser window - sign in with a different Microsoft acco
 python run.py
 ```
 
+## Testing
+
+This repository now uses a pytest-based unit test suite with coverage reporting.
+
+### Install Test Dependencies
+
+```bash
+pip install -r requirements-test.txt
+```
+
+### Run Unit Tests
+
+```bash
+pytest
+```
+
+### Coverage Output
+
+Running `pytest` generates:
+
+- terminal coverage report with missing lines
+- `coverage.xml` for CI integrations
+
 ## Commands
 
 ### Stats Commands
