@@ -46,6 +46,7 @@ class CrawlConfig:
     batch_size: int = 10
     collect_stats: bool = True
     stats_matches_to_process: int = 50
+    collect_full_history: bool = False
     min_crawl_age_hours: int = 24
     max_friends_per_node: int = 500
     sample_high_degree: bool = True
@@ -392,8 +393,18 @@ class GraphCrawler:
             if player:
                 # Player exists - check if we've already determined their Halo status
                 if player.get('halo_active') == 1:
-                    # Already known to be Halo-active
-                    if player.get('last_crawled') is None:
+                    # Re-validate known-active players with current recency cutoff to avoid stale flags.
+                    checked_count += 1
+                    is_active = await self._is_halo_active(xuid, gamertag, xuid_cache=xuid_cache)
+
+                    self.db.insert_or_update_player(
+                        xuid=xuid,
+                        gamertag=gamertag,
+                        halo_active=is_active,
+                        crawl_depth=depth
+                    )
+
+                    if is_active and player.get('last_crawled') is None:
                         queue_items.append((xuid, 50, depth))
                         self.progress.halo_players_found += 1
                         active_count += 1
@@ -448,12 +459,11 @@ class GraphCrawler:
             gamertag: Player's gamertag (optional)
             xuid_cache: Pre-loaded XUID cache dict (optional, will load if not provided)
         """
-        from datetime import datetime
-        CUTOFF_DATE = datetime(2025, 9, 1)
+        cutoff_date = self.config.halo_active_since if hasattr(self.config, 'halo_active_since') else datetime(2025, 9, 1)
         
         try:
             # Always use the API to check recent Halo activity
-            is_recent, last_match_date = await self.api.check_recent_halo_activity(xuid, CUTOFF_DATE)
+            is_recent, last_match_date = await self.api.check_recent_halo_activity(xuid, cutoff_date)
             print(is_recent,last_match_date)
             return is_recent
         except Exception as e:
@@ -467,12 +477,15 @@ class GraphCrawler:
         Stores results in the halo_features table.
         """
         try:
+            matches_to_process = None if self.config.collect_full_history else self.config.stats_matches_to_process
+
             # Get stats via API
             stats = await self.api.calculate_comprehensive_stats(
                 xuid=xuid,
                 stat_type="overall",
                 gamertag=gamertag,
-                matches_to_process=self.config.stats_matches_to_process
+                matches_to_process=matches_to_process,
+                force_full_fetch=self.config.collect_full_history
             )
             
             if stats.get('error') != 0:
@@ -527,9 +540,11 @@ class GraphCrawler:
                 if time_span > 0:
                     matches_week = (total_matches / time_span) * 7
             
-            # Get CSR from computed stats if available
-            csr = computed_stats.get('estimated_csr', 0)
-            csr_tier = computed_stats.get('csr_tier', '')
+            # CSR is optional in the current stats payload. Keep it as NULL when absent.
+            csr = computed_stats.get('estimated_csr')
+            if csr is None:
+                csr = computed_stats.get('csr')
+            csr_tier = computed_stats.get('csr_tier')
             
             # Save to database
             self.db.insert_or_update_halo_features(
@@ -553,11 +568,17 @@ class GraphCrawler:
                 first_match=first_match
             )
             
-            # Mark player as Halo-active
+            cutoff_date = self.config.halo_active_since if hasattr(self.config, 'halo_active_since') else datetime(2025, 9, 1)
+            if cutoff_date.tzinfo is not None:
+                cutoff_date = cutoff_date.astimezone(timezone.utc).replace(tzinfo=None)
+            latest_match_dt = max(match_times) if match_times else None
+            is_recently_active = bool(latest_match_dt and latest_match_dt >= cutoff_date)
+
+            # Keep halo_active aligned with the configured recency cutoff.
             self.db.insert_or_update_player(
                 xuid=xuid,
                 gamertag=gamertag,
-                halo_active=True
+                halo_active=is_recently_active
             )
             
             self.progress.nodes_with_stats += 1

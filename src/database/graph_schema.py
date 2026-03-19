@@ -465,6 +465,65 @@ class HaloSocialGraphDB:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM graph_friends WHERE src_xuid = ?", (xuid,))
         return cursor.fetchone()[0]
+
+    def get_halo_friend_count(self, xuid: str) -> int:
+        """Get count of friends currently marked as Halo-active."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM graph_friends gf
+            JOIN graph_players gp ON gf.dst_xuid = gp.xuid
+            WHERE gf.src_xuid = ?
+            AND gp.halo_active = 1
+        """, (xuid,))
+        return cursor.fetchone()[0]
+
+    def get_verified_halo_friend_count(self, xuid: str) -> int:
+        """Get count of friends verified Halo-active via recorded Halo matches."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM graph_friends gf
+            JOIN graph_players gp ON gf.dst_xuid = gp.xuid
+            JOIN halo_features hf ON gf.dst_xuid = hf.xuid
+            WHERE gf.src_xuid = ?
+            AND gp.halo_active = 1
+            AND COALESCE(hf.matches_played, 0) > 0
+        """, (xuid,))
+        return cursor.fetchone()[0]
+
+    def get_verified_halo_incoming_friend_count(self, xuid: str) -> int:
+        """Get count of verified Halo-active players who list this xuid as a friend."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM graph_friends gf
+            JOIN graph_players gp ON gf.src_xuid = gp.xuid
+            JOIN halo_features hf ON gf.src_xuid = hf.xuid
+            WHERE gf.dst_xuid = ?
+            AND gp.halo_active = 1
+            AND COALESCE(hf.matches_played, 0) > 0
+        """, (xuid,))
+        return cursor.fetchone()[0]
+
+    def get_verified_halo_incoming_friends(self, xuid: str) -> List[Dict]:
+        """Get verified Halo-active players who list this xuid as a friend."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT gf.src_xuid, gp.gamertag, hf.kd_ratio, hf.matches_played
+            FROM graph_friends gf
+            JOIN graph_players gp ON gf.src_xuid = gp.xuid
+            JOIN halo_features hf ON gf.src_xuid = hf.xuid
+            WHERE gf.dst_xuid = ?
+            AND gp.halo_active = 1
+            AND COALESCE(hf.matches_played, 0) > 0
+            ORDER BY COALESCE(hf.matches_played, 0) DESC, gp.gamertag ASC
+        """, (xuid,))
+        return [dict(row) for row in cursor.fetchall()]
     
     def get_halo_friends(self, xuid: str) -> List[Dict]:
         """Get friends who are also Halo active"""

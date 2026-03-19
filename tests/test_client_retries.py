@@ -86,6 +86,79 @@ async def test_get_match_stats_retries_429_with_account_backoff(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_match_stats_extracts_csr_and_tier(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 8, "Deaths": 4, "Assists": 3, "Medals": []}}}],
+                "Skill": {"Csr": 1523, "Tier": "Platinum 3"},
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT12M",
+            "Playlist": {"AssetId": "p1", "VersionId": "v1"},
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-2", "123", session)
+
+    assert result is not None
+    assert result["csr"] == 1523
+    assert result["csr_tier"] == "Platinum 3"
+
+
+@pytest.mark.asyncio
+async def test_get_match_stats_does_not_infer_csr_from_rank_field(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "Rank": 5,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 8, "Deaths": 4, "Assists": 3, "Medals": []}}}],
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT12M",
+            "Playlist": {"AssetId": "p1", "VersionId": "v1"},
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-3", "123", session)
+
+    assert result is not None
+    assert result["csr"] is None
+
+
+@pytest.mark.asyncio
 async def test_get_match_stats_retries_500_then_fails(monkeypatch):
     client = HaloAPIClient()
 

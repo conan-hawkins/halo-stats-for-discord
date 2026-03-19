@@ -27,7 +27,7 @@ import os
 import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
 
 # Load environment variables before module initialization
@@ -1416,6 +1416,42 @@ class HaloAPIClient:
     # =========================================================================
     # MATCH STATS RETRIEVAL
     # =========================================================================
+
+    @staticmethod
+    def _extract_csr_and_tier(player_payload: Dict) -> Tuple[Optional[float], Optional[str]]:
+        """Strict extraction: only explicit CSR/Tier fields are accepted."""
+        if not isinstance(player_payload, dict):
+            return None, None
+
+        tier_keywords = {'bronze', 'silver', 'gold', 'platinum', 'diamond', 'onyx', 'unranked'}
+        csr_value = None
+        tier_value = None
+
+        def walk(obj):
+            nonlocal csr_value, tier_value
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    key_l = str(key).lower()
+
+                    if csr_value is None and 'csr' in key_l and isinstance(value, (int, float)) and not isinstance(value, bool):
+                        val = float(value)
+                        if 0 <= val <= 5000:
+                            csr_value = val
+
+                    if tier_value is None and 'tier' in key_l and isinstance(value, str):
+                        normalized = value.strip().lower()
+                        if any(token in normalized for token in tier_keywords):
+                            tier_value = value.strip()
+
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, (dict, list)):
+                        walk(item)
+
+        walk(player_payload)
+        return csr_value, tier_value
     
     async def get_match_stats_for_match(
         self,
@@ -1586,6 +1622,8 @@ class HaloAPIClient:
                             is_ranked = playlist_asset_id in ranked_playlist_ids
                         
                         # Build match data with playlist information, map, and player XUIDs
+                        csr, csr_tier = self._extract_csr_and_tier(player)
+
                         match_data = {
                             'match_id': match_id,
                             'outcome': player.get('Outcome', 0),  # 2=Win, 3=Loss, 4=DNF
@@ -1598,6 +1636,8 @@ class HaloAPIClient:
                             'playlist_id': playlist_asset_id,
                             'playlist_version': playlist_version_id,
                             'is_ranked': is_ranked,
+                            'csr': csr,
+                            'csr_tier': csr_tier,
                             'map_id': map_asset_id,
                             'map_version': map_version_id,
                             'players': player_xuids
@@ -2280,6 +2320,8 @@ class HaloAPIClient:
                     kda = round((total_kills + (total_assists / 3)) - total_deaths, 2)
                     avg_kda = round(kda / games_played if games_played > 0 else 0, 2)
                     win_rate = f"{round(wins / games_played * 100 if games_played > 0 else 0, 1)}%"
+                    latest_csr = next((m.get('csr') for m in matches if m.get('csr') is not None), None)
+                    latest_csr_tier = next((m.get('csr_tier') for m in matches if m.get('csr_tier')), None)
                     
                     return {
                         'total_kills': total_kills,
@@ -2293,7 +2335,9 @@ class HaloAPIClient:
                         'kd_ratio': kd_ratio,
                         'kda': kda,
                         'avg_kda': avg_kda,
-                        'win_rate': win_rate
+                        'win_rate': win_rate,
+                        'estimated_csr': latest_csr,
+                        'csr_tier': latest_csr_tier,
                     }
                 
                 # Calculate stats for all three types: overall, ranked, and social

@@ -222,7 +222,7 @@ async def test_check_and_queue_halo_players_uses_known_status_and_api_check():
             flattened.extend(entry)
     assert ("known-active", 50, 1) in flattened
     assert ("unknown", 50, 1) in flattened
-    assert crawler._is_halo_active.await_count == 1
+    assert crawler._is_halo_active.await_count == 2
 
 
 @pytest.mark.asyncio

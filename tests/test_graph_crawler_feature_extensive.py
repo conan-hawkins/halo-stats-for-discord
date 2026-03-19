@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock
+from datetime import datetime
 
 import pytest
 
@@ -142,7 +143,7 @@ async def test_check_and_queue_tracks_known_and_new_players(monkeypatch):
 
     db.get_player = get_player_side_effect
     crawler = GraphCrawler(api_client=api, graph_db=db, config=CrawlConfig(max_depth=4))
-    crawler._is_halo_active = AsyncMock(side_effect=[True, False])
+    crawler._is_halo_active = AsyncMock(side_effect=[True, True, False])
 
     from src.api import xuid_cache as xuid_cache_module
 
@@ -174,6 +175,19 @@ async def test_is_halo_active_handles_api_exception():
     result = await crawler._is_halo_active("xuid-1", "GT")
 
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_is_halo_active_uses_configured_cutoff():
+    api = AsyncMock()
+    api.check_recent_halo_activity = AsyncMock(return_value=(True, datetime(2026, 1, 1)))
+    cutoff = datetime(2026, 1, 1)
+    crawler = GraphCrawler(api_client=api, graph_db=_DB(), config=CrawlConfig(halo_active_since=cutoff))
+
+    result = await crawler._is_halo_active("xuid-1", "GT")
+
+    assert result is True
+    api.check_recent_halo_activity.assert_awaited_once_with("xuid-1", cutoff)
 
 
 @pytest.mark.asyncio
