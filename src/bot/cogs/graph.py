@@ -21,6 +21,9 @@ from src.database.graph_schema import get_graph_db
 from src.api import api_client
 
 
+NETWORK_CONTROLS_TIMEOUT_SECONDS = 900
+
+
 class NetworkNodeInfoSelect(discord.ui.Select):
     """Dropdown for inspecting node details from the rendered network."""
 
@@ -214,8 +217,343 @@ class NetworkNodeInfoView(discord.ui.View):
     """View container for the node info dropdown."""
 
     def __init__(self, node_map: Dict[str, Dict], requester_id: int, db):
-        super().__init__(timeout=300)
+        super().__init__(timeout=NETWORK_CONTROLS_TIMEOUT_SECONDS)
         self.add_item(NetworkNodeInfoSelect(node_map=node_map, requester_id=requester_id, db=db))
+
+
+class NetworkLayoutToggleView(discord.ui.View):
+    """Buttons to render standard vs clustered network layouts from the same command."""
+
+    def __init__(
+        self,
+        cog,
+        requester_id: int,
+        center_xuid: str,
+        center_gamertag: str,
+        halo_friends: List[Dict],
+        center_features: Optional[Dict],
+    ):
+        super().__init__(timeout=NETWORK_CONTROLS_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.center_xuid = center_xuid
+        self.center_gamertag = center_gamertag
+        self.halo_friends = halo_friends
+        self.center_features = center_features
+
+    async def _render_and_send(self, interaction: discord.Interaction, clustered: bool):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the command requester can use these layout controls.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        loop = asyncio.get_event_loop()
+        buf = await loop.run_in_executor(
+            None,
+            lambda: self.cog._render_network_graph(
+                self.center_xuid,
+                self.center_gamertag,
+                self.halo_friends,
+                self.center_features,
+                clustered=clustered,
+            ),
+        )
+        file = discord.File(fp=buf, filename="network_layout.png")
+        mode = "Clustered" if clustered else "Standard"
+        embed = discord.Embed(
+            title=f"Network Layout: {mode}",
+            description="Same network data, alternate arrangement to inspect structure.",
+            colour=0x3498DB,
+            timestamp=datetime.now(),
+        )
+        embed.set_image(url="attachment://network_layout.png")
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
+    @discord.ui.button(label="Standard Layout", style=discord.ButtonStyle.secondary)
+    async def show_standard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._render_and_send(interaction, clustered=False)
+
+    @discord.ui.button(label="Clustered Layout", style=discord.ButtonStyle.primary)
+    async def show_clustered(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._render_and_send(interaction, clustered=True)
+
+
+class NodeSizeFilterSelect(discord.ui.Select):
+    """Select control for minimum node group-size threshold."""
+
+    def __init__(self, options: List[discord.SelectOption]):
+        super().__init__(
+            placeholder="Node Filter (0-50): minimum social group size",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, NetworkFilterView):
+            await interaction.response.send_message("Filter view is unavailable.", ephemeral=True)
+            return
+        if interaction.user.id != view.requester_id:
+            await interaction.response.send_message("Only the command requester can use these controls.", ephemeral=True)
+            return
+
+        try:
+            view.min_group_size = int(self.values[0])
+        except ValueError:
+            view.min_group_size = 0
+        await interaction.response.defer()
+
+
+class EdgeStrengthFilterSelect(discord.ui.Select):
+    """Select control for minimum edge-strength threshold."""
+
+    def __init__(self, options: List[discord.SelectOption]):
+        super().__init__(
+            placeholder="Edge Filter (1-50): minimum link strength",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, NetworkFilterView):
+            await interaction.response.send_message("Filter view is unavailable.", ephemeral=True)
+            return
+        if interaction.user.id != view.requester_id:
+            await interaction.response.send_message("Only the command requester can use these controls.", ephemeral=True)
+            return
+
+        try:
+            view.min_link_strength = float(self.values[0])
+        except ValueError:
+            view.min_link_strength = 1.0
+        await interaction.response.defer()
+
+
+class NetworkFilterView(discord.ui.View):
+    """Interactive threshold filters for node size and edge strength."""
+
+    def __init__(
+        self,
+        cog,
+        requester_id: int,
+        center_xuid: str,
+        center_gamertag: str,
+        halo_friends: List[Dict],
+        center_features: Optional[Dict],
+        base_embed: discord.Embed,
+    ):
+        super().__init__(timeout=NETWORK_CONTROLS_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.center_xuid = center_xuid
+        self.center_gamertag = center_gamertag
+        self.halo_friends = halo_friends
+        self.center_features = center_features
+        self.base_embed = base_embed
+        self.message: Optional[discord.Message] = None
+
+        self.min_group_size = 0
+        self.min_link_strength = 1.0
+        self.clustered = False
+
+        # Keep option counts <= 25 (Discord select limit) while allowing thresholds up to 50.
+        node_thresholds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+        node_options = []
+        for v in node_thresholds:
+            if v == 0:
+                label = "Show all nodes"
+                description = "No node-size filtering"
+            else:
+                label = f"Hide nodes below {v}"
+                description = f"Keep nodes with group size >= {v}"
+            node_options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(v),
+                    description=description[:100],
+                    default=(v == 0),
+                )
+            )
+
+        edge_thresholds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+        edge_options = []
+        for v in edge_thresholds:
+            if v == 1:
+                label = "Show all edges"
+                description = "No edge-strength filtering"
+            else:
+                label = f"Hide edges below {v}"
+                description = f"Keep links with strength >= {v}"
+            edge_options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(v),
+                    description=description[:100],
+                    default=(v == 1),
+                )
+            )
+
+        self.add_item(NodeSizeFilterSelect(node_options))
+        self.add_item(EdgeStrengthFilterSelect(edge_options))
+
+    def _build_description(self, controls_active: bool) -> str:
+        """Build a consistent controls status line for the graph embed."""
+        layout_mode = "Clustered" if self.clustered else "Standard"
+        state = "ACTIVE" if controls_active else "INACTIVE"
+        return (
+            f"Controls: **{state}** ({NETWORK_CONTROLS_TIMEOUT_SECONDS // 60}m timeout)\\n"
+            f"Layout: **{layout_mode}**\\n"
+            f"Filters: node group size >= {self.min_group_size}, "
+            f"edge strength >= {self.min_link_strength:.0f}"
+        )
+
+    def _sync_select_defaults(self):
+        """Keep dropdown selected values aligned with current filter state."""
+        current_group = str(int(self.min_group_size))
+        current_edge = str(int(self.min_link_strength))
+
+        for item in self.children:
+            if isinstance(item, NodeSizeFilterSelect) and item.options:
+                item.options = [
+                    discord.SelectOption(
+                        label=o.label,
+                        value=o.value,
+                        description=o.description,
+                        default=(o.value == current_group),
+                    )
+                    for o in item.options
+                ]
+            elif isinstance(item, EdgeStrengthFilterSelect) and item.options:
+                item.options = [
+                    discord.SelectOption(
+                        label=o.label,
+                        value=o.value,
+                        description=o.description,
+                        default=(o.value == current_edge),
+                    )
+                    for o in item.options
+                ]
+
+    async def _send_filtered(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the command requester can use these controls.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        loop = asyncio.get_event_loop()
+        buf = await loop.run_in_executor(
+            None,
+            lambda: self.cog._render_network_graph(
+                self.center_xuid,
+                self.center_gamertag,
+                self.halo_friends,
+                self.center_features,
+                clustered=self.clustered,
+                min_group_size=self.min_group_size,
+                min_link_strength=self.min_link_strength,
+            ),
+        )
+        self._sync_select_defaults()
+
+        file = discord.File(fp=buf, filename="network.png")
+        embed = self.base_embed.copy()
+        embed.description = self._build_description(controls_active=True)
+        embed.set_image(url="attachment://network.png")
+        await interaction.message.edit(embed=embed, attachments=[file], view=self)
+        self.message = interaction.message
+
+    async def on_timeout(self):
+        if not self.message:
+            return
+        try:
+            embed = self.base_embed.copy()
+            embed.description = self._build_description(controls_active=False)
+            embed.set_image(url="attachment://network.png")
+
+            refresh_view = NetworkRefreshView(
+                requester_id=self.requester_id,
+                source_view=self,
+            )
+            await self.message.edit(embed=embed, view=refresh_view)
+            refresh_view.message = self.message
+        except Exception:
+            # Best-effort timeout cleanup; avoid raising from discord view timeout tasks.
+            return
+
+    @discord.ui.button(label="Apply Filters To Graph", style=discord.ButtonStyle.success)
+    async def apply_filters(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_filtered(interaction)
+
+    @discord.ui.button(label="Reset Filters", style=discord.ButtonStyle.secondary)
+    async def reset_filters(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.min_group_size = 0
+        self.min_link_strength = 1.0
+        self.clustered = False
+        self._sync_select_defaults()
+
+        await self._send_filtered(interaction)
+
+    @discord.ui.button(label="Standard Layout", style=discord.ButtonStyle.secondary, row=2)
+    async def standard_layout(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.clustered = False
+        await self._send_filtered(interaction)
+
+    @discord.ui.button(label="Clustered Layout", style=discord.ButtonStyle.primary, row=2)
+    async def clustered_layout(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.clustered = True
+        await self._send_filtered(interaction)
+
+
+class NetworkRefreshView(discord.ui.View):
+    """Minimal fallback view shown after timeout to refresh controls in-place."""
+
+    def __init__(self, requester_id: int, source_view: NetworkFilterView):
+        super().__init__(timeout=NETWORK_CONTROLS_TIMEOUT_SECONDS)
+        self.requester_id = requester_id
+        self.source_view = source_view
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Refresh Controls", style=discord.ButtonStyle.primary)
+    async def refresh_controls(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the command requester can refresh controls.", ephemeral=True)
+            return
+
+        refreshed_view = NetworkFilterView(
+            cog=self.source_view.cog,
+            requester_id=self.source_view.requester_id,
+            center_xuid=self.source_view.center_xuid,
+            center_gamertag=self.source_view.center_gamertag,
+            halo_friends=self.source_view.halo_friends,
+            center_features=self.source_view.center_features,
+            base_embed=self.source_view.base_embed,
+        )
+        refreshed_view.min_group_size = self.source_view.min_group_size
+        refreshed_view.min_link_strength = self.source_view.min_link_strength
+        refreshed_view.clustered = self.source_view.clustered
+        refreshed_view._sync_select_defaults()
+
+        embed = self.source_view.base_embed.copy()
+        embed.description = refreshed_view._build_description(controls_active=True)
+        embed.set_image(url="attachment://network.png")
+
+        await interaction.response.edit_message(embed=embed, view=refreshed_view)
+        refreshed_view.message = interaction.message
+
+    async def on_timeout(self):
+        if not self.message:
+            return
+
+        try:
+            for item in self.children:
+                item.disabled = True
+            await self.message.edit(view=self)
+        except Exception:
+            # Best-effort timeout cleanup; avoid raising from discord view timeout tasks.
+            return
 
 
 class GraphCog(commands.Cog, name="Graph"):
@@ -226,7 +564,7 @@ class GraphCog(commands.Cog, name="Graph"):
         self.db = get_graph_db()
         self._crawl_task: Optional[asyncio.Task] = None
     
-    @commands.command(name='graphstats', help='Show current social graph statistics')
+    @commands.command(name='graphstats', help='Show current social graph database totals, depth distribution, and size.')
     async def graph_stats(self, ctx: commands.Context):
         """Display statistics about the social graph database"""
         stats = self.db.get_graph_stats()
@@ -285,7 +623,7 @@ class GraphCog(commands.Cog, name="Graph"):
         
         await ctx.send(embed=embed)
     
-    @commands.command(name='similar', help='Find similar Halo players. Example - #similar XxUK D3STROYxX')
+    @commands.command(name='similar', help='Find players with similar Halo performance profiles. Usage: #similar <gamertag>')
     async def find_similar(self, ctx: commands.Context, *inputs):
         """Find players with similar stats using KNN"""
         if not inputs:
@@ -370,7 +708,7 @@ class GraphCog(commands.Cog, name="Graph"):
                 colour=0xFF0000
             ))
     
-    @commands.command(name='hubs', help='Find hub players with many Halo friends')
+    @commands.command(name='hubs', help='Find highly connected hub players. Usage: #hubs [min_friends]')
     async def find_hubs(self, ctx: commands.Context, min_friends: int = 30):
         """Find players with the most Halo-active connections"""
         
@@ -405,7 +743,7 @@ class GraphCog(commands.Cog, name="Graph"):
         except Exception as e:
             await ctx.send(f"Error finding hubs: {str(e)}")
     
-    @commands.command(name='network', help='Show a player\'s Halo friend network. Example - #network XxUK D3STROYxX')
+    @commands.command(name='network', help='Show a player network visualization from graph DB data. Usage: #network <gamertag>')
     async def show_network(self, ctx: commands.Context, *inputs):
         """Show a player's Halo-active friend network with a visual graph image"""
         if not inputs:
@@ -442,6 +780,17 @@ class GraphCog(commands.Cog, name="Graph"):
             halo_flagged_count = len(halo_friends)
             all_friends = self.db.get_friends(xuid)
             features = self.db.get_halo_features(xuid)
+
+            last_crawled_raw = player.get('last_crawled')
+            if last_crawled_raw:
+                try:
+                    last_crawled_dt = datetime.fromisoformat(last_crawled_raw)
+                    crawl_status = f"Last crawl: {last_crawled_dt.strftime('%Y-%m-%d %H:%M')}"
+                except (ValueError, TypeError):
+                    crawl_status = f"Last crawl: {last_crawled_raw}"
+            else:
+                crawl_status = "Player not crawled"
+
             # Keep graph nodes to verified Halo-active friends (have recorded Halo matches).
             halo_friends = [f for f in halo_friends if (f.get('matches_played') or 0) > 0]
             halo_verified_count = len(halo_friends)
@@ -466,7 +815,7 @@ class GraphCog(commands.Cog, name="Graph"):
 
             # Build summary embed
             embed = discord.Embed(
-                title=f"Network: {gamertag}",
+                title=f"Network: {gamertag} ({crawl_status})",
                 colour=0x3498DB,
                 timestamp=datetime.now()
             )
@@ -561,14 +910,30 @@ class GraphCog(commands.Cog, name="Graph"):
                 lambda: self._render_network_graph(xuid, gamertag, friends_to_show, features)
             )
             file = discord.File(fp=buf, filename="network.png")
+            filter_view = NetworkFilterView(
+                cog=self,
+                requester_id=ctx.author.id,
+                center_xuid=xuid,
+                center_gamertag=gamertag,
+                halo_friends=friends_to_show,
+                center_features=features,
+                base_embed=embed,
+            )
+            embed.description = filter_view._build_description(controls_active=True)
             embed.set_image(url="attachment://network.png")
-            await ctx.send(embed=embed, file=file)
+            graph_message = await ctx.send(
+                embed=embed,
+                file=file,
+                view=filter_view,
+            )
+            filter_view.message = graph_message
 
             if len(node_map) > 1:
                 await ctx.send(
                     "Use the selector below for node details:",
                     view=NetworkNodeInfoView(node_map=node_map, requester_id=ctx.author.id, db=self.db),
                 )
+                await ctx.send("Use controls on the graph message to switch layout and apply filters. If controls time out, use **Refresh Controls** on that same message.")
 
         except Exception as e:
             try:
@@ -584,6 +949,9 @@ class GraphCog(commands.Cog, name="Graph"):
         center_gamertag: str,
         halo_friends: list,
         center_features: Optional[dict],
+        clustered: bool = False,
+        min_group_size: int = 0,
+        min_link_strength: float = 1.0,
     ) -> io.BytesIO:
         """Render the friend network as a PNG and return a BytesIO buffer (sync)."""
         import matplotlib
@@ -596,7 +964,10 @@ class GraphCog(commands.Cog, name="Graph"):
         import networkx as nx
 
         MAX_FRIENDS = 60
-        friends_to_show = halo_friends[:MAX_FRIENDS]
+        friends_to_show = [
+            f for f in halo_friends[:MAX_FRIENDS]
+            if (f.get('social_group_size') or 0) >= min_group_size
+        ]
 
         friend_xuids = [f['dst_xuid'] for f in friends_to_show]
         all_xuids = [center_xuid] + friend_xuids
@@ -626,16 +997,93 @@ class GraphCog(commands.Cog, name="Graph"):
                 group_size=f.get('social_group_size') or 0,
                 group_size_inferred=bool(f.get('group_size_inferred')),
             )
-            G.add_edge(center_xuid, fxuid)
+            G.add_edge(center_xuid, fxuid, weight=1.0)
 
         # Cross-edges
         for src, dst in cross_edge_set:
             if G.has_node(src) and G.has_node(dst) and not G.has_edge(src, dst):
-                G.add_edge(src, dst)
+                G.add_edge(src, dst, weight=1.4)
 
-        # Layout: better spacing to reduce dense packing
-        k = 3.5 / max(1, len(G.nodes) ** 0.5)
-        pos = nx.spring_layout(G, seed=42, k=k, iterations=75)
+        if min_link_strength > 1:
+            degree_map = dict(G.degree())
+            edges_to_remove = []
+            for u, v in G.edges():
+                strength = min(degree_map.get(u, 0), degree_map.get(v, 0))
+                if strength < min_link_strength:
+                    edges_to_remove.append((u, v))
+            if edges_to_remove:
+                G.remove_edges_from(edges_to_remove)
+
+        # Keep only nodes reachable from the center after filtering.
+        if G.has_node(center_xuid):
+            reachable = nx.node_connected_component(G, center_xuid)
+            nodes_to_remove = [n for n in G.nodes if n not in reachable]
+            if nodes_to_remove:
+                G.remove_nodes_from(nodes_to_remove)
+
+        # Layout: spread nodes further for readability in dense networks.
+        k = 5.8 / max(1, len(G.nodes) ** 0.5)
+        pos = nx.spring_layout(G, seed=42, k=k, iterations=120, weight='weight')
+
+        if clustered and len(G.nodes) >= 5 and len(G.edges) >= 4:
+            communities = list(nx.algorithms.community.greedy_modularity_communities(G, weight='weight'))
+            if len(communities) > 1:
+                cluster_of = {}
+                for cid, members in enumerate(communities):
+                    for n in members:
+                        cluster_of[n] = cid
+
+                cluster_graph = nx.Graph()
+                for cid in range(len(communities)):
+                    cluster_graph.add_node(cid)
+                for u, v, data in G.edges(data=True):
+                    cu = cluster_of.get(u)
+                    cv = cluster_of.get(v)
+                    if cu is None or cv is None or cu == cv:
+                        continue
+                    w = data.get('weight', 1.0)
+                    if cluster_graph.has_edge(cu, cv):
+                        cluster_graph[cu][cv]['weight'] += w
+                    else:
+                        cluster_graph.add_edge(cu, cv, weight=w)
+
+                cluster_k = 1.9 / max(1, len(cluster_graph.nodes()) ** 0.5)
+                cluster_pos = nx.spring_layout(cluster_graph, seed=42, k=cluster_k, iterations=100, weight='weight')
+
+                clustered_pos = {}
+                for cid, members in enumerate(communities):
+                    sub = G.subgraph(members)
+                    local_k = 1.3 / max(1, len(sub.nodes()) ** 0.5)
+                    local_pos = nx.spring_layout(sub, seed=42, k=local_k, iterations=70, weight='weight')
+                    center = cluster_pos.get(cid, (0.0, 0.0))
+                    radius = 0.18 + 0.025 * min(10, len(sub.nodes()))
+                    for n, coords in local_pos.items():
+                        clustered_pos[n] = (
+                            center[0] + coords[0] * radius,
+                            center[1] + coords[1] * radius,
+                        )
+
+                if len(clustered_pos) == len(G.nodes):
+                    pos = clustered_pos
+
+        # Stretch normalized layout to fill most of the canvas width/height.
+        x_values = [p[0] for p in pos.values()]
+        y_values = [p[1] for p in pos.values()]
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(y_values), max(y_values)
+        x_span = (x_max - x_min) or 1.0
+        y_span = (y_max - y_min) or 1.0
+
+        x_left, x_right = 0.02, 0.84
+        # Reserve extra top room so sparse-node layouts do not sit under legend/colorbars.
+        y_bottom, y_top = 0.03, 0.87
+        pos = {
+            node: (
+                x_left + ((coords[0] - x_min) / x_span) * (x_right - x_left),
+                y_bottom + ((coords[1] - y_min) / y_span) * (y_top - y_bottom),
+            )
+            for node, coords in pos.items()
+        }
 
         # Single colour scale for group size; confidence comes from outlines.
         friend_groups = [
@@ -667,12 +1115,12 @@ class GraphCog(commands.Cog, name="Graph"):
             labels[n] = data['label']
             if data.get('is_center'):
                 node_colors.append('#FFD700')  # gold for center
-                node_sizes.append(700)
+                node_sizes.append(620)
                 node_edge_colors.append('white')
                 node_linewidths.append(1.0)
             else:
                 node_colors.append(group_colormap(group_norm(data['group_size'])))
-                node_sizes.append(150 + G.degree(n) * 35)
+                node_sizes.append(120 + G.degree(n) * 28)
                 if data.get('group_size_inferred'):
                     # Orange outline indicates inferred group size via reciprocal visibility.
                     node_edge_colors.append('#FFA500')
@@ -690,7 +1138,8 @@ class GraphCog(commands.Cog, name="Graph"):
 
         # Plot
         bg = '#1a1a2e'
-        fig, ax = plt.subplots(figsize=(13, 10), facecolor=bg)
+        fig, ax = plt.subplots(figsize=(14.5, 11), facecolor=bg)
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.06)
         ax.set_facecolor(bg)
 
         # Spoke edges (center -> friends)
@@ -726,7 +1175,7 @@ class GraphCog(commands.Cog, name="Graph"):
             G,
             pos,
             labels=visible_labels,
-            font_size=7,
+            font_size=6,
             font_color='white',
             ax=ax,
         )
@@ -736,20 +1185,27 @@ class GraphCog(commands.Cog, name="Graph"):
                 path_effects.Normal(),
             ])
 
-        # Colourbars (group size + link strength).
+        # Colourbars (group size + link strength), horizontal along the top beside legend.
+        group_cax = fig.add_axes([0.36, 0.915, 0.25, 0.018])
+        link_cax = fig.add_axes([0.66, 0.915, 0.25, 0.018])
+        group_cax.set_facecolor(bg)
+        link_cax.set_facecolor(bg)
+
         group_sm = cm.ScalarMappable(cmap=group_colormap, norm=group_norm)
         group_sm.set_array([])
-        group_cbar = fig.colorbar(group_sm, ax=ax, fraction=0.025, pad=0.02)
+        group_cbar = fig.colorbar(group_sm, cax=group_cax, orientation='horizontal')
         group_cbar.set_label('Group Size (YlOrRd: low -> high)', color='white', fontsize=8)
-        group_cbar.ax.yaxis.set_tick_params(color='white')
-        plt.setp(group_cbar.ax.yaxis.get_ticklabels(), color='white')
+        group_cbar.ax.xaxis.set_tick_params(color='white', labelsize=7)
+        plt.setp(group_cbar.ax.xaxis.get_ticklabels(), color='white')
+        group_cbar.outline.set_edgecolor('white')
 
         link_sm = cm.ScalarMappable(cmap=link_colormap, norm=link_norm)
         link_sm.set_array([])
-        link_cbar = fig.colorbar(link_sm, ax=ax, fraction=0.025, pad=0.10)
+        link_cbar = fig.colorbar(link_sm, cax=link_cax, orientation='horizontal')
         link_cbar.set_label('Node Link Strength (Greens: weak -> strong)', color='white', fontsize=9)
-        link_cbar.ax.yaxis.set_tick_params(color='white')
-        plt.setp(link_cbar.ax.yaxis.get_ticklabels(), color='white')
+        link_cbar.ax.xaxis.set_tick_params(color='white', labelsize=7)
+        plt.setp(link_cbar.ax.xaxis.get_ticklabels(), color='white')
+        link_cbar.outline.set_edgecolor('white')
 
         # Graph key for node semantics; outline-only meanings intentionally have no fill.
         legend_handles = [
@@ -793,9 +1249,15 @@ class GraphCog(commands.Cog, name="Graph"):
             title += f"  (showing {shown} of {total} Halo friends)"
         title += f"  |  Private-list nodes: {private_list_count}"
         title += f"  |  Inferred nodes: {inferred_count}"
-        ax.set_title(title, color='white', fontsize=13, pad=12)
+        if min_group_size > 0 or min_link_strength > 1:
+            title += f"  |  Filter N>={min_group_size}, E>={int(min_link_strength)}"
+        if clustered:
+            title += "  |  Layout: Clustered"
+        # Place title at the bottom per user preference.
+        fig.text(0.50, 0.015, title, color='white', fontsize=12, ha='center', va='bottom')
         ax.axis('off')
-        plt.tight_layout()
+        # Keep margins minimal after explicit subplot placement.
+        ax.margins(x=0.0, y=0.0)
 
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor=bg)
@@ -823,6 +1285,36 @@ class GraphCog(commands.Cog, name="Graph"):
         
         if self._crawl_task and not self._crawl_task.done():
             await ctx.send("A crawl is already running. Wait for it to complete or restart the bot.")
+            return
+
+        # Early detection: avoid launching crawl for known/private friend-list profiles.
+        seed_xuid = await api_client.resolve_gamertag_to_xuid(gamertag)
+        if not seed_xuid:
+            await ctx.send(f"Could not resolve **{gamertag}**. Check spelling and try again.")
+            return
+
+        seed_player = self.db.get_player(seed_xuid)
+        if seed_player and seed_player.get('profile_visibility') == 'private':
+            await ctx.send(
+                f"Cannot crawl **{gamertag}**: profile is marked private (friends list not visible)."
+            )
+            return
+
+        try:
+            seed_friends_probe = await api_client.get_friends_list(seed_xuid)
+        except Exception as e:
+            await ctx.send(f"Unable to verify seed profile visibility before crawl: {str(e)}")
+            return
+
+        if seed_friends_probe.get('is_private'):
+            self.db.insert_or_update_player(
+                xuid=seed_xuid,
+                gamertag=gamertag,
+                profile_visibility='private',
+            )
+            await ctx.send(
+                f"Cannot crawl **{gamertag}**: friends list is private/unavailable."
+            )
             return
         
         await ctx.send(f"Starting background crawl from **{gamertag}** with depth {depth}...\nUse `#graphstats` to check progress.")

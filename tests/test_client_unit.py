@@ -125,3 +125,90 @@ async def test_get_clearance_token_loads_valid_spartan(monkeypatch):
     ok = await client.get_clearance_token()
     assert ok is True
     assert client.spartan_token == "spartan-token"
+
+
+@pytest.mark.asyncio
+async def test_calculate_comprehensive_stats_bounded_fetch_stops_at_required_pages(monkeypatch):
+    client = HaloAPIClient()
+    client.spartan_token = "spartan-token"
+
+    from src.api import client as client_module
+
+    class _FakeRateLimiter:
+        async def wait_if_needed(self, force_account=None):
+            return 0
+
+        def set_backoff(self, seconds, account_index=None):
+            return None
+
+    class _FakeResponse:
+        def __init__(self, status, payload):
+            self.status = status
+            self._payload = payload
+            self.headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return self._payload
+
+        async def text(self):
+            return ""
+
+    requested_starts = []
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, headers=None):
+            start = int(url.split("start=")[1].split("&")[0])
+            requested_starts.append(start)
+
+            if start >= 50:
+                return _FakeResponse(200, {"Results": []})
+
+            matches = [{"MatchId": f"m{start + i}"} for i in range(25)]
+            return _FakeResponse(200, {"Results": matches})
+
+    monkeypatch.setattr(client_module, "halo_stats_rate_limiter", _FakeRateLimiter())
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda *args, **kwargs: _FakeSession())
+    monkeypatch.setattr(client_module.aiohttp, "TCPConnector", lambda *args, **kwargs: object())
+    monkeypatch.setattr(client_module.aiohttp, "ClientTimeout", lambda *args, **kwargs: object())
+
+    monkeypatch.setattr(client, "load_cached_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *args, **kwargs: None)
+
+    async def _fake_match_detail(match_id, player_xuid, session):
+        return {
+            "match_id": match_id,
+            "kills": 1,
+            "deaths": 1,
+            "assists": 0,
+            "outcome": 2,
+            "is_ranked": False,
+            "start_time": "2026-01-01T00:00:00",
+            "csr": None,
+            "csr_tier": None,
+        }
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _fake_match_detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="test-xuid",
+        stat_type="overall",
+        gamertag="Tester",
+        matches_to_process=50,
+        force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert result["stats"]["games_played"] == 50
+    assert sorted(requested_starts) == [0, 25]

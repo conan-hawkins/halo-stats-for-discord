@@ -26,7 +26,8 @@ import json
 import os
 import time
 import traceback
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
 
@@ -246,8 +247,7 @@ class HaloAPIClient:
                             safe_write_json(TOKEN_CACHE_FILE, account1_backup)
                         except:
                             pass
-                
-                # If refresh failed, just skip this account (don't spam device code prompts)
+
                 if not refresh_success:
                     print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
             
@@ -323,6 +323,7 @@ class HaloAPIClient:
                     return False
             
             # Refresh additional accounts (2-5) if needed
+            refreshed_account_attempts = set()
             for i in range(2, 6):
                 cache_file = get_token_cache_path(i)
                 account_cache = safe_read_json(cache_file, default={})
@@ -343,6 +344,7 @@ class HaloAPIClient:
                 if not account_valid:
                     oauth_info = account_cache.get("oauth")
                     if oauth_info and oauth_info.get("refresh_token"):
+                        refreshed_account_attempts.add(i)
                         print(f"Refreshing Account {i} tokens...")
                         
                         # CRITICAL FIX: Swap cache files so run_auth_flow uses this account's tokens
@@ -362,8 +364,6 @@ class HaloAPIClient:
                         
                         # 5. Restore Account 1's original cache
                         safe_write_json(TOKEN_CACHE_FILE, account1_backup)
-                        
-                        print(f"Account {i} tokens refreshed")
                     else:
                         print(f"No OAuth refresh token for Account {i}")
                         print(f"Run: python setup_account{i}.py")
@@ -386,7 +386,15 @@ class HaloAPIClient:
                         spartan_valid = spartan_info_acc and is_token_valid(spartan_info_acc)
                         xsts_valid = xsts_info_acc and is_token_valid(xsts_info_acc)
                         xbox_valid = xsts_xbox_info_acc and is_token_valid(xsts_xbox_info_acc)
-                        
+
+                        if i in refreshed_account_attempts:
+                            if spartan_valid and xsts_valid and xbox_valid:
+                                print(f"Account {i} tokens refreshed successfully")
+                            else:
+                                print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
+                        elif not (spartan_valid and xsts_valid and xbox_valid):
+                            print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
+
                         if spartan_valid and xsts_valid and xbox_valid:
                             additional_accounts.append({
                                 'id': f'account{i}',
@@ -405,7 +413,7 @@ class HaloAPIClient:
                 
                 # Add all valid additional accounts
                 self.spartan_accounts.extend(additional_accounts)
-                print(f"All tokens refreshed - Loaded {len(self.spartan_accounts)} Spartan accounts")
+                print(f"Token refresh complete - Loaded {len(self.spartan_accounts)} valid Spartan account(s)")
                 
                 # Load Xbox accounts for friends list API
                 self._load_xbox_accounts()
@@ -479,158 +487,6 @@ class HaloAPIClient:
         if self.xbox_accounts:
             print(f"📱 Loaded {len(self.xbox_accounts)} Xbox account(s) for friends list")
             xbox_profile_rate_limiter.set_num_accounts(len(self.xbox_accounts))
-    
-    async def _attempt_device_code_auth(self, account_num: int, cache_file: str) -> Optional[Dict]:
-        """
-        Attempt device code authentication for a specific account.
-        
-        This is used when refresh tokens have expired (90+ days without use).
-        Prints instructions for the user to authenticate via any browser.
-        
-        Args:
-            account_num: Account number (2-5)
-            cache_file: Path to the account's token cache file
-            
-        Returns:
-            Account dict if successful, None if failed/skipped
-        """
-        from src.auth.tokens import OAuthFlow, XboxAuth, HaloAuth
-        import webbrowser
-        
-        try:
-            oauth = OAuthFlow(self.client_id, self.client_secret)
-            
-            # Start device code flow
-            device_info = oauth.start_device_code_flow()
-            if not device_info:
-                print(f"❌ Account {account_num}: Failed to start device code flow")
-                return None
-            
-            user_code = device_info['user_code']
-            verification_uri = device_info['verification_uri']
-            
-            # Try to copy code to clipboard
-            clipboard_success = False
-            try:
-                import subprocess
-                # Windows clipboard
-                subprocess.run(['clip'], input=user_code.encode(), check=True)
-                clipboard_success = True
-            except:
-                #try:
-                    #import pyperclip
-                    #pyperclip.copy(user_code)
-                    #clipboard_success = True
-                #except:
-                pass
-            
-            # Open browser automatically
-            browser_opened = False
-            try:
-                webbrowser.open(verification_uri)
-                browser_opened = True
-            except:
-                pass
-            
-            # Print clear instructions
-            print(f"\n{'='*60}")
-            print(f"🔐 ACCOUNT {account_num} REQUIRES RE-AUTHENTICATION")
-            print(f"{'='*60}")
-            if browser_opened:
-                print(f"✅ Browser opened automatically!")
-            else:
-                print(f"1. Go to: {verification_uri}")
-            if clipboard_success:
-                print(f"✅ Code copied to clipboard: {user_code}")
-                print(f"   Just paste (Ctrl+V) and sign in!")
-            else:
-                print(f"2. Enter code: {user_code}")
-            print(f"3. Sign in with the Microsoft account for Account {account_num}")
-            print(f"   (You have {device_info['expires_in'] // 60} minutes)")
-            print(f"{'='*60}")
-            print(f"Waiting for authentication...")
-            
-            # Poll for completion (with timeout)
-            oauth_tokens = oauth.poll_device_code(
-                device_info['device_code'],
-                interval=device_info.get('interval', 5),
-                timeout=device_info.get('expires_in', 300)
-            )
-            
-            if not oauth_tokens:
-                print(f"❌ Account {account_num}: Device code authentication failed or timed out")
-                return None
-            
-            print(f"✅ Account {account_num}: OAuth tokens received, completing auth flow...")
-            
-            # Complete the full auth flow with the new OAuth tokens
-            # Get Xbox user token (sync)
-            user_token = XboxAuth.request_user_token(oauth_tokens['access_token'])
-            if not user_token:
-                print(f"❌ Account {account_num}: Failed to get Xbox user token")
-                return None
-            
-            # Get dual XSTS tokens (Halo + Xbox) - this also gets the XUID
-            xsts_dual = XboxAuth.get_dual_xsts_tokens(user_token['token'])
-            if not xsts_dual:
-                print(f"❌ Account {account_num}: Failed to get XSTS tokens")
-                return None
-            
-            # Get Spartan token (async)
-            spartan = await HaloAuth.request_spartan_token(xsts_dual['token'])
-            if not spartan:
-                print(f"❌ Account {account_num}: Failed to get Spartan token")
-                return None
-            
-            xuid = xsts_dual.get('xuid')
-            
-            # Get clearance token (async) - optional
-            clearance = None
-            if xuid:
-                clearance = await HaloAuth.request_clearance(spartan['token'], xuid)
-            
-            # Build separate XSTS entries for cache compatibility
-            xsts_halo = {
-                'token': xsts_dual['token'],
-                'expires_at': xsts_dual['expires_at'],
-                'xuid': xuid,
-                'uhs': xsts_dual.get('uhs'),
-                'xbox_token': xsts_dual.get('xbox_token'),
-                'xbox_expires_at': xsts_dual.get('xbox_expires_at')
-            }
-            xsts_xbox = {
-                'token': xsts_dual.get('xbox_token'),
-                'expires_at': xsts_dual.get('xbox_expires_at'),
-                'uhs': xsts_dual.get('uhs')
-            }
-            
-            # Build cache
-            new_cache = {
-                'oauth': oauth_tokens,
-                'user': user_token,
-                'xsts': xsts_halo,
-                'xsts_xbox': xsts_xbox,
-                'spartan': spartan,
-                'clearance': clearance or {}
-            }
-            
-            # Save to account's cache file
-            safe_write_json(cache_file, new_cache)
-            
-            print(f"✅ Account {account_num}: Successfully authenticated and saved!")
-            
-            return {
-                'id': f'account{account_num}',
-                'token': spartan.get("token"),
-                'name': f'Account {account_num}',
-                'cache_file': cache_file
-            }
-            
-        except Exception as e:
-            print(f"❌ Account {account_num}: Device code auth error: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
     
     def get_xbox_account(self, account_index: Optional[int] = None) -> Optional[Dict]:
         """
@@ -1679,6 +1535,14 @@ class HaloAPIClient:
         """
         if cutoff_date is None:
             cutoff_date = datetime(2025, 9, 1)
+
+        def _normalize_utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
+            """Convert datetime to UTC naive for safe comparisons."""
+            if dt is None:
+                return None
+            if dt.tzinfo is not None:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -1726,7 +1590,7 @@ class HaloAPIClient:
                                 return (False, None)
                             
                             # Check if match is after cutoff
-                            is_recent = last_match_date >= cutoff_date
+                            is_recent = _normalize_utc_naive(last_match_date) >= _normalize_utc_naive(cutoff_date)
                             return (is_recent, last_match_date)
                             
                         elif response.status == 401:
@@ -2135,7 +1999,12 @@ class HaloAPIClient:
                     num_accounts = len(self.spartan_accounts) if self.spartan_accounts else 1
                     max_in_flight = min(num_accounts * 5, 25)  # 5 per account, max 25 total
                     current_page = 0
-                    max_pages = 999999
+                    bounded_fetch = matches_to_process < 999999
+                    if bounded_fetch:
+                        max_pages = max(0, math.ceil(matches_to_process / PAGE_SIZE))
+                        print(f"Bounded fetch enabled: request={matches_to_process} matches, max_pages={max_pages}")
+                    else:
+                        max_pages = 999999
                     got_empty_page = False
                     
                     # Use asyncio queue for rolling concurrency
@@ -2164,6 +2033,11 @@ class HaloAPIClient:
                                 break
                             elif page and len(page) > 0:
                                 all_matches.extend(page)
+
+                                # For bounded requests, stop enqueuing once enough matches are gathered.
+                                if bounded_fetch and len(all_matches) >= matches_to_process:
+                                    got_empty_page = True
+
                                 # Start next page request immediately
                                 if current_page < max_pages and not got_empty_page:
                                     new_task = asyncio.create_task(fetch_and_track(current_page))

@@ -803,12 +803,13 @@ class HaloSocialGraphDB:
             print(f"Error adding to crawl queue: {e}")
             return False
     
-    def add_to_crawl_queue_batch(self, items: List[Tuple[str, int, int]]) -> int:
+    def add_to_crawl_queue_batch(self, items: List[Tuple[str, int, int]], force_pending: bool = False) -> int:
         """
         Batch add items to crawl queue.
         
         Args:
             items: List of (xuid, priority, depth) tuples
+            force_pending: If True, reset status to pending even if previously completed
         
         Returns:
             Number of items added
@@ -821,13 +822,26 @@ class HaloSocialGraphDB:
         
         try:
             for xuid, priority, depth in items:
-                cursor.execute("""
-                    INSERT INTO crawl_queue (xuid, priority, depth, status, added_at)
-                    VALUES (?, ?, ?, 'pending', ?)
-                    ON CONFLICT(xuid) DO UPDATE SET
-                        priority = MAX(crawl_queue.priority, excluded.priority),
-                        depth = MIN(crawl_queue.depth, excluded.depth)
-                """, (xuid, priority, depth, now))
+                if force_pending:
+                    cursor.execute("""
+                        INSERT INTO crawl_queue (xuid, priority, depth, status, added_at)
+                        VALUES (?, ?, ?, 'pending', ?)
+                        ON CONFLICT(xuid) DO UPDATE SET
+                            priority = MAX(crawl_queue.priority, excluded.priority),
+                            depth = MIN(crawl_queue.depth, excluded.depth),
+                            status = 'pending',
+                            started_at = NULL,
+                            completed_at = NULL,
+                            error_message = NULL
+                    """, (xuid, priority, depth, now))
+                else:
+                    cursor.execute("""
+                        INSERT INTO crawl_queue (xuid, priority, depth, status, added_at)
+                        VALUES (?, ?, ?, 'pending', ?)
+                        ON CONFLICT(xuid) DO UPDATE SET
+                            priority = MAX(crawl_queue.priority, excluded.priority),
+                            depth = MIN(crawl_queue.depth, excluded.depth)
+                    """, (xuid, priority, depth, now))
                 count += 1
             
             conn.commit()
@@ -898,6 +912,62 @@ class HaloSocialGraphDB:
         stats['total'] = cursor.fetchone()[0]
         
         return stats
+
+    def requeue_in_progress_items(self) -> int:
+        """Reset all in-progress crawl queue items back to pending."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("""
+                UPDATE crawl_queue
+                SET status = 'pending',
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error_message = NULL
+                WHERE status = 'in_progress'
+            """)
+            updated = cursor.rowcount or 0
+            conn.commit()
+            return updated
+        except Exception as e:
+            print(f"Error requeueing in-progress items: {e}")
+            conn.rollback()
+            return 0
+
+    def retry_failed_items(self, error_contains: str = None) -> int:
+        """
+        Reset failed crawl queue items back to pending and increment retry_count.
+
+        Args:
+            error_contains: Optional case-insensitive substring filter for error_message.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            params = []
+            where = "status = 'failed'"
+            if error_contains:
+                where += " AND LOWER(COALESCE(error_message, '')) LIKE ?"
+                params.append(f"%{error_contains.lower()}%")
+
+            cursor.execute(f"""
+                UPDATE crawl_queue
+                SET status = 'pending',
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error_message = NULL,
+                    retry_count = COALESCE(retry_count, 0) + 1
+                WHERE {where}
+            """, params)
+            updated = cursor.rowcount or 0
+            conn.commit()
+            return updated
+        except Exception as e:
+            print(f"Error retrying failed items: {e}")
+            conn.rollback()
+            return 0
     
     # =========================================================================
     # GRAPH ANALYTICS

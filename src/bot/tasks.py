@@ -56,33 +56,47 @@ async def proactive_token_refresh():
             oauth_info = account_cache.get("oauth")
             if oauth_info and oauth_info.get("refresh_token"):
                 print(f"🔄 Proactively refreshing Account {i}...")
+                account1_backup = safe_read_json(TOKEN_CACHE_FILE, default={})
                 
                 try:
-                    # Backup Account 1's cache
-                    account1_backup = safe_read_json(TOKEN_CACHE_FILE, default={})
-                    
                     # Swap to this account's cache
-                    safe_write_json(TOKEN_CACHE_FILE, account_cache)
+                    candidate_cache = dict(account_cache)
+
+                    # Force-refresh path: expire derived tokens so auth flow must re-mint them.
+                    for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
+                        token_info = candidate_cache.get(key)
+                        if token_info:
+                            token_copy = dict(token_info)
+                            token_copy["expires_at"] = 0
+                            candidate_cache[key] = token_copy
+
+                    safe_write_json(TOKEN_CACHE_FILE, candidate_cache)
                     
                     # Run auth flow to refresh
                     await run_auth_flow(client_id, client_secret, use_halo=True)
                     
-                    # Save refreshed tokens back
+                    # Save refreshed tokens back only if they are valid.
                     refreshed = safe_read_json(TOKEN_CACHE_FILE, default={})
-                    if refreshed:
+                    refreshed_spartan = refreshed.get("spartan")
+                    refreshed_xsts = refreshed.get("xsts")
+                    refreshed_xbox = refreshed.get("xsts_xbox")
+                    refreshed_valid = (
+                        refreshed_spartan and is_token_valid(refreshed_spartan) and
+                        refreshed_xsts and is_token_valid(refreshed_xsts) and
+                        refreshed_xbox and is_token_valid(refreshed_xbox)
+                    )
+
+                    if refreshed and refreshed_valid:
                         safe_write_json(cache_file, refreshed)
                         print(f"✅ Account {i} tokens refreshed proactively")
-                    
-                    # Restore Account 1's cache
-                    safe_write_json(TOKEN_CACHE_FILE, account1_backup)
+                    else:
+                        print(f"⚠️ Account {i} proactive refresh produced invalid tokens")
                     
                 except Exception as e:
                     print(f"⚠️ Account {i} proactive refresh failed: {e}")
-                    # Try to restore Account 1's cache
-                    try:
-                        safe_write_json(TOKEN_CACHE_FILE, account1_backup)
-                    except:
-                        pass
+                finally:
+                    # Always restore Account 1's cache
+                    safe_write_json(TOKEN_CACHE_FILE, account1_backup)
         
         print("🔄 Weekly proactive refresh complete")
     except Exception as e:

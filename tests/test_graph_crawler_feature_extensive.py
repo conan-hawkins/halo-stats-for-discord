@@ -14,6 +14,7 @@ class _DB:
         self.queue_batch = []
         self.crawled = []
         self.features = []
+        self.halo_features_by_xuid = {}
 
     def mark_queue_item_complete(self, xuid, error=None):
         self.completed.append((xuid, error))
@@ -27,7 +28,7 @@ class _DB:
         self.inserted_edges.append(edges)
         return len(edges)
 
-    def add_to_crawl_queue_batch(self, items):
+    def add_to_crawl_queue_batch(self, items, force_pending=False):
         self.queue_batch.append(items)
         return len(items)
 
@@ -41,6 +42,9 @@ class _DB:
     def insert_or_update_halo_features(self, **kwargs):
         self.features.append(kwargs)
         return True
+
+    def get_halo_features(self, xuid):
+        return self.halo_features_by_xuid.get(xuid)
 
 
 @pytest.mark.asyncio
@@ -142,6 +146,9 @@ async def test_check_and_queue_tracks_known_and_new_players(monkeypatch):
         return None
 
     db.get_player = get_player_side_effect
+    db.halo_features_by_xuid = {
+        "known_active": {"last_match": "2026-01-05T00:00:00", "matches_played": 25}
+    }
     crawler = GraphCrawler(api_client=api, graph_db=db, config=CrawlConfig(max_depth=4))
     crawler._is_halo_active = AsyncMock(side_effect=[True, True, False])
 

@@ -225,3 +225,41 @@ async def test_refresh_success_reloads_accounts_and_sets_primary_token(monkeypat
     assert client.spartan_token == "spartan-acc1-refreshed"
     assert len(client.spartan_accounts) == 2
     assert tracker["loaded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_additional_account_refresh_succeeds_and_restores_primary_cache(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    acc1_valid = _valid_bundle("acc1")
+    acc2_invalid = _invalid_bundle("acc2", with_refresh=True)
+
+    store = {
+        str(client_module.TOKEN_CACHE_FILE): copy.deepcopy(acc1_valid),
+        str(client_module.get_token_cache_path(2)): copy.deepcopy(acc2_invalid),
+    }
+    _install_store(monkeypatch, store)
+    monkeypatch.setattr(client_module, "is_token_valid", lambda info: bool(info and info.get("expires_at", 0) > 0))
+
+    async def fake_auth(*args, **kwargs):
+        # During additional-account refresh, token_cache.json holds account2's swapped cache.
+        current = store[str(client_module.TOKEN_CACHE_FILE)]
+        oauth_rt = current.get("oauth", {}).get("refresh_token")
+        if oauth_rt == "rt-acc2":
+            store[str(client_module.TOKEN_CACHE_FILE)] = _valid_bundle("acc2-refreshed")
+
+    monkeypatch.setattr(client_module, "run_auth_flow", fake_auth)
+    monkeypatch.setattr(client, "_load_xbox_accounts", lambda: None)
+
+    ok = await client.ensure_valid_tokens()
+
+    assert ok is True
+    # Primary cache should be restored after refreshing additional account.
+    assert store[str(client_module.TOKEN_CACHE_FILE)]["spartan"]["token"] == acc1_valid["spartan"]["token"]
+    # Account 2 cache should now hold refreshed valid tokens and be loaded.
+    assert store[str(client_module.get_token_cache_path(2))]["spartan"]["token"] == "spartan-acc2-refreshed"
+    assert any(acc["id"] == "account2" for acc in client.spartan_accounts)
+
+

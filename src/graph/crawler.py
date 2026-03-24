@@ -48,7 +48,7 @@ class CrawlConfig:
     stats_matches_to_process: int = 50
     collect_full_history: bool = False
     min_crawl_age_hours: int = 24
-    max_friends_per_node: int = 500
+    max_friends_per_node: int = 1000
     sample_high_degree: bool = True
     progress_callback: Optional[Callable] = None
     save_interval: int = 10  # Save progress every N nodes
@@ -119,6 +119,18 @@ class GraphCrawler:
             return self.progress
         
         print(f"[CRAWLER] Starting crawl from seed XUID: {seed_xuid}")
+
+        # Recover stale queue state from interrupted runs.
+        recovered_in_progress = self.db.requeue_in_progress_items()
+        if recovered_in_progress:
+            print(f"[CRAWLER] Re-queued {recovered_in_progress} stale in-progress items")
+
+        # Retry previously failed items caused by known datetime mismatch issues.
+        retried_datetime_failures = self.db.retry_failed_items(
+            error_contains="offset-naive and offset-aware"
+        )
+        if retried_datetime_failures:
+            print(f"[CRAWLER] Re-queued {retried_datetime_failures} prior datetime-failed items")
         
         # Check if seed is Halo-active using the API
         from datetime import datetime
@@ -165,6 +177,10 @@ class GraphCrawler:
     
     async def resume_crawl(self) -> CrawlProgress:
         """Resume a previously paused or interrupted crawl"""
+        recovered_in_progress = self.db.requeue_in_progress_items()
+        if recovered_in_progress:
+            print(f"[CRAWLER] Re-queued {recovered_in_progress} stale in-progress items")
+
         queue_stats = self.db.get_queue_stats()
         pending = queue_stats.get('pending', 0) + queue_stats.get('in_progress', 0)
         
@@ -255,6 +271,14 @@ class GraphCrawler:
             gamertag = player.get('gamertag') if player else None
             
             print(f"[CRAWLER] Processing: {gamertag or xuid} (depth={depth})")
+            
+            # Early check: skip API call if profile is already known to be private
+            profile_visibility = player.get('profile_visibility') if player else 'unknown'
+            if profile_visibility == 'private':
+                print(f"[CRAWLER] Skipping {gamertag or xuid} - profile already marked as private")
+                self.progress.private_profiles += 1
+                self.db.mark_queue_item_complete(xuid)
+                return
             
             # Fetch friends list
             friends_result = await self.api.get_friends_list(xuid)
@@ -365,7 +389,8 @@ class GraphCrawler:
         """
         Check if players are Halo-active and queue them for crawling.
         
-        Uses the Halo API to check if players have recent match history.
+        Uses XUID cache for instant recognition, then concurrent API calls for all others.
+        Re-validates all players to catch those who became active again.
         Only queues Halo-active players to avoid exponential explosion.
         
         Args:
@@ -377,94 +402,205 @@ class GraphCrawler:
             return
         
         queue_items = []
-        checked_count = 0
-        active_count = 0
+
+        def _parse_iso_datetime(value):
+            """Best-effort ISO datetime parsing for DB timestamps."""
+            if not value:
+                return None
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+                except ValueError:
+                    return None
+            return None
+
+        def _normalize_utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
+            """Convert datetime to UTC naive for safe comparisons."""
+            if dt is None:
+                return None
+            if dt.tzinfo is not None:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
         
-        # Pre-load XUID cache once for all checks (contains ~24k+ known Halo players)
-        from src.api.xuid_cache import load_xuid_cache
-        xuid_cache = load_xuid_cache()
-        print(f"[CRAWLER] Loaded XUID cache with {len(xuid_cache)} known Halo players")
         print(f"[CRAWLER] Checking {len(players)} friends for Halo activity...")
         
+        # Categorize players for efficient checking.
+        # Strict fast-path only for players with recent Halo feature evidence.
+        confirmed_cache_hits = []
+        needs_check = []
+        stale_revalidation_candidates = 0
+        
         for xuid, gamertag, is_mutual in players:
-            # Check if already in database with known Halo status
+            player = self.db.get_player(xuid)
+
+            # Early short-circuit: do not spend activity-check budget on known private profiles.
+            if player and player.get('profile_visibility') == 'private':
+                self.progress.private_profiles += 1
+                self.db.insert_or_update_player(
+                    xuid=xuid,
+                    gamertag=gamertag,
+                    halo_active=False,
+                    crawl_depth=depth,
+                    profile_visibility='private',
+                )
+                continue
+
+            if player and player.get('halo_active') == 1:
+                # Strict fast-path: require recent match evidence and non-zero match volume.
+                features = self.db.get_halo_features(xuid)
+                matches_played = (features or {}).get('matches_played') or 0
+                last_match_value = (features or {}).get('last_match') or (features or {}).get('last_match_date')
+                last_match_dt = _parse_iso_datetime(last_match_value)
+                normalized_last_match = _normalize_utc_naive(last_match_dt)
+                normalized_cutoff = _normalize_utc_naive(self.config.halo_active_since)
+
+                if normalized_last_match and normalized_last_match >= normalized_cutoff and matches_played > 0:
+                    confirmed_cache_hits.append((xuid, gamertag, is_mutual))
+                else:
+                    stale_revalidation_candidates += 1
+                    needs_check.append((xuid, gamertag, is_mutual, False))
+            else:
+                # Unconfirmed players are re-validated.
+                needs_check.append((xuid, gamertag, is_mutual, False))
+
+        print(f"[CRAWLER]   Confirmed active (strict fast path): {len(confirmed_cache_hits)}")
+        print(f"[CRAWLER]   Stale/ambiguous active players to revalidate: {stale_revalidation_candidates}")
+        print(f"[CRAWLER]   Need verification: {len(needs_check)}/{len(players)}")
+        
+        active_count = 0
+        
+        # Process confirmed cache hits (instant, no API calls needed)
+        for xuid, gamertag, is_mutual in confirmed_cache_hits:
             player = self.db.get_player(xuid)
             
-            if player:
-                # Player exists - check if we've already determined their Halo status
-                if player.get('halo_active') == 1:
-                    # Re-validate known-active players with current recency cutoff to avoid stale flags.
-                    checked_count += 1
-                    is_active = await self._is_halo_active(xuid, gamertag, xuid_cache=xuid_cache)
-
-                    self.db.insert_or_update_player(
-                        xuid=xuid,
-                        gamertag=gamertag,
-                        halo_active=is_active,
-                        crawl_depth=depth
-                    )
-
-                    if is_active and player.get('last_crawled') is None:
-                        queue_items.append((xuid, 50, depth))
-                        self.progress.halo_players_found += 1
-                        active_count += 1
-                    continue
-                elif player.get('halo_active') == 0 and player.get('last_crawled') is not None:
-                    # Previously checked and confirmed not active - skip
-                    continue
-                # Otherwise, player exists but hasn't been fully checked - continue to check
-            
-            # Check if player is Halo-active via cache or lightweight API check
-            checked_count += 1
-            is_active = await self._is_halo_active(xuid, gamertag, xuid_cache=xuid_cache)
-            
-            # Insert/update player with correct Halo status
             self.db.insert_or_update_player(
                 xuid=xuid,
                 gamertag=gamertag,
-                halo_active=is_active,
+                halo_active=True,
                 crawl_depth=depth
             )
             
-            if is_active:
-                self.progress.halo_players_found += 1
+            # Depth-1 should always be traversed for a new seed crawl, even if previously crawled.
+            if depth == 1 or not player or player.get('last_crawled') is None:
                 queue_items.append((xuid, 50, depth))
+                self.progress.halo_players_found += 1
                 active_count += 1
+        
+        # Process players that need verification - run concurrently with 5-player semaphore
+        async def check_and_insert(xuid: str, gamertag: str, is_mutual: bool, is_cache_hit: bool) -> bool:
+            """Check player activity and insert into DB, return True if Halo-active."""
+            try:
+                # Activity checks are DB/API-based; XUID cache is not used as an activity signal.
+                is_active = await self._is_halo_active(
+                    xuid,
+                    gamertag,
+                    xuid_cache=None,
+                    trust_xuid_cache=False,
+                )
+                
+                self.db.insert_or_update_player(
+                    xuid=xuid,
+                    gamertag=gamertag,
+                    halo_active=is_active,
+                    crawl_depth=depth
+                )
+                
+                return is_active
+            except Exception as e:
+                print(f"[CRAWLER] Error checking {xuid}: {e}")
+                return False
+        
+        # Run checks with limited concurrency (default 5 concurrent API calls)
+        if needs_check:
+            sem = asyncio.Semaphore(5)
+            verified_players = len(needs_check)
+            print(f"[CRAWLER]   Verified players via DB/API checks: {verified_players}")
             
-            # Progress logging every 10 checks (more frequent since API calls are slower)
-            if checked_count % 10 == 0:
-                print(f"[CRAWLER] Checked {checked_count}/{len(players)}, found {active_count} Halo players")
+            async def sem_check(xuid: str, gamertag: str, is_mutual: bool, is_cache_hit: bool):
+                async with sem:
+                    return await check_and_insert(xuid, gamertag, is_mutual, is_cache_hit)
+            
+            tasks = [
+                sem_check(xuid, gamertag, is_mutual, is_cache_hit)
+                for xuid, gamertag, is_mutual, is_cache_hit in needs_check
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for (xuid, gamertag, is_mutual, is_cache_hit), result in zip(needs_check, results):
+                if isinstance(result, bool) and result:
+                    # Queue if active, regardless of prior last_crawled status
+                    # (players can become active again after being inactive)
+                    queue_items.append((xuid, 50, depth))
+                    self.progress.halo_players_found += 1
+                    active_count += 1
         
         print(f"[CRAWLER] Halo check complete: {active_count}/{len(players)} are Halo-active")
         
         # Batch add to queue
         if queue_items:
-            self.db.add_to_crawl_queue_batch(queue_items)
+            # Depth-1 items should be re-queued for each new seed crawl even if previously completed.
+            self.db.add_to_crawl_queue_batch(queue_items, force_pending=(depth == 1))
             print(f"[CRAWLER] Queued {len(queue_items)} players for crawling at depth {depth}")
     
-    async def _is_halo_active(self, xuid: str, gamertag: str = None, xuid_cache: dict = None) -> bool:
+    async def _is_halo_active(
+        self,
+        xuid: str,
+        gamertag: str = None,
+        xuid_cache: dict = None,
+        trust_xuid_cache: bool = True,
+    ) -> bool:
         """
         Check if a player is recently active in Halo Infinite.
         
         Uses multiple checks in order of speed (fastest first):
-        1. Check XUID cache (players appear here if they were in someone's match)
-        2. Check graph DB halo_features table
-        3. Check main stats DB for existing player data
-        4. Lightweight API check - fetches only last match date
+        1. Check graph DB halo_features table - very fast
+        2. Lightweight API check - fetches only last match date (slow, use sparingly)
         
         Returns True if player has played Halo since September 2025.
         
         Args:
             xuid: Player's XUID
             gamertag: Player's gamertag (optional)
-            xuid_cache: Pre-loaded XUID cache dict (optional, will load if not provided)
+            xuid_cache: Reserved for compatibility (not used for activity decisions)
         """
         cutoff_date = self.config.halo_active_since if hasattr(self.config, 'halo_active_since') else datetime(2025, 9, 1)
+
+        def _parse_iso_datetime(value):
+            if not value:
+                return None
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+                except ValueError:
+                    return None
+            return None
+
+        def _normalize_utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
+            """Convert datetime to UTC naive for safe comparisons."""
+            if dt is None:
+                return None
+            if dt.tzinfo is not None:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
         
         try:
-            # Always use the API to check recent Halo activity
+            # 1. Check if we already have halo_features for this player (cached DB lookup)
+            features = self.db.get_halo_features(xuid)
+            if features and (features.get('last_match') or features.get('last_match_date')):
+                last_match = _parse_iso_datetime(features.get('last_match') or features.get('last_match_date'))
+                if last_match is None:
+                    return False
+                normalized_last_match = _normalize_utc_naive(last_match)
+                normalized_cutoff = _normalize_utc_naive(cutoff_date)
+                return normalized_last_match >= normalized_cutoff
+            
+            # 2. Slow check: API call only if not in DB
+            # This is expensive, so we only do it for players not yet evaluated
             is_recent, last_match_date = await self.api.check_recent_halo_activity(xuid, cutoff_date)
-            print(is_recent,last_match_date)
             return is_recent
         except Exception as e:
             print(f"[CRAWLER] Error checking Halo activity for {xuid}: {e}")

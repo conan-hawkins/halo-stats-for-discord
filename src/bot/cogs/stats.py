@@ -21,7 +21,8 @@ from discord.ext import commands
 
 from src.api import get_players_from_recent_matches, api_client
 from src.bot.commands import fetch_and_display_stats, collect_server_stats
-from src.config import XUID_CACHE_FILE, CACHE_PROGRESS_FILE
+from src.config import CACHE_PROGRESS_FILE, PROJECT_ROOT, XUID_CACHE_FILE
+from src.database.graph_schema import get_graph_db
 
 
 class StatsCog(commands.Cog, name="Stats"):
@@ -29,31 +30,110 @@ class StatsCog(commands.Cog, name="Stats"):
     
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @commands.command(name='help', help='Show detailed instructions for all commands or a single command (example: #help network).')
+    async def help_command(self, ctx: commands.Context, command_name: str = None):
+        """Custom help with practical command-by-command usage guidance."""
+        if command_name:
+            cmd = self.bot.get_command(command_name.lower())
+            if not cmd:
+                await ctx.send(f"Unknown command: {command_name}. Use `#help` to see all commands.")
+                return
+
+            embed = discord.Embed(
+                title=f"Help: #{cmd.name}",
+                description=cmd.help or "No additional help is available for this command.",
+                colour=0x00BFFF,
+                timestamp=datetime.now()
+            )
+            if cmd.signature:
+                embed.add_field(name="Usage", value=f"`#{cmd.name} {cmd.signature}`", inline=False)
+            else:
+                embed.add_field(name="Usage", value=f"`#{cmd.name}`", inline=False)
+            embed.set_footer(text="Tip: Gamertags with spaces should be typed normally, e.g. #stats Player Name")
+            await ctx.send(embed=embed)
+            return
+
+        embed = discord.Embed(
+            title="Halo Bot Command Guide",
+            description=(
+                "Use `#help <command>` for focused help on one command.\n"
+                "Example: `#help xboxfriends`"
+            ),
+            colour=0x00BFFF,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="Player Stats Commands",
+            value=(
+                "`#full <gamertag>`: Full lifetime stats from all available matches.\n"
+                "`#ranked <gamertag>`: Ranked-only performance summary.\n"
+                "`#casual <gamertag>`: Social/casual playlist performance summary.\n"
+                "`#populate <gamertag>`: Resolves players from match history and updates XUID cache."
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Social Commands",
+            value=(
+                "`#xboxfriends <gamertag>`: Live Xbox friends + friends-of-friends scan with blacklist checks.\n"
+                "`#network <gamertag>`: Visual graph from data stored in graph database.\n"
+                "`#similar <gamertag>`: Finds players with similar stat profiles from graph DB.\n"
+                "`#hubs [min_friends]`: Lists players with high Halo-active connectivity."
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Admin and Utility Commands",
+            value=(
+                "`#server`: Attempts a server-wide leaderboard by matching Discord members to gamertags.\n"
+                "`#cachestatus`: Shows progress of background caching jobs.\n"
+                "`#graphstats`: Shows social graph database totals and health.\n"
+                "`#crawl <gamertag> [depth]` / `#crawlstop`: Start or stop background graph crawling (admin only)."
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Suggested Workflow",
+            value=(
+                "1) Run `#xboxfriends <gamertag>` to discover social edges quickly.\n"
+                "2) Run `#network <gamertag>` to visualize what is already in graph DB.\n"
+                "3) Run `#crawl <gamertag> 2` to enrich Halo-active and stat-backed graph quality."
+            ),
+            inline=False
+        )
+
+        embed.set_footer(text="Examples use your own gamertags. No specific player names are required.")
+        await ctx.send(embed=embed)
     
-    @commands.command(name='full', help='Get stats from ALL match history. Example - #full XxUK D3STROYxX')
+    @commands.command(name='full', help='Get complete lifetime stats from all available matches. Usage: #full <gamertag>')
     async def full(self, ctx: commands.Context, *inputs):
         """Get complete stats from player's entire match history"""
         gamertag = ''.join(inputs)
         await fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_process=None)
     
-    @commands.command(name='ranked', help='Get stats from RANKED matches only. Example - #ranked XxUK D3STROYxX')
+    @commands.command(name='ranked', help='Get ranked-only stats and performance trends. Usage: #ranked <gamertag>')
     async def ranked(self, ctx: commands.Context, *inputs):
         """Get stats from ranked matches only"""
         gamertag = ''.join(inputs)
         await fetch_and_display_stats(ctx, gamertag, stat_type="ranked", matches_to_process=None)
     
-    @commands.command(name='casual', help='Get stats from CASUAL/SOCIAL matches only. Example - #casual XxUK D3STROYxX')
+    @commands.command(name='casual', help='Get social/casual playlist stats only. Usage: #casual <gamertag>')
     async def casual(self, ctx: commands.Context, *inputs):
         """Get stats from casual/social matches only"""
         gamertag = ''.join(inputs)
         await fetch_and_display_stats(ctx, gamertag, stat_type="social", matches_to_process=None)
     
-    @commands.command(name='server', help='Collect stats from all server members. Bot will try to match Discord names with Halo gamertags.')
+    @commands.command(name='server', help='Build a server leaderboard by matching Discord members to Halo gamertags.')
     async def server_stats(self, ctx: commands.Context):
         """Generate server-wide leaderboard from all members"""
         await collect_server_stats(ctx, self.bot)
     
-    @commands.command(name='populate', help='Resolve and cache gamertags from recent matches. Example - #populate XxUK D3STROYxX')
+    @commands.command(name='populate', help='Resolve and cache players from recent match history. Usage: #populate <gamertag>')
     async def populate_cache(self, ctx: commands.Context, *inputs):
         """Resolve gamertags to XUIDs and populate the XUID cache"""
         if not inputs:
@@ -69,6 +149,13 @@ class StatsCog(commands.Cog, name="Stats"):
             timestamp=datetime.now()
         )
         loading_message = await ctx.send(embed=loading_embed)
+
+        async def safe_update_message(embed: discord.Embed):
+            """Update loading message, falling back to a fresh message if edit fails."""
+            try:
+                await loading_message.edit(embed=embed)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await ctx.send(embed=embed)
         
         try:
             print(f"Getting player list for {gamertag}...")
@@ -92,39 +179,27 @@ class StatsCog(commands.Cog, name="Stats"):
             await loading_message.edit(content=f"Error: {e}")
             print(f"Error in populate_cache: {e}")
     
-    @commands.command(name='cachestatus', help='Check background caching progress')
+    @commands.command(name='cachestatus', help='Show progress and estimates for background player caching.')
     async def cache_status(self, ctx: commands.Context):
         """Display the current status of background stats caching"""
         try:
-            # Load XUID cache
-            with open(XUID_CACHE_FILE, 'r') as f:
+            with open(XUID_CACHE_FILE, 'r', encoding='utf-8') as f:
                 xuid_cache = json.load(f)
-            total_players = len(xuid_cache)
-            
-            # Count cached players
-            cached_count = 0
-            for xuid in xuid_cache.keys():
-                xuid_dir = os.path.join("player_stats_cache", str(xuid))
-                if os.path.exists(xuid_dir) and any(f.endswith('.json') for f in os.listdir(xuid_dir)):
-                    cached_count += 1
-            
-            # Load progress
-            progress_file = str(CACHE_PROGRESS_FILE)
-            current_index = 0
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r') as f:
+            xuid_mappings = len(xuid_cache)
+
+            progress_candidates = [str(CACHE_PROGRESS_FILE), os.path.join(PROJECT_ROOT, 'cache_progress.json')]
+            progress_path = next((path for path in progress_candidates if os.path.exists(path)), None)
+
+            progress = {}
+            if progress_path:
+                with open(progress_path, 'r', encoding='utf-8') as f:
                     progress = json.load(f)
-                    current_index = progress.get('last_processed_index', 0)
-            
-            # Calculate percentages
-            percent_cached = (cached_count / total_players * 100) if total_players > 0 else 0
-            percent_processed = (current_index / total_players * 100) if total_players > 0 else 0
-            
-            # Estimate remaining time
-            remaining = total_players - cached_count
-            est_seconds = remaining * 10  # ~10 seconds per player with 5 accounts
-            est_hours = est_seconds / 3600
-            est_days = est_hours / 24
+
+            processed_matches = int(progress.get('processed_matches', progress.get('last_processed_index', 0)) or 0)
+            total_matches = int(progress.get('total_matches', 0) or 0)
+            unique_players = len(progress.get('unique_players', []))
+            resolved_gamertags = len(progress.get('resolved_gamertags', []))
+            percent_processed = (processed_matches / total_matches * 100) if total_matches > 0 else 0
             
             embed = discord.Embed(
                 title="📊 Background Caching Status",
@@ -132,24 +207,27 @@ class StatsCog(commands.Cog, name="Stats"):
                 timestamp=datetime.now()
             )
             embed.add_field(
-                name="Overall Progress",
-                value=f"**{cached_count:,}** / **{total_players:,}** players cached\n"
-                      f"Progress: {percent_cached:.1f}%",
+                name="XUID Cache",
+                value=f"Total mappings: **{xuid_mappings:,}**",
                 inline=False
             )
             embed.add_field(
-                name="Current Session",
-                value=f"Processing index: {current_index:,} / {total_players:,}\n"
-                      f"Session progress: {percent_processed:.1f}%",
+                name="Match Scan Progress",
+                value=(
+                    f"Processed: **{processed_matches:,}** / **{total_matches:,}** matches\n"
+                    f"Progress: {percent_processed:.1f}%"
+                    if total_matches > 0
+                    else "No active match scan progress file"
+                ),
                 inline=False
             )
             embed.add_field(
-                name="Estimated Time Remaining",
-                value=f"~{est_hours:.1f} hours ({est_days:.1f} days)\n"
-                      f"*Based on 50x parallel processing (5 accounts)*",
+                name="Discovery Progress",
+                value=f"Unique players tracked: **{unique_players:,}**\n"
+                      f"Resolved gamertags: **{resolved_gamertags:,}**",
                 inline=False
             )
-            embed.set_footer(text="Project Goliath • Caching runs every 24 hours")
+            embed.set_footer(text="Project Goliath")
             
             await ctx.send(embed=embed)
             
@@ -157,7 +235,7 @@ class StatsCog(commands.Cog, name="Stats"):
             await ctx.send(f"Error checking cache status: {e}")
             print(f"Error in cache_status: {e}")
     
-    @commands.command(name='xboxfriends', help='Get Xbox friends and friends-of-friends. Example - #friends XxUK D3STROYxX')
+    @commands.command(name='xboxfriends', help='Fetch Xbox friends and friends-of-friends, then apply blacklist checks. Usage: #xboxfriends <gamertag>')
     async def friends_list(self, ctx: commands.Context, *inputs):
         """Get a player's Xbox friends list and friends-of-friends, checking against blacklist"""
         if not inputs:
@@ -174,14 +252,26 @@ class StatsCog(commands.Cog, name="Stats"):
             timestamp=datetime.now()
         )
         loading_message = await ctx.send(embed=loading_embed)
+
+        async def safe_update_message(embed: discord.Embed):
+            """Update loading message, falling back to a fresh message if edit fails."""
+            try:
+                await loading_message.edit(embed=embed)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await ctx.send(embed=embed)
         
         try:
             # Load blacklist
             blacklist_path = Path(__file__).parent.parent.parent.parent / 'data' / 'xuid_gamertag_blacklist.json'
             blacklist = {}
             if blacklist_path.exists():
-                with open(blacklist_path, 'r') as f:
-                    blacklist = json.load(f)
+                try:
+                    # utf-8-sig handles files saved with BOM; strip handles accidental empty/whitespace files
+                    raw_blacklist = blacklist_path.read_text(encoding='utf-8-sig').strip()
+                    blacklist = json.loads(raw_blacklist) if raw_blacklist else {}
+                except json.JSONDecodeError as e:
+                    print(f"Invalid blacklist JSON at {blacklist_path}: {e}")
+                    blacklist = {}
             
             # Progress callback to update the embed
             async def update_progress(current, total, stage, fof_count):
@@ -207,7 +297,7 @@ class StatsCog(commands.Cog, name="Stats"):
                         colour=0xFFA500,
                         timestamp=datetime.now()
                     )
-                await loading_message.edit(embed=progress_embed)
+                await safe_update_message(progress_embed)
             
             # Get friends and friends-of-friends (fetches ALL friends)
             result = await api_client.get_friends_of_friends(
@@ -223,13 +313,85 @@ class StatsCog(commands.Cog, name="Stats"):
                     colour=0xFF0000,
                     timestamp=datetime.now()
                 )
-                await loading_message.edit(embed=error_embed)
+                await safe_update_message(error_embed)
                 return
             
             # Get friends and friends-of-friends
             friends = result.get('friends', [])
             fof = result.get('friends_of_friends', [])
             private_friends = result.get('private_friends', [])
+
+            # Persist discovered relationships so graph commands can reuse them.
+            try:
+                graph_db = get_graph_db()
+                target_info = result.get('target') or {}
+                target_xuid = target_info.get('xuid')
+                target_gt = target_info.get('gamertag') or gamertag
+
+                if target_xuid:
+                    graph_db.insert_or_update_player(
+                        xuid=target_xuid,
+                        gamertag=target_gt,
+                        profile_visibility='public',
+                        friends_count=len(friends),
+                    )
+
+                    # Direct friends: target -> friend
+                    direct_edges = []
+                    friend_gt_to_xuid = {}
+                    for friend in friends:
+                        fxuid = friend.get('xuid')
+                        fgt = friend.get('gamertag')
+                        if not fxuid:
+                            continue
+                        graph_db.insert_or_update_player(
+                            xuid=fxuid,
+                            gamertag=fgt,
+                            profile_visibility='public',
+                        )
+                        direct_edges.append((
+                            target_xuid,
+                            fxuid,
+                            bool(friend.get('is_mutual', False)),
+                            target_xuid,
+                            1,
+                        ))
+                        if fgt:
+                            friend_gt_to_xuid[fgt.lower()] = fxuid
+
+                    if direct_edges:
+                        graph_db.insert_friend_edges_batch(direct_edges)
+
+                    # Friends-of-friends: direct_friend -> fof
+                    fof_edges = []
+                    for second_degree in fof:
+                        fof_xuid = second_degree.get('xuid')
+                        fof_gt = second_degree.get('gamertag')
+                        via_gt = second_degree.get('via')
+                        if not fof_xuid:
+                            continue
+
+                        graph_db.insert_or_update_player(
+                            xuid=fof_xuid,
+                            gamertag=fof_gt,
+                            profile_visibility='public',
+                        )
+
+                        via_xuid = friend_gt_to_xuid.get(via_gt.lower()) if via_gt else None
+                        if via_xuid:
+                            fof_edges.append((
+                                via_xuid,
+                                fof_xuid,
+                                bool(second_degree.get('is_mutual', False)),
+                                target_xuid,
+                                2,
+                            ))
+
+                    if fof_edges:
+                        graph_db.insert_friend_edges_batch(fof_edges)
+            except Exception as db_error:
+                # Keep command response working even if persistence fails.
+                print(f"Failed to persist xboxfriends graph data: {db_error}")
             
             # Check friends against blacklist
             blacklisted_friends = []
@@ -255,7 +417,7 @@ class StatsCog(commands.Cog, name="Stats"):
             
             # Format all private friends list
             if private_friends:
-                private_names = [pf.get('gamertag', 'Unknown') for pf in private_friends]
+                private_names = [str(pf.get('gamertag') or 'Unknown') for pf in private_friends]
                 private_text = "\n".join([f"• {name}" for name in private_names])
             else:
                 private_text = "N/A"
@@ -319,7 +481,7 @@ class StatsCog(commands.Cog, name="Stats"):
             )
             result_embed.set_footer(text="Project Goliath • Note: Private friends lists cannot be accessed")
             
-            await loading_message.edit(embed=result_embed)
+            await safe_update_message(result_embed)
             
         except Exception as e:
             import traceback
@@ -329,7 +491,10 @@ class StatsCog(commands.Cog, name="Stats"):
                 colour=0xFF0000,
                 timestamp=datetime.now()
             )
-            await loading_message.edit(embed=error_embed)
+            try:
+                await safe_update_message(error_embed)
+            except Exception:
+                await ctx.send(f"❌ Error in #xboxfriends: {e}")
             print(f"Error in friends_list: {e}")
             traceback.print_exc()
 

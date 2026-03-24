@@ -13,6 +13,7 @@ Usage:
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 # Add project root to path for imports
@@ -23,4 +24,25 @@ from src.bot.main import run_bot
 
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    max_start_attempts = 2
+    startup_interrupt_retry_window_seconds = 15
+
+    for attempt in range(1, max_start_attempts + 1):
+        started_at = time.monotonic()
+        try:
+            asyncio.run(run_bot())
+            break
+        except KeyboardInterrupt:
+            elapsed = time.monotonic() - started_at
+            # Windows terminals can occasionally surface an early interrupt during initial websocket startup.
+            if attempt < max_start_attempts and elapsed <= startup_interrupt_retry_window_seconds:
+                print("\nStartup interrupted early; retrying once...")
+                continue
+            print("\nShutdown requested. Exiting.")
+            break
+        except asyncio.CancelledError:
+            elapsed = time.monotonic() - started_at
+            if attempt < max_start_attempts and elapsed <= startup_interrupt_retry_window_seconds:
+                print("\nStartup cancelled early; retrying once...")
+                continue
+            raise

@@ -30,6 +30,7 @@ intents = discord.Intents.all()
 intents.members = True
 
 bot = commands.Bot(command_prefix="#", intents=intents)
+bot.remove_command("help")
 
 # Path to cogs directory
 COGS_DIR = Path(__file__).parent / "cogs"
@@ -45,6 +46,7 @@ async def load_cogs():
     cog_modules = [
         "src.bot.cogs.stats",
         "src.bot.cogs.graph",
+        "src.bot.cogs.terminal",
     ]
     
     for cog in cog_modules:
