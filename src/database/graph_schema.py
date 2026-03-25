@@ -84,6 +84,12 @@ class HaloSocialGraphDB:
                 is_seed INTEGER DEFAULT 0
             )
         """)
+
+        # Migration-safe player snapshot columns for inferred social-group persistence.
+        self._ensure_column_exists(cursor, "graph_players", "social_group_size", "INTEGER DEFAULT 0")
+        self._ensure_column_exists(cursor, "graph_players", "social_group_size_inferred", "INTEGER DEFAULT 0")
+        self._ensure_column_exists(cursor, "graph_players", "social_group_source", "TEXT DEFAULT 'unknown'")
+        self._ensure_column_exists(cursor, "graph_players", "inference_updated_at", "TIMESTAMP")
         
         # ============================================================
         # Table 2: Friends (Edge Table)
@@ -158,6 +164,22 @@ class HaloSocialGraphDB:
                 FOREIGN KEY (dst_xuid) REFERENCES graph_players(xuid)
             )
         """)
+
+        # ============================================================
+        # Table 4b: Persisted inferred partners
+        # Stores full inferred-friend list per owner player.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS graph_inferred_friends (
+                owner_xuid TEXT NOT NULL,
+                inferred_xuid TEXT NOT NULL,
+                source TEXT DEFAULT 'inferred-reciprocal',
+                inferred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (owner_xuid, inferred_xuid),
+                FOREIGN KEY (owner_xuid) REFERENCES graph_players(xuid),
+                FOREIGN KEY (inferred_xuid) REFERENCES graph_players(xuid)
+            )
+        """)
         
         # ============================================================
         # Table 5: Crawl Queue
@@ -222,6 +244,10 @@ class HaloSocialGraphDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_src ON graph_coplay(src_xuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_dst ON graph_coplay(dst_xuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_matches ON graph_coplay(matches_together)")
+
+        # Persisted inferred-friend indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_inferred_owner ON graph_inferred_friends(owner_xuid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_inferred_partner ON graph_inferred_friends(inferred_xuid)")
         
         # Crawl queue indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_crawl_queue_status ON crawl_queue(status)")
@@ -229,6 +255,14 @@ class HaloSocialGraphDB:
         
         conn.commit()
         print(f"[GRAPH DB] Initialized social graph database at {self.db_path}")
+
+    def _ensure_column_exists(self, cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+        """Add a column to an existing table when missing."""
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        if column in existing:
+            return
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     
     # =========================================================================
     # PLAYER NODE OPERATIONS
@@ -531,7 +565,10 @@ class HaloSocialGraphDB:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT gf.*, gp.gamertag, gp.halo_active, hf.csr, hf.kd_ratio, hf.matches_played
+            SELECT gf.*, gp.gamertag, gp.halo_active,
+                   gp.social_group_size, gp.social_group_size_inferred,
+                   gp.social_group_source, gp.inference_updated_at,
+                   hf.csr, hf.kd_ratio, hf.matches_played
             FROM graph_friends gf
             JOIN graph_players gp ON gf.dst_xuid = gp.xuid
             LEFT JOIN halo_features hf ON gf.dst_xuid = hf.xuid
@@ -564,6 +601,117 @@ class HaloSocialGraphDB:
             xuids + xuids
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # INFERRED SOCIAL GROUP PERSISTENCE
+    # =========================================================================
+
+    def compute_inferred_group_snapshot(self, owner_xuid: str) -> Dict[str, object]:
+        """Compute inferred group snapshot and inferred partner list for an owner node."""
+        direct_count = self.get_verified_halo_friend_count(owner_xuid)
+        if direct_count > 0:
+            return {
+                "social_group_size": direct_count,
+                "social_group_size_inferred": False,
+                "social_group_source": "direct",
+                "inferred_partner_xuids": [],
+            }
+
+        inferred_partners = self.get_verified_halo_incoming_friends(owner_xuid)
+        inferred_xuids = [row.get("src_xuid") for row in inferred_partners if row.get("src_xuid")]
+        if inferred_xuids:
+            return {
+                "social_group_size": len(inferred_xuids),
+                "social_group_size_inferred": True,
+                "social_group_source": "inferred-reciprocal",
+                "inferred_partner_xuids": inferred_xuids,
+            }
+
+        return {
+            "social_group_size": 0,
+            "social_group_size_inferred": False,
+            "social_group_source": "private-or-empty",
+            "inferred_partner_xuids": [],
+        }
+
+    def persist_inferred_snapshot(self, owner_xuid: str, count: int, inferred: bool, source: str) -> bool:
+        """Persist inferred snapshot metadata on the owner's player row."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE graph_players
+                SET social_group_size = ?,
+                    social_group_size_inferred = ?,
+                    social_group_source = ?,
+                    inference_updated_at = ?
+                WHERE xuid = ?
+                """,
+                (int(count or 0), int(bool(inferred)), source or "unknown", datetime.now().isoformat(), owner_xuid),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error persisting inferred snapshot for {owner_xuid}: {e}")
+            return False
+
+    def replace_inferred_partners(self, owner_xuid: str, inferred_xuids: List[str], source: str = "inferred-reciprocal") -> bool:
+        """Atomically replace full inferred partner list for an owner node."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        normalized = sorted({str(x) for x in inferred_xuids if x})
+
+        try:
+            cursor.execute("DELETE FROM graph_inferred_friends WHERE owner_xuid = ?", (owner_xuid,))
+            if normalized:
+                now = datetime.now().isoformat()
+                cursor.executemany(
+                    """
+                    INSERT INTO graph_inferred_friends (owner_xuid, inferred_xuid, source, inferred_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [(owner_xuid, inferred_xuid, source, now) for inferred_xuid in normalized],
+                )
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            print(f"Error replacing inferred partners for {owner_xuid}: {e}")
+            return False
+
+    def get_inferred_partners(self, owner_xuid: str) -> List[Dict]:
+        """Get persisted inferred partners for an owner node."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT gif.owner_xuid, gif.inferred_xuid, gif.source, gif.inferred_at,
+                   gp.gamertag, gp.halo_active
+            FROM graph_inferred_friends gif
+            LEFT JOIN graph_players gp ON gif.inferred_xuid = gp.xuid
+            WHERE gif.owner_xuid = ?
+            ORDER BY gif.inferred_xuid ASC
+            """,
+            (owner_xuid,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def refresh_inferred_group_snapshot(self, owner_xuid: str) -> Dict[str, object]:
+        """Compute and persist inferred snapshot + inferred partner rows."""
+        snapshot = self.compute_inferred_group_snapshot(owner_xuid)
+        self.persist_inferred_snapshot(
+            owner_xuid,
+            int(snapshot.get("social_group_size") or 0),
+            bool(snapshot.get("social_group_size_inferred")),
+            str(snapshot.get("social_group_source") or "unknown"),
+        )
+        self.replace_inferred_partners(
+            owner_xuid,
+            list(snapshot.get("inferred_partner_xuids") or []),
+            str(snapshot.get("social_group_source") or "inferred-reciprocal"),
+        )
+        return snapshot
 
     # =========================================================================
     # HALO FEATURES OPERATIONS
@@ -751,6 +899,125 @@ class HaloSocialGraphDB:
         """, (xuid, min_matches))
         
         return [dict(row) for row in cursor.fetchall()]
+
+    def get_coplay_neighbors(self, xuid: str, min_matches: int = 2, limit: int = 60) -> List[Dict]:
+        """Get co-play neighbors for a player regardless of stored edge direction."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                CASE
+                    WHEN gc.src_xuid = ? THEN gc.dst_xuid
+                    ELSE gc.src_xuid
+                END AS partner_xuid,
+                SUM(COALESCE(gc.matches_together, 0)) AS matches_together,
+                SUM(COALESCE(gc.wins_together, 0)) AS wins_together,
+                SUM(COALESCE(gc.total_minutes, 0)) AS total_minutes,
+                SUM(COALESCE(gc.same_team_count, 0)) AS same_team_count,
+                SUM(COALESCE(gc.opposing_team_count, 0)) AS opposing_team_count,
+                MIN(gc.first_played) AS first_played,
+                MAX(gc.last_played) AS last_played,
+                gp.gamertag,
+                gp.halo_active,
+                hf.kd_ratio,
+                hf.win_rate,
+                hf.matches_played
+            FROM graph_coplay gc
+            LEFT JOIN graph_players gp
+                ON gp.xuid = CASE WHEN gc.src_xuid = ? THEN gc.dst_xuid ELSE gc.src_xuid END
+            LEFT JOIN halo_features hf
+                ON hf.xuid = CASE WHEN gc.src_xuid = ? THEN gc.dst_xuid ELSE gc.src_xuid END
+            WHERE (gc.src_xuid = ? OR gc.dst_xuid = ?)
+            GROUP BY partner_xuid
+            HAVING SUM(COALESCE(gc.matches_together, 0)) >= ?
+            ORDER BY matches_together DESC, partner_xuid ASC
+            LIMIT ?
+            """,
+            (xuid, xuid, xuid, xuid, xuid, max(1, int(min_matches or 1)), max(1, int(limit or 1))),
+        )
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_coplay_edges_within_set(self, xuids: List[str], min_matches: int = 1) -> List[Dict]:
+        """Return co-play edges where both endpoints are in the provided XUID set."""
+        if len(xuids) < 2:
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(xuids))
+        min_matches_value = max(1, int(min_matches or 1))
+
+        cursor.execute(
+            f"""
+            SELECT
+                src_xuid,
+                dst_xuid,
+                matches_together,
+                wins_together,
+                total_minutes,
+                same_team_count,
+                opposing_team_count,
+                first_played,
+                last_played
+            FROM graph_coplay
+            WHERE src_xuid IN ({placeholders})
+              AND dst_xuid IN ({placeholders})
+              AND matches_together >= ?
+            """,
+            xuids + xuids + [min_matches_value],
+        )
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def upsert_coplay_edge(
+        self,
+        src_xuid: str,
+        dst_xuid: str,
+        matches_together: int,
+        wins_together: int = 0,
+        first_played: str = None,
+        last_played: str = None,
+        total_minutes: int = 0,
+        same_team_count: int = 0,
+        opposing_team_count: int = 0,
+    ) -> bool:
+        """Insert or overwrite a co-play edge with absolute values."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("""
+                INSERT INTO graph_coplay
+                (src_xuid, dst_xuid, matches_together, wins_together,
+                 last_played, first_played, total_minutes, same_team_count, opposing_team_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(src_xuid, dst_xuid) DO UPDATE SET
+                    matches_together = excluded.matches_together,
+                    wins_together = excluded.wins_together,
+                    last_played = excluded.last_played,
+                    first_played = excluded.first_played,
+                    total_minutes = excluded.total_minutes,
+                    same_team_count = excluded.same_team_count,
+                    opposing_team_count = excluded.opposing_team_count
+            """, (
+                src_xuid,
+                dst_xuid,
+                int(matches_together or 0),
+                int(wins_together or 0),
+                last_played,
+                first_played,
+                int(total_minutes or 0),
+                int(same_team_count or 0),
+                int(opposing_team_count or 0),
+            ))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error upserting coplay edge {src_xuid}->{dst_xuid}: {e}")
+            return False
     
     # =========================================================================
     # CRAWL QUEUE OPERATIONS

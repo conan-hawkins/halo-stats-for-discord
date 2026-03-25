@@ -110,3 +110,90 @@ def test_medal_lookup_helpers_cover_known_and_unknown_values():
     assert get_medal_id("Double Kill") == 622331684
     assert get_medal_name(123456789) == "Unknown Medal (123456789)"
     assert get_medal_id("not-a-medal") is None
+
+
+def test_match_participants_persist_and_scope_query(tmp_path):
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    match = _match("mp-1", ranked=False, start_time="2026-01-04T00:00:00")
+    db.insert_match(match)
+    db.insert_or_update_player("xuid-a", "Alpha")
+    db.insert_or_update_player("xuid-b", "Bravo")
+    db.insert_or_update_player("xuid-c", "Charlie")
+
+    inserted = db.insert_match_participants(
+        "mp-1",
+        [
+            {
+                "xuid": "xuid-a",
+                "outcome": 2,
+                "team_id": "1",
+                "inferred_team_id": None,
+                "kills": 10,
+                "deaths": 4,
+                "assists": 3,
+            },
+            {
+                "xuid": "xuid-b",
+                "outcome": 2,
+                "team_id": "1",
+                "inferred_team_id": None,
+                "kills": 7,
+                "deaths": 6,
+                "assists": 2,
+            },
+            {
+                "xuid": "xuid-c",
+                "outcome": 3,
+                "team_id": "2",
+                "inferred_team_id": None,
+                "kills": 4,
+                "deaths": 9,
+                "assists": 1,
+            },
+        ],
+    )
+
+    assert inserted is True
+
+    participants = db.get_match_participants("mp-1")
+    assert len(participants) == 3
+
+    scope_rows = db.get_scope_match_participants(["xuid-a", "xuid-b"])
+    assert "mp-1" in scope_rows
+    assert len(scope_rows["mp-1"]) == 2
+    assert {row["xuid"] for row in scope_rows["mp-1"]} == {"xuid-a", "xuid-b"}
+
+    db.close()
+
+
+def test_insert_match_persists_category_fields(tmp_path):
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    db.insert_match(
+        {
+            "match_id": "cat-1",
+            "duration": "PT10M",
+            "start_time": "2026-01-05T00:00:00",
+            "is_ranked": False,
+            "playlist_id": "playlist-social",
+            "match_category": "social",
+            "category_source": "default_non_ranked",
+            "map_id": "map",
+            "map_version": "v1",
+        }
+    )
+
+    conn = db._get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT match_category, category_source FROM matches WHERE match_id = ?",
+        ("cat-1",),
+    )
+    row = cursor.fetchone()
+
+    assert row is not None
+    assert row["match_category"] == "social"
+    assert row["category_source"] == "default_non_ranked"
+
+    db.close()

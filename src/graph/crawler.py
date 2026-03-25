@@ -368,6 +368,9 @@ class GraphCrawler:
             
             # Check which friends are Halo-active and queue them
             await self._check_and_queue_halo_players(players_to_check, depth + 1, discovered_from=xuid)
+
+            # Persist inferred social-group snapshot and inferred partners for this node.
+            self.db.refresh_inferred_group_snapshot(xuid)
             
             # Collect stats for this node if configured
             if self.config.collect_stats and depth <= 1:  # Only collect stats for first 2 levels

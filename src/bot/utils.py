@@ -1,8 +1,6 @@
 """
-Discord utility functions for Xbox account integration and gamertag resolution
+Discord utility functions for Xbox account integration.
 """
-
-import discord
 
 
 async def get_xbox_gamertag_from_discord(member, bot):
@@ -51,44 +49,6 @@ async def get_xbox_gamertag_from_discord(member, bot):
     return None
 
 
-async def get_gamertag_for_member(member, bot):
-    """
-    Get the best gamertag match for a Discord member
-    Priority: Xbox linked account > Discord names
-    
-    Args:
-        member: Discord member object
-        bot: Discord bot instance
-        
-    Returns:
-        List of gamertag strings to try, ordered by priority
-    """
-    # First priority: Check for linked Xbox account
-    xbox_gt = await get_xbox_gamertag_from_discord(member, bot)
-    if xbox_gt:
-        print(f"   Using linked Xbox account: {xbox_gt}")
-        return [xbox_gt]
-    
-    # Fallback to Discord names
-    print(f"   No linked Xbox account, trying Discord names...")
-    gamertag_attempts = [
-        member.name,
-        member.display_name,
-        member.global_name
-    ]
-    
-    # Remove None values and duplicates
-    seen = set()
-    unique_attempts = []
-    for gt in gamertag_attempts:
-        if gt and gt not in seen:
-            seen.add(gt)
-            unique_attempts.append(gt)
-    
-    return unique_attempts
-
-
 __all__ = [
     "get_xbox_gamertag_from_discord",
-    "get_gamertag_for_member",
 ]

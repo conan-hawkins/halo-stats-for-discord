@@ -5,7 +5,6 @@ Contains all player statistics related commands:
 - #full - Get complete stats from player's entire match history
 - #ranked - Get stats from ranked matches only
 - #casual - Get stats from casual/social matches only
-- #server - Generate server-wide leaderboard
 - #populate - Resolve and cache gamertags from recent matches
 - #cachestatus - Check background caching progress
 - #xboxfriends - Get Xbox friends and friends-of-friends network
@@ -20,7 +19,8 @@ import discord
 from discord.ext import commands
 
 from src.api import get_players_from_recent_matches, api_client
-from src.bot.commands import fetch_and_display_stats, collect_server_stats
+from src.bot.cache_status import load_cache_status_metrics
+from src.bot.commands import fetch_and_display_stats
 from src.config import CACHE_PROGRESS_FILE, PROJECT_ROOT, XUID_CACHE_FILE
 from src.database.graph_schema import get_graph_db
 
@@ -79,7 +79,8 @@ class StatsCog(commands.Cog, name="Stats"):
             name="Social Commands",
             value=(
                 "`#xboxfriends <gamertag>`: Live Xbox friends + friends-of-friends scan with blacklist checks.\n"
-                "`#network <gamertag>`: Visual graph from data stored in graph database.\n"
+                "`#network <gamertag>`: Visual friend graph from data stored in graph database.\n"
+                "`#halonet <gamertag>`: Visual co-play graph weighted by shared matches.\n"
                 "`#similar <gamertag>`: Finds players with similar stat profiles from graph DB.\n"
                 "`#hubs [min_friends]`: Lists players with high Halo-active connectivity."
             ),
@@ -89,10 +90,10 @@ class StatsCog(commands.Cog, name="Stats"):
         embed.add_field(
             name="Admin and Utility Commands",
             value=(
-                "`#server`: Attempts a server-wide leaderboard by matching Discord members to gamertags.\n"
                 "`#cachestatus`: Shows progress of background caching jobs.\n"
                 "`#graphstats`: Shows social graph database totals and health.\n"
-                "`#crawl <gamertag> [depth]` / `#crawlstop`: Start or stop background graph crawling (admin only)."
+                "`#crawlfriends <gamertag> [depth]` / `#crawlstop`: Crawl Halo-active friends and update graph DB (admin only).\n"
+                "`#crawlgames <gamertag> [depth]`: Builds co-play edge weights from shared match history in the crawled scope (admin only)."
             ),
             inline=False
         )
@@ -102,7 +103,9 @@ class StatsCog(commands.Cog, name="Stats"):
             value=(
                 "1) Run `#xboxfriends <gamertag>` to discover social edges quickly.\n"
                 "2) Run `#network <gamertag>` to visualize what is already in graph DB.\n"
-                "3) Run `#crawl <gamertag> 2` to enrich Halo-active and stat-backed graph quality."
+                "3) Run `#crawlfriends <gamertag> 2` to enrich Halo-active graph structure.\n"
+                "4) Run `#crawlgames <gamertag> 2` to compute co-play edge strength from cached/shared matches.\n"
+                "5) Run `#halonet <gamertag>` to inspect co-play clusters and strong partners."
             ),
             inline=False
         )
@@ -127,11 +130,6 @@ class StatsCog(commands.Cog, name="Stats"):
         """Get stats from casual/social matches only"""
         gamertag = ''.join(inputs)
         await fetch_and_display_stats(ctx, gamertag, stat_type="social", matches_to_process=None)
-    
-    @commands.command(name='server', help='Build a server leaderboard by matching Discord members to Halo gamertags.')
-    async def server_stats(self, ctx: commands.Context):
-        """Generate server-wide leaderboard from all members"""
-        await collect_server_stats(ctx, self.bot)
     
     @commands.command(name='populate', help='Resolve and cache players from recent match history. Usage: #populate <gamertag>')
     async def populate_cache(self, ctx: commands.Context, *inputs):
@@ -183,23 +181,11 @@ class StatsCog(commands.Cog, name="Stats"):
     async def cache_status(self, ctx: commands.Context):
         """Display the current status of background stats caching"""
         try:
-            with open(XUID_CACHE_FILE, 'r', encoding='utf-8') as f:
-                xuid_cache = json.load(f)
-            xuid_mappings = len(xuid_cache)
-
-            progress_candidates = [str(CACHE_PROGRESS_FILE), os.path.join(PROJECT_ROOT, 'cache_progress.json')]
-            progress_path = next((path for path in progress_candidates if os.path.exists(path)), None)
-
-            progress = {}
-            if progress_path:
-                with open(progress_path, 'r', encoding='utf-8') as f:
-                    progress = json.load(f)
-
-            processed_matches = int(progress.get('processed_matches', progress.get('last_processed_index', 0)) or 0)
-            total_matches = int(progress.get('total_matches', 0) or 0)
-            unique_players = len(progress.get('unique_players', []))
-            resolved_gamertags = len(progress.get('resolved_gamertags', []))
-            percent_processed = (processed_matches / total_matches * 100) if total_matches > 0 else 0
+            metrics = load_cache_status_metrics(
+                XUID_CACHE_FILE,
+                [str(CACHE_PROGRESS_FILE), os.path.join(PROJECT_ROOT, 'cache_progress.json')],
+            )
+            percent_processed = (metrics.processed_matches / metrics.total_matches * 100) if metrics.total_matches > 0 else 0
             
             embed = discord.Embed(
                 title="📊 Background Caching Status",
@@ -208,23 +194,26 @@ class StatsCog(commands.Cog, name="Stats"):
             )
             embed.add_field(
                 name="XUID Cache",
-                value=f"Total mappings: **{xuid_mappings:,}**",
+                value=f"Total mappings: **{metrics.xuid_mappings:,}**",
                 inline=False
             )
             embed.add_field(
                 name="Match Scan Progress",
                 value=(
-                    f"Processed: **{processed_matches:,}** / **{total_matches:,}** matches\n"
+                    f"Processed: **{metrics.processed_matches:,}** / **{metrics.total_matches:,}** matches\n"
                     f"Progress: {percent_processed:.1f}%"
-                    if total_matches > 0
-                    else "No active match scan progress file"
+                    if metrics.total_matches > 0
+                    else (
+                        "No active match scan progress file"
+                        if metrics.progress_state == 'missing'
+                        else "Progress file unreadable"
+                    )
                 ),
                 inline=False
             )
             embed.add_field(
-                name="Discovery Progress",
-                value=f"Unique players tracked: **{unique_players:,}**\n"
-                      f"Resolved gamertags: **{resolved_gamertags:,}**",
+                name="Gamertag Resolution",
+                value=f"Resolved gamertags: **{metrics.resolved_gamertags:,}**",
                 inline=False
             )
             embed.set_footer(text="Project Goliath")

@@ -106,10 +106,16 @@ class HaloStatsDBv2:
                 start_time TEXT NOT NULL,
                 is_ranked INTEGER NOT NULL DEFAULT 0,
                 playlist_id TEXT,
+                match_category TEXT NOT NULL DEFAULT 'unknown',
+                category_source TEXT,
                 map_id TEXT,
                 map_version TEXT
             )
         """)
+
+        # Migration-safe columns for existing DBs created before category support.
+        self._ensure_column_exists("matches", "match_category", "TEXT NOT NULL DEFAULT 'unknown'")
+        self._ensure_column_exists("matches", "category_source", "TEXT")
         
         # ============================================================
         # Table 2: Players - Player information
@@ -167,6 +173,27 @@ class HaloStatsDBv2:
                 FOREIGN KEY (medal_set_id) REFERENCES medal_sets(medal_set_id)
             )
         """)
+
+        # ============================================================
+        # Table 6: Match Participants - Full match rosters with team attribution
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS match_participants (
+                match_id TEXT NOT NULL,
+                xuid TEXT NOT NULL,
+                outcome INTEGER NOT NULL DEFAULT 0,
+                team_id TEXT,
+                inferred_team_id TEXT,
+                kills INTEGER NOT NULL DEFAULT 0,
+                deaths INTEGER NOT NULL DEFAULT 0,
+                assists INTEGER NOT NULL DEFAULT 0,
+                csr INTEGER,
+                csr_tier TEXT,
+                PRIMARY KEY (match_id, xuid),
+                FOREIGN KEY (match_id) REFERENCES matches(match_id),
+                FOREIGN KEY (xuid) REFERENCES players(xuid)
+            )
+        """)
         
         # ============================================================
         # Indexes for performance
@@ -174,15 +201,31 @@ class HaloStatsDBv2:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_start_time ON matches(start_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_playlist ON matches(playlist_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_ranked ON matches(is_ranked)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_category ON matches(match_category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_map ON matches(map_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_gamertag ON players(gamertag)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_match_xuid ON player_match(xuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_match_match ON player_match(match_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_participants_match ON match_participants(match_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_participants_xuid ON match_participants(xuid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_participants_team ON match_participants(team_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_participants_inferred_team ON match_participants(inferred_team_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_medal_sets_hash ON medal_sets(medal_hash)")
         
         # Populate medal_types reference table
         self._populate_medal_types(cursor)
         
+        conn.commit()
+
+    def _ensure_column_exists(self, table_name: str, column_name: str, column_sql: str) -> None:
+        """Add a column to an existing table if it is missing."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        existing = {row['name'] for row in cursor.fetchall()}
+        if column_name in existing:
+            return
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
         conn.commit()
     
     def _get_medal_columns_sql(self) -> str:
@@ -296,17 +339,34 @@ class HaloStatsDBv2:
         try:
             cursor.execute("""
                 INSERT OR IGNORE INTO matches 
-                (match_id, duration, start_time, is_ranked, playlist_id, map_id, map_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (match_id, duration, start_time, is_ranked, playlist_id, match_category, category_source, map_id, map_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 match_data.get('match_id'),
                 match_data.get('duration'),
                 match_data.get('start_time'),
                 1 if match_data.get('is_ranked') else 0,
                 match_data.get('playlist_id'),
+                match_data.get('match_category', 'unknown') or 'unknown',
+                match_data.get('category_source'),
                 match_data.get('map_id'),
                 match_data.get('map_version')
             ))
+
+            cursor.execute(
+                """
+                UPDATE matches
+                SET
+                    match_category = COALESCE(?, match_category),
+                    category_source = COALESCE(?, category_source)
+                WHERE match_id = ?
+                """,
+                (
+                    match_data.get('match_category'),
+                    match_data.get('category_source'),
+                    match_data.get('match_id'),
+                ),
+            )
             conn.commit()
             return True
         except Exception as e:
@@ -381,6 +441,136 @@ class HaloStatsDBv2:
         except Exception as e:
             print(f"Error inserting player_match: {e}")
             return False
+
+    def insert_match_participants(self, match_id: str, participants: List[Dict]) -> bool:
+        """Insert or update all participants for a match."""
+        if not match_id or not participants:
+            return True
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            for participant in participants:
+                participant_xuid = str(participant.get('xuid') or '').strip()
+                if not participant_xuid:
+                    continue
+
+                participant_gamertag = participant.get('gamertag')
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO players (xuid, gamertag, date_added)
+                    VALUES (?, ?, ?)
+                    """,
+                    (participant_xuid, participant_gamertag, datetime.now().isoformat()),
+                )
+
+                if participant_gamertag:
+                    cursor.execute(
+                        """
+                        UPDATE players
+                        SET gamertag = COALESCE(gamertag, ?)
+                        WHERE xuid = ?
+                        """,
+                        (participant_gamertag, participant_xuid),
+                    )
+
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO match_participants
+                    (match_id, xuid, outcome, team_id, inferred_team_id, kills, deaths, assists, csr, csr_tier)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        match_id,
+                        participant_xuid,
+                        int(participant.get('outcome', 0) or 0),
+                        participant.get('team_id'),
+                        participant.get('inferred_team_id'),
+                        int(participant.get('kills', 0) or 0),
+                        int(participant.get('deaths', 0) or 0),
+                        int(participant.get('assists', 0) or 0),
+                        participant.get('csr'),
+                        participant.get('csr_tier'),
+                    ),
+                )
+
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error inserting match participants for {match_id}: {e}")
+            return False
+
+    def get_match_participants(self, match_id: str) -> List[Dict]:
+        """Get all persisted participants for a single match."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                mp.match_id,
+                mp.xuid,
+                mp.outcome,
+                mp.team_id,
+                mp.inferred_team_id,
+                mp.kills,
+                mp.deaths,
+                mp.assists,
+                mp.csr,
+                mp.csr_tier,
+                p.gamertag,
+                m.start_time
+            FROM match_participants mp
+            LEFT JOIN players p ON p.xuid = mp.xuid
+            LEFT JOIN matches m ON m.match_id = mp.match_id
+            WHERE mp.match_id = ?
+            ORDER BY mp.xuid
+            """,
+            (match_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_scope_match_participants(self, scope_xuids: List[str]) -> Dict[str, List[Dict]]:
+        """Get participants for matches where any scope player appears, filtered to scope players."""
+        normalized_scope = [str(x).strip() for x in scope_xuids if str(x).strip()]
+        if not normalized_scope:
+            return {}
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        placeholders = ",".join(["?"] * len(normalized_scope))
+        params = normalized_scope + normalized_scope
+        cursor.execute(
+            f"""
+            WITH scope_matches AS (
+                SELECT DISTINCT match_id
+                FROM match_participants
+                WHERE xuid IN ({placeholders})
+            )
+            SELECT
+                mp.match_id,
+                mp.xuid,
+                mp.outcome,
+                mp.team_id,
+                mp.inferred_team_id,
+                m.start_time
+            FROM match_participants mp
+            JOIN scope_matches sm ON sm.match_id = mp.match_id
+            LEFT JOIN matches m ON m.match_id = mp.match_id
+            WHERE mp.xuid IN ({placeholders})
+            ORDER BY mp.match_id
+            """,
+            params,
+        )
+
+        grouped: Dict[str, List[Dict]] = {}
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            grouped.setdefault(row_dict['match_id'], []).append(row_dict)
+
+        return grouped
     
     def get_player_stats(self, xuid: str, stat_type: str = "overall") -> Optional[Dict]:
         """Get aggregated player stats from normalized data"""
@@ -460,6 +650,8 @@ class HaloStatsDBv2:
                 m.start_time,
                 m.is_ranked,
                 m.playlist_id,
+                m.match_category,
+                m.category_source,
                 m.map_id,
                 m.map_version
             FROM player_match pm

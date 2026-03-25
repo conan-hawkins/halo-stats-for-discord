@@ -54,6 +54,11 @@ class PlayerStatsCacheV2:
                 
                 # Insert match metadata
                 self.db.insert_match(match_data)
+
+                # Persist full roster when participant payload is available.
+                participants = match_data.get('all_participants') or []
+                if participants:
+                    self.db.insert_match_participants(match_id, participants)
                 
                 # Insert player's performance in this match
                 if self.db.insert_player_match(xuid, match_data):
@@ -158,6 +163,8 @@ class PlayerStatsCacheV2:
                 m.start_time,
                 m.is_ranked,
                 m.playlist_id,
+                m.match_category,
+                m.category_source,
                 m.map_id,
                 m.map_version
             FROM player_match pm
@@ -179,6 +186,8 @@ class PlayerStatsCacheV2:
                 'start_time': row['start_time'],
                 'is_ranked': bool(row['is_ranked']),
                 'playlist_id': row['playlist_id'],
+                'match_category': row['match_category'] or 'unknown',
+                'category_source': row['category_source'],
                 'map_id': row['map_id'],
                 'map_version': row['map_version'],
                 'medals': []  # Will be populated if needed

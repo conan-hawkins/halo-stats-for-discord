@@ -88,3 +88,79 @@ def test_connected_component(tmp_path):
     assert "x4" not in component
 
     db.close()
+
+
+def test_refresh_inferred_snapshot_persists_metadata_and_partner_rows(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+
+    db.insert_or_update_player("owner", gamertag="Owner", halo_active=True)
+    db.insert_or_update_player("friend1", gamertag="Friend1", halo_active=True)
+    db.insert_or_update_player("friend2", gamertag="Friend2", halo_active=True)
+
+    # Incoming verified friends to owner (owner has no outgoing verified edges).
+    db.insert_friend_edge("friend1", "owner", is_mutual=False, depth=1)
+    db.insert_friend_edge("friend2", "owner", is_mutual=False, depth=1)
+    db.insert_or_update_halo_features("friend1", gamertag="Friend1", matches_played=10)
+    db.insert_or_update_halo_features("friend2", gamertag="Friend2", matches_played=20)
+
+    snapshot = db.refresh_inferred_group_snapshot("owner")
+
+    assert snapshot["social_group_size"] == 2
+    assert snapshot["social_group_size_inferred"] is True
+    assert snapshot["social_group_source"] == "inferred-reciprocal"
+
+    owner = db.get_player("owner")
+    assert owner["social_group_size"] == 2
+    assert owner["social_group_size_inferred"] == 1
+    assert owner["social_group_source"] == "inferred-reciprocal"
+    assert owner["inference_updated_at"] is not None
+
+    partners = db.get_inferred_partners("owner")
+    partner_xuids = sorted(row["inferred_xuid"] for row in partners)
+    assert partner_xuids == ["friend1", "friend2"]
+
+    # Replace with empty inferred partners after direct verified edge appears.
+    db.insert_friend_edge("owner", "friend1", is_mutual=False, depth=1)
+    db.insert_or_update_halo_features("friend1", gamertag="Friend1", matches_played=30)
+    snapshot2 = db.refresh_inferred_group_snapshot("owner")
+    assert snapshot2["social_group_source"] == "direct"
+    assert db.get_inferred_partners("owner") == []
+
+    db.close()
+
+
+def test_get_coplay_neighbors_is_direction_agnostic(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    db.insert_or_update_player("x1", gamertag="Alpha")
+    db.insert_or_update_player("x2", gamertag="Beta")
+    db.insert_or_update_player("x3", gamertag="Gamma")
+
+    db.insert_or_update_coplay("x1", "x2", matches_together=2)
+    db.insert_or_update_coplay("x3", "x1", matches_together=5)
+
+    neighbors = db.get_coplay_neighbors("x1", min_matches=2)
+    by_partner = {row["partner_xuid"]: row for row in neighbors}
+
+    assert by_partner["x2"]["matches_together"] == 2
+    assert by_partner["x3"]["matches_together"] == 5
+
+    db.close()
+
+
+def test_get_coplay_edges_within_set_filters_min_matches(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    for xuid in ["x1", "x2", "x3"]:
+        db.insert_or_update_player(xuid)
+
+    db.insert_or_update_coplay("x1", "x2", matches_together=1)
+    db.insert_or_update_coplay("x2", "x3", matches_together=4)
+    db.insert_or_update_coplay("x1", "x3", matches_together=6)
+
+    edges = db.get_coplay_edges_within_set(["x1", "x2", "x3"], min_matches=4)
+    pairs = {tuple(sorted((row["src_xuid"], row["dst_xuid"]))) for row in edges}
+
+    assert ("x1", "x2") not in pairs
+    assert ("x2", "x3") in pairs
+    assert ("x1", "x3") in pairs
+
+    db.close()

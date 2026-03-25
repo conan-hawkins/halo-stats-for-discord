@@ -1,7 +1,7 @@
-import json
 import os
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
+from src.bot.cache_status import load_cache_status_metrics
 from src.config import CACHE_PROGRESS_FILE, PROJECT_ROOT, XUID_CACHE_FILE
 from src.database.graph_schema import get_graph_db
 
@@ -24,7 +24,13 @@ def parse_crawl_input(raw: str) -> Tuple[str, Optional[int]]:
     return value, None
 
 
-async def execute_terminal_action(bot, command_ctx, action: str, user_input: str = "") -> str:
+async def execute_terminal_action(
+    bot,
+    command_ctx,
+    action: str,
+    user_input: str = "",
+    progress_callback: Optional[Callable[[dict], object]] = None,
+) -> str:
     stats_cog = bot.get_cog("Stats")
     graph_cog = bot.get_cog("Graph")
 
@@ -41,69 +47,42 @@ async def execute_terminal_action(bot, command_ctx, action: str, user_input: str
         )
 
     if action == "status_cache":
-        xuid_mappings = 0
         try:
-            with open(XUID_CACHE_FILE, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            xuid_mappings = len(cache)
+            metrics = load_cache_status_metrics(
+                XUID_CACHE_FILE,
+                [str(CACHE_PROGRESS_FILE), os.path.join(PROJECT_ROOT, "cache_progress.json")],
+            )
         except Exception:
             return "CACHE STATUS UNAVAILABLE"
 
-        if xuid_mappings == 0:
+        if metrics.xuid_mappings == 0:
             return "CACHE EMPTY"
 
-        progress_candidates = [str(CACHE_PROGRESS_FILE), os.path.join(PROJECT_ROOT, "cache_progress.json")]
-        progress_path = next((path for path in progress_candidates if os.path.exists(path)), None)
-        if not progress_path:
+        if metrics.progress_state == "missing":
             return (
-                f"XUID cache mappings: {xuid_mappings:,}\n"
+                f"XUID cache mappings: {metrics.xuid_mappings:,}\n"
+                f"Resolved GTs: {metrics.resolved_gamertags:,}\n"
                 "Progress: No active progress file"
             )
 
-        try:
-            with open(progress_path, "r", encoding="utf-8") as f:
-                progress = json.load(f)
-        except Exception:
+        if metrics.progress_state == "unreadable":
             return (
-                f"XUID cache mappings: {xuid_mappings:,}\n"
+                f"XUID cache mappings: {metrics.xuid_mappings:,}\n"
+                f"Resolved GTs: {metrics.resolved_gamertags:,}\n"
                 "Progress: File unreadable"
             )
 
-        processed_matches = int(progress.get("processed_matches", progress.get("last_processed_index", 0)) or 0)
-        total_matches = int(progress.get("total_matches", 0) or 0)
-
-        # Support both old and new progress schemas.
-        unique_players_raw = progress.get("unique_players")
-        if isinstance(unique_players_raw, list):
-            unique_players = len(unique_players_raw)
-        elif isinstance(unique_players_raw, int):
-            unique_players = unique_players_raw
-        else:
-            completed_xuids = progress.get("completed_xuids", [])
-            unique_players = len(completed_xuids) if isinstance(completed_xuids, list) else 0
-
-        resolved_raw = progress.get("resolved_gamertags")
-        if isinstance(resolved_raw, list):
-            resolved_gamertags = len(resolved_raw)
-        elif isinstance(resolved_raw, int):
-            resolved_gamertags = resolved_raw
-        else:
-            # Fallback: count non-empty gamertag mappings from XUID cache.
-            resolved_gamertags = sum(1 for value in cache.values() if str(value).strip())
-
-        if total_matches > 0:
-            pct = (processed_matches / total_matches) * 100
+        if metrics.total_matches > 0:
+            pct = (metrics.processed_matches / metrics.total_matches) * 100
             return (
-                f"XUID cache mappings: {xuid_mappings:,}\n"
-                f"Match scan: {processed_matches:,}/{total_matches:,} ({pct:.1f}%)\n"
-                f"Unique players: {unique_players:,}\n"
-                f"Resolved GTs: {resolved_gamertags:,}"
+                f"XUID cache mappings: {metrics.xuid_mappings:,}\n"
+                f"Match scan: {metrics.processed_matches:,}/{metrics.total_matches:,} ({pct:.1f}%)\n"
+                f"Resolved GTs: {metrics.resolved_gamertags:,}"
             )
 
         return (
-            f"XUID cache mappings: {xuid_mappings:,}\n"
-            f"Unique players tracked: {unique_players:,}\n"
-            f"Resolved GTs: {resolved_gamertags:,}"
+            f"XUID cache mappings: {metrics.xuid_mappings:,}\n"
+            f"Resolved GTs: {metrics.resolved_gamertags:,}"
         )
 
     if not stats_cog and action.startswith("cmd_"):
@@ -121,10 +100,6 @@ async def execute_terminal_action(bot, command_ctx, action: str, user_input: str
         await stats_cog.casual(command_ctx, user_input)
         return f"Executed #casual for {user_input}"
 
-    if action == "cmd_server":
-        await stats_cog.server_stats(command_ctx)
-        return "Executed #server"
-
     if action == "cmd_populate":
         await stats_cog.populate_cache(command_ctx, user_input)
         return f"Executed #populate for {user_input}"
@@ -140,6 +115,10 @@ async def execute_terminal_action(bot, command_ctx, action: str, user_input: str
         await graph_cog.show_network(command_ctx, user_input)
         return f"Executed #network for {user_input}"
 
+    if action == "cmd_halonet":
+        await graph_cog.show_halonet(command_ctx, user_input)
+        return f"Executed #halonet for {user_input}"
+
     if action == "cmd_similar":
         await graph_cog.find_similar(command_ctx, user_input)
         return f"Executed #similar for {user_input}"
@@ -152,7 +131,7 @@ async def execute_terminal_action(bot, command_ctx, action: str, user_input: str
         await graph_cog.find_hubs(command_ctx)
         return "Executed #hubs"
 
-    if action == "cmd_crawl":
+    if action == "cmd_crawlfriends":
         if not command_ctx.author.guild_permissions.administrator:
             return "Admin permission required for crawl actions"
 
@@ -161,11 +140,48 @@ async def execute_terminal_action(bot, command_ctx, action: str, user_input: str
             return "Crawl input required: Gamertag|Depth"
 
         if depth is not None:
-            await graph_cog.start_crawl(command_ctx, gamertag, str(depth))
-            return f"Executed #crawl {gamertag} {depth}"
+            await graph_cog.start_crawl(
+                command_ctx,
+                gamertag,
+                str(depth),
+                progress_callback=progress_callback,
+                run_inline=progress_callback is not None,
+            )
+            return f"Executed #crawlfriends {gamertag} {depth}"
 
-        await graph_cog.start_crawl(command_ctx, gamertag)
-        return f"Executed #crawl {gamertag}"
+        await graph_cog.start_crawl(
+            command_ctx,
+            gamertag,
+            progress_callback=progress_callback,
+            run_inline=progress_callback is not None,
+        )
+        return f"Executed #crawlfriends {gamertag}"
+
+    if action == "cmd_crawlgames":
+        if not command_ctx.author.guild_permissions.administrator:
+            return "Admin permission required for crawl actions"
+
+        gamertag, depth = parse_crawl_input(user_input)
+        if not gamertag:
+            return "Crawl input required: Gamertag|Depth"
+
+        if depth is not None:
+            await graph_cog.start_crawl_games(
+                command_ctx,
+                gamertag,
+                str(depth),
+                progress_callback=progress_callback,
+                run_inline=progress_callback is not None,
+            )
+            return f"Executed #crawlgames {gamertag} {depth}"
+
+        await graph_cog.start_crawl_games(
+            command_ctx,
+            gamertag,
+            progress_callback=progress_callback,
+            run_inline=progress_callback is not None,
+        )
+        return f"Executed #crawlgames {gamertag}"
 
     if action == "cmd_crawlstop":
         if not command_ctx.author.guild_permissions.administrator:

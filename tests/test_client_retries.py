@@ -81,6 +81,11 @@ async def test_get_match_stats_retries_429_with_account_backoff(monkeypatch):
 
     assert result is not None
     assert result["kills"] == 5
+    assert result["all_participants"]
+    assert result["all_participants"][0]["xuid"] == "123"
+    assert result["all_participants"][0]["inferred_team_id"] == "outcome:2"
+    assert result["match_category"] == "social"
+    assert result["category_source"] == "default_non_ranked"
     assert wait_seen == [0, 1]
     assert (6, 0) in backoffs
 
@@ -181,6 +186,43 @@ async def test_get_match_stats_retries_500_then_fails(monkeypatch):
 
     assert result is None
     assert sleeps == [0.3]
+
+
+@pytest.mark.asyncio
+async def test_get_match_stats_classifies_custom_from_playlist_hint(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 6, "Deaths": 3, "Assists": 2, "Medals": []}}}],
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT10M",
+            "Playlist": {"AssetId": "custom-playlist-test", "VersionId": "v1"},
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-custom", "123", session)
+
+    assert result is not None
+    assert result["is_ranked"] is False
+    assert result["match_category"] == "custom"
+    assert result["category_source"] == "text_heuristic"
 
 
 @pytest.mark.asyncio

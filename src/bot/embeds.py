@@ -126,48 +126,7 @@ async def format_stats_embed(gamertag, stats_list, stat_type="overall"):
     return embed
 
 
-async def format_leaderboard_embed(guild_name, member_stats, successful_fetches, total_members):
-    """
-    Format server leaderboard into a Discord embed
-    
-    Args:
-        guild_name: Name of the Discord server
-        member_stats: List of player stat dictionaries
-        successful_fetches: Number of successful API calls
-        total_members: Total number of members checked
-        
-    Returns:
-        Discord Embed object
-    """
-    embed = discord.Embed(
-        title=f"🏆 {guild_name} - Halo Stats Leaderboard",
-        description=f"Successfully fetched stats for **{successful_fetches}/{total_members}** members",
-        colour=0x00b0f4,
-        timestamp=datetime.now()
-    )
-    
-    if member_stats:
-        leaderboard_text = ""
-        for i, player in enumerate(member_stats[:10], 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"**{i}.**"
-            leaderboard_text += f"{medal} **{player['gamertag']}**\n"
-            leaderboard_text += f"   K/D: {player['kd_ratio']} | Win Rate: {player['win_rate']}% | Avg KDA: {player['avg_kda']}\n"
-            leaderboard_text += f"   Games: {player['games_played']} | Kills: {player['kills']:,}\n\n"
-        
-        embed.add_field(name="📊 Top Players by K/D Ratio", value=leaderboard_text, inline=False)
-    else:
-        embed.add_field(name="⚠️ No Stats Found", value="Could not fetch stats for any server members.", inline=False)
-    
-    embed.set_footer(
-        text="Project Goliath",
-        icon_url="https://static.wikia.nocookie.net/halo/images/a/a6/H3_Difficulty_LegendaryIcon.png/revision/latest/scale-to-width-down/150?cb=20160930195427"
-    )
-    
-    return embed
-
-
 __all__ = [
     "format_error_embed",
     "format_stats_embed",
-    "format_leaderboard_embed",
 ]

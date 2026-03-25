@@ -7,7 +7,6 @@ A Discord bot for fetching and displaying Halo Infinite player statistics and so
 ## Features
 
 - 📊 **Player Stats** - Get comprehensive statistics from match history
-- 🏆 **Server Leaderboards** - Compare stats across server members --Not Functional--
 - 🕸️ **Social Graph Crawler** - Map friend networks and find active Halo players
 - 🔄 **Multi-Account Support** - Up to 5 accounts for increased API rate limits
 - 💾 **SQLite Caching** - Efficient normalized database for fast lookups
@@ -129,9 +128,32 @@ Running `pytest` generates:
 ### Graph Commands (Admin)
 | Command | Description |
 |---------|-------------|
-| `#crawl <gamertag> [depth]` | Start social graph crawl (default depth 2) |
+| `#crawlfriends <gamertag> [depth]` | Start Halo-friends graph crawl (default depth 2) |
+| `#crawlgames <gamertag> [depth]` | Build weighted co-play edges from shared match history |
 | `#crawlstop` | Stop the current crawl |
 | `#graphstats` | Show graph database statistics |
+
+## Match Categories and Historical Backfill
+
+Matches now store category metadata in the stats DB:
+
+- `match_category`: `ranked`, `social`, `custom`, or `unknown`
+- `category_source`: classifier provenance (for example `playlist_map`, `text_heuristic`, `default_non_ranked`)
+
+Historical rows can be backfilled with the one-time utility script:
+
+```bash
+python one_time_backfill_match_participants.py --dry-run
+python one_time_backfill_match_participants.py --run --only-missing-participants
+python one_time_backfill_match_participants.py --run --only-unknown-category
+python one_time_backfill_match_participants.py --run --limit 500 --batch-size 50 --sleep-ms 250
+```
+
+Recommended rollout:
+
+1. Run `--dry-run` first to inspect candidate volume.
+2. Run a small bounded pass (`--run --limit 100`) to validate behavior.
+3. Run the full backfill with optional pacing (`--sleep-ms`) if needed.
 
 ## Social Graph Crawler
 

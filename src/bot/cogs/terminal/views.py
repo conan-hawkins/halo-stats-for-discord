@@ -1,5 +1,6 @@
 from typing import Optional
 import io
+import asyncio
 
 import discord
 
@@ -60,6 +61,7 @@ class TerminalView(discord.ui.View):
         self.state = state
         self.message: Optional[discord.Message] = None
         self._action_in_progress = False
+        self._loading_task: Optional[asyncio.Task] = None
 
     async def _redraw(self, interaction: discord.Interaction, defer_first: bool = True) -> None:
         if defer_first and not interaction.response.is_done():
@@ -86,6 +88,62 @@ class TerminalView(discord.ui.View):
 
     def _end_action(self) -> None:
         self._action_in_progress = False
+
+    async def _redraw_message(self) -> None:
+        if not self.message:
+            return
+        embed, file = await build_terminal_message_payload_async(self.state)
+        kwargs = {"embed": embed, "view": self}
+        if file:
+            kwargs["attachments"] = [file]
+        await self.message.edit(**kwargs)
+
+    async def _loading_ticker(self) -> None:
+        try:
+            while self.state.is_loading:
+                await asyncio.sleep(0.6)
+                if not self.state.is_loading:
+                    break
+                self.state.bump_loading_tick()
+                await self._redraw_message()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # Loading animation is best-effort and must never fail command execution.
+            return
+
+    async def _start_loading(self, label: str, stage: str = "Running") -> None:
+        self.state.begin_loading(label=label, stage=stage)
+        await self._redraw_message()
+        if self._loading_task and not self._loading_task.done():
+            self._loading_task.cancel()
+        self._loading_task = asyncio.create_task(self._loading_ticker())
+
+    async def _stop_loading(self) -> None:
+        self.state.end_loading()
+        if self._loading_task and not self._loading_task.done():
+            self._loading_task.cancel()
+            try:
+                await self._loading_task
+            except asyncio.CancelledError:
+                pass
+        self._loading_task = None
+
+    async def _handle_progress_update(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        stage = payload.get("stage")
+        if isinstance(stage, str) and stage.strip():
+            self.state.loading_stage = stage.strip()
+
+        percent = payload.get("percent")
+        if isinstance(percent, (int, float)):
+            self.state.progress_percent = max(0.0, min(100.0, float(percent)))
+
+        detail = payload.get("detail")
+        if isinstance(detail, str):
+            self.state.progress_detail = detail.strip()
 
     async def on_timeout(self):
         if not self.message:
@@ -152,49 +210,51 @@ class TerminalView(discord.ui.View):
                 user_input = (modal.submitted_value or "").strip()
                 if not user_input:
                     self.state.last_error = "Input cancelled or empty"
-                    followup_embed, followup_file = await build_terminal_message_payload_async(self.state)
-                    kwargs = {"embed": followup_embed, "view": self}
-                    if followup_file:
-                        kwargs["attachments"] = [followup_file]
-                    await interaction.message.edit(**kwargs)
+                    await self._redraw_message()
                     return
 
                 self.state.last_output = f"Running {item.label}..."
-                followup_embed, followup_file = await build_terminal_message_payload_async(self.state)
-                kwargs = {"embed": followup_embed, "view": self}
-                if followup_file:
-                    kwargs["attachments"] = [followup_file]
-                await interaction.message.edit(**kwargs)
+                await self._start_loading(item.label, stage="Running command")
 
                 try:
-                    result = await execute_terminal_action(self.bot, self.command_ctx, item.action, user_input)
+                    result = await execute_terminal_action(
+                        self.bot,
+                        self.command_ctx,
+                        item.action,
+                        user_input,
+                        progress_callback=self._handle_progress_update,
+                    )
                     self.state.last_output = result
                 except Exception as exc:
                     self.state.last_error = str(exc)
                     self.state.last_output = "Action failed"
+                finally:
+                    await self._stop_loading()
 
-                followup_embed, followup_file = await build_terminal_message_payload_async(self.state)
-                kwargs = {"embed": followup_embed, "view": self}
-                if followup_file:
-                    kwargs["attachments"] = [followup_file]
-                await interaction.message.edit(**kwargs)
+                await self._redraw_message()
                 return
 
             self.state.last_output = f"Running {item.label}..."
             await self._redraw(interaction)
 
+            await self._start_loading(item.label, stage="Running command")
+
             try:
-                result = await execute_terminal_action(self.bot, self.command_ctx, item.action, user_input)
+                result = await execute_terminal_action(
+                    self.bot,
+                    self.command_ctx,
+                    item.action,
+                    user_input,
+                    progress_callback=self._handle_progress_update,
+                )
                 self.state.last_output = result
             except Exception as exc:
                 self.state.last_error = str(exc)
                 self.state.last_output = "Action failed"
+            finally:
+                await self._stop_loading()
 
-            followup_embed, followup_file = await build_terminal_message_payload_async(self.state)
-            kwargs = {"embed": followup_embed, "view": self}
-            if followup_file:
-                kwargs["attachments"] = [followup_file]
-            await interaction.message.edit(**kwargs)
+            await self._redraw_message()
         finally:
             self._end_action()
 

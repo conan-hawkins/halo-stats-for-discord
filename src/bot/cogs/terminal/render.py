@@ -20,6 +20,7 @@ SCREEN_LABELS = {
     "social": "SOCIAL",
     "crawl": "CRAWL",
 }
+LOADING_FRAMES = ["[=     ]", "[==    ]", "[===   ]", "[ ===  ]", "[  === ]", "[   ===]", "[    ==]", "[     =]"]
 
 
 def _build_lines(state: TerminalState) -> str:
@@ -37,6 +38,26 @@ def _build_lines(state: TerminalState) -> str:
         lines.append(f"{marker} {item.label}")
 
     lines.append("")
+    if state.is_loading:
+        frame = LOADING_FRAMES[state.loading_tick % len(LOADING_FRAMES)]
+        elapsed = "0s"
+        if state.loading_started_at is not None:
+            elapsed = f"{max(0, int((datetime.now() - state.loading_started_at).total_seconds()))}s"
+        lines.append("LOADING:")
+        lines.append(f"{frame} {state.loading_label}".strip())
+        if state.loading_stage:
+            lines.append(f"Stage: {state.loading_stage}")
+        if state.progress_percent is not None:
+            pct = max(0.0, min(100.0, float(state.progress_percent)))
+            segments = 20
+            filled = int(round((pct / 100.0) * segments))
+            bar = "#" * filled + "-" * (segments - filled)
+            lines.append(f"Progress: [{bar}] {pct:.1f}%")
+        if state.progress_detail:
+            lines.append(f"Detail: {state.progress_detail}")
+        lines.append(f"Elapsed: {elapsed}")
+        lines.append("")
+
     lines.append("OUTPUT:")
     lines.append(state.last_output[-600:] if state.last_output else "")
     if state.last_error:

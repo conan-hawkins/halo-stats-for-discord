@@ -15,6 +15,7 @@ class _DB:
         self.crawled = []
         self.features = []
         self.halo_features_by_xuid = {}
+        self.refreshed_inference = []
 
     def mark_queue_item_complete(self, xuid, error=None):
         self.completed.append((xuid, error))
@@ -45,6 +46,15 @@ class _DB:
 
     def get_halo_features(self, xuid):
         return self.halo_features_by_xuid.get(xuid)
+
+    def refresh_inferred_group_snapshot(self, xuid):
+        self.refreshed_inference.append(xuid)
+        return {
+            "social_group_size": 0,
+            "social_group_size_inferred": False,
+            "social_group_source": "direct",
+            "inferred_partner_xuids": [],
+        }
 
 
 @pytest.mark.asyncio
@@ -276,3 +286,17 @@ async def test_process_node_unexpected_exception_marks_failed():
     assert db.completed
     assert db.completed[0][0] == "xerr"
     assert "network down" in db.completed[0][1]
+
+
+@pytest.mark.asyncio
+async def test_process_node_refreshes_inferred_snapshot_after_queueing():
+    api = AsyncMock()
+    api.get_friends_list.return_value = {"error": None, "friends": []}
+
+    db = _DB()
+    crawler = GraphCrawler(api_client=api, graph_db=db, config=CrawlConfig(max_depth=3, collect_stats=False))
+    crawler._check_and_queue_halo_players = AsyncMock()
+
+    await crawler._process_node("x5", 0)
+
+    assert db.refreshed_inference == ["x5"]

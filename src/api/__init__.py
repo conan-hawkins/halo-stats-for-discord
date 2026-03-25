@@ -19,6 +19,8 @@ from src.api.utils import (
 from src.api.xuid_cache import (
     load_xuid_cache,
     save_xuid_cache,
+    load_xuid_cache_full,
+    get_gamertag_history,
 )
 
 # Import from main client module
@@ -49,4 +51,6 @@ __all__ = [
     # XUID cache
     "load_xuid_cache",
     "save_xuid_cache",
+    "load_xuid_cache_full",
+    "get_gamertag_history",
 ]

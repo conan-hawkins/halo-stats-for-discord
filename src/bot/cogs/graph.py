@@ -6,13 +6,17 @@ Contains commands for social graph analysis:
 - #similar - Find similar players (KNN)
 - #hubs - Find hub players with many connections
 - #network - Show a player's Halo-active friend network
-- #crawl - Start background crawl from a seed player
+- #halonet - Show a player's co-play network graph
+- #crawlfriends - Start background crawl from a seed player
+- #crawlgames - Build co-play edges from shared match history
 """
 
 import asyncio
 import io
+from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from itertools import combinations
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import discord
 from discord.ext import commands
@@ -742,6 +746,193 @@ class GraphCog(commands.Cog, name="Graph"):
             
         except Exception as e:
             await ctx.send(f"Error finding hubs: {str(e)}")
+
+    @commands.command(name='halonet', help='Show a co-play network visualization from graph DB data. Usage: #halonet <gamertag>')
+    async def show_halonet(self, ctx: commands.Context, *inputs):
+        """Show a player's local co-play network from stored graph_coplay data."""
+        if not inputs:
+            await ctx.send("Please provide a gamertag. Example: `#halonet GAMERTAG`")
+            return
+
+        gamertag = ' '.join(inputs)
+        min_matches = 2
+        max_nodes = 60
+
+        loading_embed = discord.Embed(
+            title="Building Co-play Network...",
+            description=f"Fetching co-play edges for **{gamertag}**",
+            colour=0xFFA500,
+            timestamp=datetime.now(),
+        )
+        loading_msg = await ctx.send(embed=loading_embed)
+
+        try:
+            xuid = await api_client.resolve_gamertag_to_xuid(gamertag)
+            if not xuid:
+                await loading_msg.delete()
+                await ctx.send(f"Could not find player **{gamertag}**")
+                return
+
+            player = self.db.get_player(xuid)
+            if not player:
+                await loading_msg.delete()
+                await ctx.send(
+                    f"**{gamertag}** is not in the graph database. Run `#crawlfriends` and `#crawlgames` first."
+                )
+                return
+
+            center_features = self.db.get_halo_features(xuid)
+            neighbors = self.db.get_coplay_neighbors(xuid, min_matches=min_matches, limit=max_nodes - 1)
+            if not neighbors:
+                await loading_msg.delete()
+                await ctx.send(
+                    f"No co-play edges found for **{gamertag}**. Run `#crawlgames {gamertag}` to build co-play data."
+                )
+                return
+
+            node_map: Dict[str, Dict] = {
+                xuid: {
+                    'xuid': xuid,
+                    'gamertag': gamertag,
+                    'is_center': True,
+                    'kd_ratio': center_features.get('kd_ratio') if center_features else None,
+                    'win_rate': center_features.get('win_rate') if center_features else None,
+                    'matches_played': center_features.get('matches_played') if center_features else None,
+                }
+            }
+
+            for row in neighbors:
+                partner_xuid = row.get('partner_xuid')
+                if not partner_xuid:
+                    continue
+                node_map[partner_xuid] = {
+                    'xuid': partner_xuid,
+                    'gamertag': row.get('gamertag') or partner_xuid,
+                    'is_center': False,
+                    'kd_ratio': row.get('kd_ratio'),
+                    'win_rate': row.get('win_rate'),
+                    'matches_played': row.get('matches_played'),
+                }
+
+            all_xuids = list(node_map.keys())
+            raw_edges = self.db.get_coplay_edges_within_set(all_xuids, min_matches=min_matches)
+
+            aggregated_edges: Dict[tuple, Dict[str, object]] = {}
+            for edge in raw_edges:
+                src = edge.get('src_xuid')
+                dst = edge.get('dst_xuid')
+                if not src or not dst or src == dst:
+                    continue
+                key = tuple(sorted((src, dst)))
+                bucket = aggregated_edges.setdefault(
+                    key,
+                    {
+                        'src_xuid': key[0],
+                        'dst_xuid': key[1],
+                        'matches_together': 0,
+                        'wins_together': 0,
+                        'total_minutes': 0,
+                    },
+                )
+                bucket['matches_together'] += int(edge.get('matches_together') or 0)
+                bucket['wins_together'] += int(edge.get('wins_together') or 0)
+                bucket['total_minutes'] += int(edge.get('total_minutes') or 0)
+
+            if not aggregated_edges:
+                for row in neighbors:
+                    partner_xuid = row.get('partner_xuid')
+                    if not partner_xuid:
+                        continue
+                    key = tuple(sorted((xuid, partner_xuid)))
+                    aggregated_edges[key] = {
+                        'src_xuid': key[0],
+                        'dst_xuid': key[1],
+                        'matches_together': int(row.get('matches_together') or 0),
+                        'wins_together': int(row.get('wins_together') or 0),
+                        'total_minutes': int(row.get('total_minutes') or 0),
+                    }
+
+            edges = [
+                edge
+                for edge in aggregated_edges.values()
+                if int(edge.get('matches_together') or 0) >= min_matches
+            ]
+
+            if not edges:
+                await loading_msg.delete()
+                await ctx.send(
+                    f"Co-play data exists for **{gamertag}**, but no edges met the current minimum shared-match threshold ({min_matches})."
+                )
+                return
+
+            total_shared_matches = sum(int(edge.get('matches_together') or 0) for edge in edges)
+            top_partners = sorted(
+                neighbors,
+                key=lambda row: int(row.get('matches_together') or 0),
+                reverse=True,
+            )[:5]
+
+            embed = discord.Embed(
+                title=f"HaloNet: {gamertag}",
+                description="Co-play links weighted by shared matches from graph DB data.",
+                colour=0x1ABC9C,
+                timestamp=datetime.now(),
+            )
+            embed.add_field(
+                name="Summary",
+                value=(
+                    f"Nodes: **{len(node_map)}**\n"
+                    f"Edges: **{len(edges)}**\n"
+                    f"Total shared matches: **{total_shared_matches:,}**\n"
+                    f"Min edge weight: **{min_matches}**"
+                ),
+                inline=True,
+            )
+
+            if center_features and (center_features.get('matches_played') or 0) > 0:
+                kd_val = center_features.get('kd_ratio')
+                wr_val = center_features.get('win_rate')
+                kd_str = f"{kd_val:.2f}" if kd_val is not None else "N/A"
+                wr_str = f"{wr_val:.1f}%" if wr_val is not None else "N/A"
+                embed.add_field(
+                    name="Player Stats",
+                    value=(
+                        f"K/D: {kd_str}\n"
+                        f"Win Rate: {wr_str}\n"
+                        f"Matches: {center_features.get('matches_played') or 0}"
+                    ),
+                    inline=True,
+                )
+
+            if top_partners:
+                lines = []
+                for row in top_partners:
+                    partner_name = row.get('gamertag') or row.get('partner_xuid', 'Unknown')
+                    matches_together = int(row.get('matches_together') or 0)
+                    same_team = int(row.get('same_team_count') or 0)
+                    lines.append(f"**{partner_name}**: {matches_together} shared matches ({same_team} same-team)")
+                embed.add_field(name="Top Co-play Partners", value="\n".join(lines), inline=False)
+
+            await loading_msg.delete()
+
+            loop = asyncio.get_event_loop()
+            buf = await loop.run_in_executor(
+                None,
+                lambda: self._render_coplay_graph(xuid, gamertag, node_map, edges),
+            )
+
+            file = discord.File(fp=buf, filename="halonet.png")
+            embed.set_image(url="attachment://halonet.png")
+            embed.set_footer(text=f"XUID: {xuid} | Gold=center | Edge width/color=shared matches | Node size=weighted degree")
+            await ctx.send(embed=embed, file=file)
+
+        except Exception as e:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
+            await ctx.send(f"Error showing halonet: {str(e)}")
+            raise
     
     @commands.command(name='network', help='Show a player network visualization from graph DB data. Usage: #network <gamertag>')
     async def show_network(self, ctx: commands.Context, *inputs):
@@ -796,22 +987,22 @@ class GraphCog(commands.Cog, name="Graph"):
             halo_verified_count = len(halo_friends)
             friends_with_stats = [f for f in halo_friends if f.get('matches_played') is not None]
 
-            # Social group size = known friend edges for each halo friend node.
+            # Social group size comes from persisted snapshot on each friend node.
+            # Lazily backfill if no snapshot exists yet for a friend.
             for friend in halo_friends:
-                direct_count = self.db.get_verified_halo_friend_count(friend['dst_xuid'])
-                inferred = False
-                source = 'direct'
-                if direct_count == 0:
-                    reciprocal_count = self.db.get_verified_halo_incoming_friend_count(friend['dst_xuid'])
-                    if reciprocal_count > 0:
-                        direct_count = reciprocal_count
-                        inferred = True
-                        source = 'inferred-reciprocal'
-                    else:
-                        source = 'private-or-empty'
-                friend['social_group_size'] = direct_count
-                friend['group_size_inferred'] = inferred
-                friend['group_size_source'] = source
+                friend_xuid = friend.get('dst_xuid')
+                if not friend_xuid:
+                    continue
+
+                if friend.get('inference_updated_at') is None:
+                    snapshot = self.db.refresh_inferred_group_snapshot(friend_xuid)
+                    friend['social_group_size'] = int(snapshot.get('social_group_size') or 0)
+                    friend['group_size_inferred'] = bool(snapshot.get('social_group_size_inferred'))
+                    friend['group_size_source'] = snapshot.get('social_group_source') or 'unknown'
+                else:
+                    friend['social_group_size'] = int(friend.get('social_group_size') or 0)
+                    friend['group_size_inferred'] = bool(friend.get('social_group_size_inferred'))
+                    friend['group_size_source'] = friend.get('social_group_source') or 'unknown'
 
             # Build summary embed
             embed = discord.Embed(
@@ -1265,12 +1456,174 @@ class GraphCog(commands.Cog, name="Graph"):
         plt.close(fig)
         return buf
 
-    @commands.command(name='crawl', help='Start a background crawl from a seed player. Admin only.')
+    def _render_coplay_graph(
+        self,
+        center_xuid: str,
+        center_gamertag: str,
+        node_map: Dict[str, Dict],
+        edges: List[Dict],
+    ) -> io.BytesIO:
+        """Render a weighted co-play graph as a PNG and return a BytesIO buffer."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        import matplotlib.pyplot as plt
+        import matplotlib.patheffects as path_effects
+        import networkx as nx
+
+        G = nx.Graph()
+
+        for xuid, data in node_map.items():
+            G.add_node(
+                xuid,
+                label=data.get('gamertag') or xuid,
+                is_center=bool(data.get('is_center')),
+            )
+
+        for edge in edges:
+            src = edge.get('src_xuid')
+            dst = edge.get('dst_xuid')
+            matches = int(edge.get('matches_together') or 0)
+            if not src or not dst or src == dst or matches <= 0:
+                continue
+            if not G.has_node(src) or not G.has_node(dst):
+                continue
+            if G.has_edge(src, dst):
+                G[src][dst]['weight'] += matches
+            else:
+                G.add_edge(src, dst, weight=matches)
+
+        if not G.edges:
+            G.add_node(center_xuid, label=center_gamertag, is_center=True)
+
+        weighted_degree = {node: float(G.degree(node, weight='weight')) for node in G.nodes}
+        edge_weights = [float(data.get('weight') or 0.0) for _, _, data in G.edges(data=True)]
+
+        def _safe_norm(values: List[float]) -> mcolors.Normalize:
+            if not values:
+                return mcolors.Normalize(vmin=0, vmax=1)
+            vmin = min(values)
+            vmax = max(values)
+            if vmin == vmax:
+                vmax = vmin + 1
+            return mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+        node_norm = _safe_norm(list(weighted_degree.values()))
+        edge_norm = _safe_norm(edge_weights)
+        node_cmap = cm.Blues
+        edge_cmap = cm.Greens
+
+        pos = nx.spring_layout(G, seed=42, k=4.5 / max(1, len(G.nodes) ** 0.5), iterations=140, weight='weight')
+
+        node_colors = []
+        node_sizes = []
+        for node in G.nodes:
+            if node == center_xuid:
+                node_colors.append('#FFD700')
+                node_sizes.append(760)
+            else:
+                strength = weighted_degree.get(node, 0.0)
+                node_colors.append(node_cmap(node_norm(strength)))
+                node_sizes.append(180 + 22 * strength)
+
+        edge_colors = []
+        edge_widths = []
+        for _, _, data in G.edges(data=True):
+            weight = float(data.get('weight') or 0.0)
+            edge_colors.append(edge_cmap(edge_norm(weight)))
+            edge_widths.append(0.8 + 2.8 * edge_norm(weight))
+
+        bg = '#101820'
+        fig, ax = plt.subplots(figsize=(14.5, 11), facecolor=bg)
+        fig.subplots_adjust(left=0.03, right=0.97, top=0.92, bottom=0.06)
+        ax.set_facecolor(bg)
+
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            edge_color=edge_colors,
+            width=edge_widths,
+            alpha=0.65,
+            ax=ax,
+        )
+        nx.draw_networkx_nodes(
+            G,
+            pos,
+            node_color=node_colors,
+            node_size=node_sizes,
+            linewidths=1.2,
+            edgecolors='white',
+            ax=ax,
+        )
+
+        labels = {n: G.nodes[n].get('label', n) for n in G.nodes}
+        label_artists = nx.draw_networkx_labels(G, pos, labels=labels, font_size=7, font_color='white', ax=ax)
+        for text_artist in label_artists.values():
+            text_artist.set_path_effects([
+                path_effects.Stroke(linewidth=2.2, foreground='black'),
+                path_effects.Normal(),
+            ])
+
+        edge_cax = fig.add_axes([0.60, 0.93, 0.33, 0.018])
+        edge_cax.set_facecolor(bg)
+        edge_sm = cm.ScalarMappable(cmap=edge_cmap, norm=edge_norm)
+        edge_sm.set_array([])
+        edge_cbar = fig.colorbar(edge_sm, cax=edge_cax, orientation='horizontal')
+        edge_cbar.set_label('Shared Matches per Edge (low -> high)', color='white', fontsize=9)
+        edge_cbar.ax.xaxis.set_tick_params(color='white', labelsize=7)
+        plt.setp(edge_cbar.ax.xaxis.get_ticklabels(), color='white')
+        edge_cbar.outline.set_edgecolor('white')
+
+        title = (
+            f"HaloNet Co-play Graph: {center_gamertag}  |  Nodes: {len(G.nodes)}"
+            f"  |  Edges: {len(G.edges)}"
+        )
+        fig.text(0.5, 0.015, title, color='white', fontsize=12, ha='center', va='bottom')
+
+        ax.axis('off')
+        ax.margins(x=0.0, y=0.0)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor=bg)
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+
+    def _collect_halo_active_scope(self, seed_xuid: str, max_depth: int) -> List[str]:
+        """Collect halo-active players reachable from seed within depth in current graph DB."""
+        visited = {seed_xuid}
+        frontier = {seed_xuid}
+
+        for _ in range(max(0, max_depth)):
+            next_frontier = set()
+            for current_xuid in frontier:
+                for edge in self.db.get_friends(current_xuid):
+                    dst_xuid = edge.get('dst_xuid')
+                    if not dst_xuid or dst_xuid in visited:
+                        continue
+                    if not bool(edge.get('halo_active')):
+                        continue
+                    visited.add(dst_xuid)
+                    next_frontier.add(dst_xuid)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+
+        return sorted(visited)
+
+    @commands.command(name='crawlfriends', help='Start a background Halo-friends crawl from a seed player. Admin only.')
     @commands.has_permissions(administrator=True)
-    async def start_crawl(self, ctx: commands.Context, *inputs):
+    async def start_crawl(
+        self,
+        ctx: commands.Context,
+        *inputs,
+        progress_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
+        run_inline: bool = False,
+    ):
         """Start a background crawl (admin only)"""
         if not inputs:
-            await ctx.send("Usage: `#crawl GAMERTAG [depth]`\nExample: `#crawl YourGamertag 2`\nNote: Wrap gamertags with spaces in quotes: `#crawl \"Possibly Tom\" 2`")
+            await ctx.send("Usage: `#crawlfriends GAMERTAG [depth]`\nExample: `#crawlfriends YourGamertag 2`\nNote: Wrap gamertags with spaces in quotes: `#crawlfriends \"Possibly Tom\" 2`")
             return
         
         # Handle gamertags with spaces: check if last arg is a number (depth)
@@ -1317,7 +1670,23 @@ class GraphCog(commands.Cog, name="Graph"):
             )
             return
         
-        await ctx.send(f"Starting background crawl from **{gamertag}** with depth {depth}...\nUse `#graphstats` to check progress.")
+        if not run_inline:
+            await ctx.send(f"Starting background friends crawl from **{gamertag}** with depth {depth}...\nUse `#graphstats` to check progress.")
+
+        async def crawl_progress_update(progress):
+            if not progress_callback:
+                return
+            crawled = int(getattr(progress, 'nodes_crawled', 0) or 0)
+            discovered = int(getattr(progress, 'nodes_discovered', 0) or 0)
+            denominator = max(crawled + 1, discovered, 1)
+            crawl_pct = min(84.0, (float(crawled) / float(denominator)) * 84.0)
+            await progress_callback(
+                {
+                    "stage": "Crawling friends",
+                    "percent": crawl_pct,
+                    "detail": f"Crawled {crawled} nodes, discovered {discovered}",
+                }
+            )
         
         # Import here to avoid circular imports
         from src.graph.crawler import GraphCrawler, CrawlConfig
@@ -1327,31 +1696,347 @@ class GraphCog(commands.Cog, name="Graph"):
                 config = CrawlConfig(
                     max_depth=depth,
                     collect_stats=True,
-                    stats_matches_to_process=25
+                    stats_matches_to_process=25,
+                    progress_callback=crawl_progress_update if progress_callback else None,
                 )
                 crawler = GraphCrawler(api_client, config, self.db)
                 progress = await crawler.crawl_from_seed(seed_gamertag=gamertag)
+
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "stage": "Finalizing",
+                            "percent": 100.0,
+                            "detail": "Friends crawl complete",
+                        }
+                    )
                 
                 # Send completion message
-                channel = ctx.channel
+                if not run_inline:
+                    channel = ctx.channel
+                    embed = discord.Embed(
+                        title="Crawl Complete",
+                        colour=0x00FF00,
+                        timestamp=datetime.now()
+                    )
+                    embed.add_field(name="Seed", value=gamertag, inline=True)
+                    embed.add_field(name="Depth", value=str(depth), inline=True)
+                    embed.add_field(name="Nodes Discovered", value=str(progress.nodes_discovered), inline=True)
+                    embed.add_field(name="Halo Players", value=str(progress.halo_players_found), inline=True)
+                    embed.add_field(name="Edges", value=str(progress.edges_discovered), inline=True)
+                    embed.add_field(name="With Stats", value=str(progress.nodes_with_stats), inline=True)
+                    
+                    await channel.send(embed=embed)
+                return (
+                    f"Friends crawl completed for {gamertag}. "
+                    f"Discovered {progress.nodes_discovered} players, "
+                    f"halo-active {progress.halo_players_found}, "
+                    f"stats on {progress.nodes_with_stats}."
+                )
+                
+            except Exception as e:
+                if not run_inline:
+                    await ctx.channel.send(f"Crawl error: {str(e)}")
+                raise
+        
+        self._crawl_task = asyncio.create_task(run_crawl())
+        if run_inline:
+            return await self._crawl_task
+
+    @commands.command(name='crawlgames', help='Crawl and build co-play edges from shared match history. Admin only.')
+    @commands.has_permissions(administrator=True)
+    async def start_crawl_games(
+        self,
+        ctx: commands.Context,
+        *inputs,
+        progress_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
+        run_inline: bool = False,
+    ):
+        """Start background game-history crawl and refresh co-play edge weights."""
+        if not inputs:
+            await ctx.send("Usage: `#crawlgames GAMERTAG [depth]`\nExample: `#crawlgames YourGamertag 2`")
+            return
+
+        if len(inputs) > 1 and inputs[-1].isdigit():
+            gamertag = ' '.join(inputs[:-1])
+            depth = int(inputs[-1])
+        else:
+            gamertag = ' '.join(inputs)
+            depth = 2
+
+        if self._crawl_task and not self._crawl_task.done():
+            await ctx.send("A crawl is already running. Wait for it to complete or restart the bot.")
+            return
+
+        if not run_inline:
+            await ctx.send(
+                f"Starting co-play build from current graph scope for **{gamertag}** with depth {depth}. "
+                "Use `#crawlfriends` separately if you want to expand graph coverage first."
+            )
+
+        async def run_coplay_crawl():
+            try:
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "stage": "Preparing scope",
+                            "percent": 5.0,
+                            "detail": f"Resolving seed player {gamertag}",
+                        }
+                    )
+
+                seed_xuid = await api_client.resolve_gamertag_to_xuid(gamertag)
+                if not seed_xuid:
+                    await ctx.channel.send(
+                        f"Could not resolve **{gamertag}**; co-play build skipped. "
+                        "Run `#crawlfriends` first if this player has not been discovered yet."
+                    )
+                    return
+
+                scope_xuids = self._collect_halo_active_scope(seed_xuid, depth)
+                if not scope_xuids:
+                    await ctx.channel.send(
+                        "No Halo-active players found in the current graph scope; no co-play edges were created. "
+                        "Run `#crawlfriends` to expand scope, then rerun `#crawlgames`."
+                    )
+                    return
+
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "stage": "Reading participants",
+                            "percent": 20.0,
+                            "detail": f"Loaded scope with {len(scope_xuids)} players",
+                        }
+                    )
+
+                match_edge_counts: Dict[tuple[str, str], int] = defaultdict(int)
+                same_team_counts: Dict[tuple[str, str], int] = defaultdict(int)
+                opposing_team_counts: Dict[tuple[str, str], int] = defaultdict(int)
+                first_played: Dict[tuple[str, str], str] = {}
+                last_played: Dict[tuple[str, str], str] = {}
+                counted_pair_matches = set()
+
+                players_analyzed = 0
+                scope_set = set(scope_xuids)
+                stats_db = getattr(getattr(api_client, 'stats_cache', None), 'db', None)
+                scope_match_participants = {}
+                if stats_db and hasattr(stats_db, 'get_scope_match_participants'):
+                    scope_match_participants = stats_db.get_scope_match_participants(scope_xuids) or {}
+
+                if scope_match_participants:
+                    analyzed_players = set()
+                    total_matches = len(scope_match_participants)
+                    for idx, (match_id, participants) in enumerate(sorted(scope_match_participants.items()), start=1):
+                        scoped_participants = [
+                            p for p in participants
+                            if str(p.get('xuid') or '').strip() in scope_set
+                        ]
+                        if len(scoped_participants) < 2:
+                            continue
+
+                        start_time = ''
+                        for participant in scoped_participants:
+                            participant_xuid = str(participant.get('xuid') or '').strip()
+                            if participant_xuid:
+                                analyzed_players.add(participant_xuid)
+                            if not start_time:
+                                start_time = str(participant.get('start_time') or '')
+
+                        for left, right in combinations(scoped_participants, 2):
+                            left_xuid = str(left.get('xuid') or '').strip()
+                            right_xuid = str(right.get('xuid') or '').strip()
+                            if not left_xuid or not right_xuid or left_xuid == right_xuid:
+                                continue
+
+                            src_xuid, dst_xuid = sorted((left_xuid, right_xuid))
+                            pair_key = (src_xuid, dst_xuid)
+                            pair_match_key = (match_id, src_xuid, dst_xuid)
+                            if match_id and pair_match_key in counted_pair_matches:
+                                continue
+                            if match_id:
+                                counted_pair_matches.add(pair_match_key)
+
+                            match_edge_counts[pair_key] += 1
+
+                            left_team = left.get('team_id') or left.get('inferred_team_id')
+                            right_team = right.get('team_id') or right.get('inferred_team_id')
+                            if left_team and right_team:
+                                if str(left_team) == str(right_team):
+                                    same_team_counts[pair_key] += 1
+                                else:
+                                    opposing_team_counts[pair_key] += 1
+
+                            if start_time:
+                                existing_first = first_played.get(pair_key)
+                                existing_last = last_played.get(pair_key)
+                                if not existing_first or start_time < existing_first:
+                                    first_played[pair_key] = start_time
+                                if not existing_last or start_time > existing_last:
+                                    last_played[pair_key] = start_time
+
+                        if progress_callback and total_matches > 0:
+                            analysis_pct = 25.0 + (float(idx) / float(total_matches)) * 60.0
+                            await progress_callback(
+                                {
+                                    "stage": "Analyzing co-play",
+                                    "percent": min(85.0, analysis_pct),
+                                    "detail": f"Analyzed {idx}/{total_matches} matches",
+                                }
+                            )
+
+                    players_analyzed = len(analyzed_players)
+                else:
+                    total_scope = len(scope_xuids)
+                    for scope_xuid in scope_xuids:
+                        player = self.db.get_player(scope_xuid)
+                        player_gamertag = (player or {}).get('gamertag')
+                        stats_result = await api_client.calculate_comprehensive_stats(
+                            xuid=scope_xuid,
+                            stat_type='overall',
+                            gamertag=player_gamertag,
+                            matches_to_process=None,
+                        )
+                        if stats_result.get('error') != 0:
+                            continue
+
+                        players_analyzed += 1
+                        if progress_callback and total_scope > 0:
+                            analysis_pct = 25.0 + (float(players_analyzed) / float(total_scope)) * 60.0
+                            await progress_callback(
+                                {
+                                    "stage": "Analyzing co-play",
+                                    "percent": min(85.0, analysis_pct),
+                                    "detail": f"Analyzed {players_analyzed}/{total_scope} players",
+                                }
+                            )
+                        for match in stats_result.get('processed_matches', []):
+                            match_id = match.get('match_id')
+                            start_time = match.get('start_time') or ''
+                            participants = match.get('players')
+                            if not isinstance(participants, list) or not participants:
+                                continue
+
+                            for partner_xuid in participants:
+                                partner_xuid = str(partner_xuid)
+                                if partner_xuid == scope_xuid or partner_xuid not in scope_set:
+                                    continue
+
+                                src_xuid, dst_xuid = sorted((scope_xuid, partner_xuid))
+                                pair_key = (src_xuid, dst_xuid)
+                                pair_match_key = (match_id, src_xuid, dst_xuid)
+                                if match_id and pair_match_key in counted_pair_matches:
+                                    continue
+                                if match_id:
+                                    counted_pair_matches.add(pair_match_key)
+
+                                match_edge_counts[pair_key] += 1
+                                if start_time:
+                                    existing_first = first_played.get(pair_key)
+                                    existing_last = last_played.get(pair_key)
+                                    if not existing_first or start_time < existing_first:
+                                        first_played[pair_key] = start_time
+                                    if not existing_last or start_time > existing_last:
+                                        last_played[pair_key] = start_time
+
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "stage": "Writing edges",
+                            "percent": 88.0,
+                            "detail": f"Writing {len(match_edge_counts)} co-play pairs",
+                        }
+                    )
+
+                rows_written = 0
+                total_pairs = max(1, len(match_edge_counts))
+                for pair_idx, ((src_xuid, dst_xuid), matches_together) in enumerate(match_edge_counts.items(), start=1):
+                    first_ts = first_played.get((src_xuid, dst_xuid))
+                    last_ts = last_played.get((src_xuid, dst_xuid))
+
+                    if self.db.upsert_coplay_edge(
+                        src_xuid=src_xuid,
+                        dst_xuid=dst_xuid,
+                        matches_together=matches_together,
+                        wins_together=0,
+                        first_played=first_ts,
+                        last_played=last_ts,
+                        total_minutes=0,
+                        same_team_count=same_team_counts.get((src_xuid, dst_xuid), 0),
+                        opposing_team_count=opposing_team_counts.get((src_xuid, dst_xuid), 0),
+                    ):
+                        rows_written += 1
+
+                    if self.db.upsert_coplay_edge(
+                        src_xuid=dst_xuid,
+                        dst_xuid=src_xuid,
+                        matches_together=matches_together,
+                        wins_together=0,
+                        first_played=first_ts,
+                        last_played=last_ts,
+                        total_minutes=0,
+                        same_team_count=same_team_counts.get((src_xuid, dst_xuid), 0),
+                        opposing_team_count=opposing_team_counts.get((src_xuid, dst_xuid), 0),
+                    ):
+                        rows_written += 1
+
+                    if progress_callback and (pair_idx == 1 or pair_idx == total_pairs or pair_idx % 250 == 0):
+                        write_pct = 88.0 + (float(pair_idx) / float(total_pairs)) * 10.0
+                        await progress_callback(
+                            {
+                                "stage": "Writing edges",
+                                "percent": min(98.0, write_pct),
+                                "detail": f"Upserted {pair_idx}/{total_pairs} pairs",
+                            }
+                        )
+
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "stage": "Finalizing",
+                            "percent": 100.0,
+                            "detail": "Co-play crawl complete",
+                        }
+                    )
+
                 embed = discord.Embed(
-                    title="Crawl Complete",
-                    colour=0x00FF00,
-                    timestamp=datetime.now()
+                    title="Co-play Crawl Complete",
+                    colour=0x00FF88,
+                    timestamp=datetime.now(),
                 )
                 embed.add_field(name="Seed", value=gamertag, inline=True)
                 embed.add_field(name="Depth", value=str(depth), inline=True)
-                embed.add_field(name="Nodes Discovered", value=str(progress.nodes_discovered), inline=True)
-                embed.add_field(name="Halo Players", value=str(progress.halo_players_found), inline=True)
-                embed.add_field(name="Edges", value=str(progress.edges_discovered), inline=True)
-                embed.add_field(name="With Stats", value=str(progress.nodes_with_stats), inline=True)
-                
-                await channel.send(embed=embed)
-                
+                embed.add_field(name="Scope Players", value=str(len(scope_xuids)), inline=True)
+                embed.add_field(name="Players Analyzed", value=str(players_analyzed), inline=True)
+                embed.add_field(name="Unique Co-play Pairs", value=str(len(match_edge_counts)), inline=True)
+                embed.add_field(name="Co-play Rows Written", value=str(rows_written), inline=True)
+                embed.add_field(name="Participant Source", value="match_participants + fallback stats", inline=True)
+                embed.add_field(name="Next Step", value=f"Run `#halonet {gamertag}`", inline=True)
+                if len(match_edge_counts) == 0:
+                    embed.add_field(
+                        name="No Co-play Pairs Found",
+                        value=(
+                            "No shared-match pairs were discovered in current scope. "
+                            "Run `#crawlfriends` to expand graph coverage and rerun `#crawlgames`."
+                        ),
+                        inline=False,
+                    )
+
+                if not run_inline:
+                    await ctx.channel.send(embed=embed)
+                return (
+                    f"Co-play crawl completed for {gamertag}. "
+                    f"Scope players {len(scope_xuids)}, analyzed {players_analyzed}, "
+                    f"pairs {len(match_edge_counts)}, rows written {rows_written}."
+                )
             except Exception as e:
-                await ctx.channel.send(f"Crawl error: {str(e)}")
-        
-        self._crawl_task = asyncio.create_task(run_crawl())
+                if not run_inline:
+                    await ctx.channel.send(f"Co-play crawl error: {str(e)}")
+                raise
+
+        self._crawl_task = asyncio.create_task(run_coplay_crawl())
+        if run_inline:
+            return await self._crawl_task
     
     @commands.command(name='crawlstop', help='Stop the current background crawl. Admin only.')
     @commands.has_permissions(administrator=True)

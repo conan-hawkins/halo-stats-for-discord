@@ -89,6 +89,10 @@ class HaloAPIClient:
     STATS_URL = "https://halostats.svc.halowaypoint.com"
     PROFILE_URL = "https://profile.svc.halowaypoint.com/users/by-gamertag"
     USER_AGENT = "HaloWaypoint/2021.01.10.01"
+    RANKED_PLAYLIST_IDS = {
+        "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b",  # Ranked Arena
+        "edfef3ac-9cbe-4fa2-b949-8f29deafd483",  # Ranked Slayer
+    }
     
     def __init__(self):
         """Initialize the Halo API client."""
@@ -660,6 +664,99 @@ class HaloAPIClient:
             traceback.print_exc()
             return None
         
+        return None
+
+    async def resolve_xuid_to_gamertag(self, xuid: str) -> Optional[str]:
+        """
+        Convert an XUID to gamertag using Xbox Live Profile API.
+
+        Uses cache first to minimize API calls and writes resolved values back
+        to the legacy XUID cache format.
+
+        Args:
+            xuid: Xbox User ID to resolve
+
+        Returns:
+            Gamertag string if found, None otherwise
+        """
+        xuid_str = str(xuid)
+
+        try:
+            xuid_cache = load_xuid_cache()
+            cached_gamertag = xuid_cache.get(xuid_str)
+            if isinstance(cached_gamertag, str) and cached_gamertag.strip():
+                return cached_gamertag
+
+            await xbox_profile_rate_limiter.acquire()
+
+            try:
+                cache_file = TOKEN_CACHE_FILE
+                if not os.path.exists(cache_file):
+                    print("Token cache not found")
+                    return None
+
+                cache = safe_read_json(cache_file, default={})
+                if not cache:
+                    print("Failed to parse token cache")
+                    return None
+
+                xsts_xbox = cache.get("xsts_xbox")
+                if not xsts_xbox:
+                    print("Xbox Live XSTS token not found in cache")
+                    return None
+
+                xbox_token = xsts_xbox.get("token")
+                uhs = xsts_xbox.get("uhs")
+                if not xbox_token or not uhs:
+                    print("Xbox Live XSTS token or UHS missing")
+                    return None
+
+                profile_url = f"https://profile.xboxlive.com/users/xuid({xuid_str})/profile/settings?settings=Gamertag"
+                headers = {
+                    "Authorization": f"XBL3.0 x={uhs};{xbox_token}",
+                    "x-xbl-contract-version": "2",
+                    "Accept": "application/json",
+                }
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(profile_url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            profile_users = data.get("profileUsers", [])
+                            if not profile_users:
+                                return None
+
+                            settings = profile_users[0].get("settings", [])
+                            for setting in settings:
+                                if setting.get("id") == "Gamertag":
+                                    gamertag = setting.get("value")
+                                    if isinstance(gamertag, str) and gamertag.strip():
+                                        xuid_cache[xuid_str] = gamertag
+                                        save_xuid_cache(xuid_cache)
+                                        return gamertag
+                            return None
+
+                        if response.status == 404:
+                            return None
+
+                        if response.status == 401:
+                            error_text = await response.text()
+                            print("Unauthorized (401) - Xbox Live XSTS token is invalid")
+                            print(f"Error: {error_text[:200]}")
+                            return None
+
+                        error_text = await response.text()
+                        print(f"Profile API returned status {response.status}")
+                        print(f"Error: {error_text[:200]}")
+                        return None
+            finally:
+                xbox_profile_rate_limiter.release()
+
+        except Exception as e:
+            print(f"Error resolving XUID to gamertag: {e}")
+            traceback.print_exc()
+            return None
+
         return None
     
     # =========================================================================
@@ -1308,6 +1405,58 @@ class HaloAPIClient:
 
         walk(player_payload)
         return csr_value, tier_value
+
+    def _classify_match_category(
+        self,
+        playlist_asset_id: Optional[str],
+        playlist_version_id: Optional[str],
+        playlist_info: Optional[Dict],
+        match_info: Optional[Dict],
+    ) -> Tuple[str, bool, str]:
+        """Classify match type for filtering and analytics compatibility."""
+        playlist_id = (playlist_asset_id or "").strip()
+        playlist_id_lower = playlist_id.lower()
+
+        if playlist_id in self.RANKED_PLAYLIST_IDS:
+            return "ranked", True, "playlist_map"
+
+        playlist_name = ""
+        if isinstance(playlist_info, dict):
+            playlist_name = str(
+                playlist_info.get('Name')
+                or playlist_info.get('PlaylistName')
+                or playlist_info.get('DisplayName')
+                or ""
+            ).strip()
+
+        match_type_hint = ""
+        if isinstance(match_info, dict):
+            match_type_hint = str(
+                match_info.get('MatchType')
+                or match_info.get('Category')
+                or match_info.get('Mode')
+                or ""
+            ).strip()
+
+        signal_text = " ".join(
+            [
+                playlist_id_lower,
+                str(playlist_version_id or "").lower(),
+                playlist_name.lower(),
+                match_type_hint.lower(),
+            ]
+        )
+
+        if "ranked" in signal_text:
+            return "ranked", True, "text_heuristic"
+
+        if "custom" in signal_text:
+            return "custom", False, "text_heuristic"
+
+        if playlist_id:
+            return "social", False, "default_non_ranked"
+
+        return "unknown", False, "missing_playlist"
     
     async def get_match_stats_for_match(
         self,
@@ -1420,12 +1569,61 @@ class HaloAPIClient:
             
             # Extract XUIDs of all players in the match
             player_xuids = []
+            all_participants = []
             for p in players:
                 player_id = p.get('PlayerId', '')
                 # Extract XUID from format: 'xuid(2533274924643541)'
                 if 'xuid(' in player_id:
                     xuid_str = player_id.replace('xuid(', '').replace(')', '')
                     player_xuids.append(xuid_str)
+
+                    participant_team_stats = p.get('PlayerTeamStats', [])
+                    participant_stats_obj = {}
+                    participant_core_stats = {}
+                    if participant_team_stats and isinstance(participant_team_stats, list):
+                        first_team_stats = participant_team_stats[0] if participant_team_stats else {}
+                        if isinstance(first_team_stats, dict):
+                            participant_stats_obj = first_team_stats.get('Stats') or {}
+                    if isinstance(participant_stats_obj, dict):
+                        participant_core_stats = participant_stats_obj.get('CoreStats') or {}
+
+                    explicit_team_id = (
+                        p.get('TeamId')
+                        or p.get('TeamID')
+                        or p.get('teamId')
+                        or p.get('team_id')
+                    )
+                    if explicit_team_id is None and participant_team_stats and isinstance(participant_team_stats, list):
+                        first_team_stats = participant_team_stats[0] if participant_team_stats else {}
+                        if isinstance(first_team_stats, dict):
+                            explicit_team_id = (
+                                first_team_stats.get('TeamId')
+                                or first_team_stats.get('TeamID')
+                                or first_team_stats.get('teamId')
+                                or first_team_stats.get('team_id')
+                            )
+
+                    participant_outcome = int(p.get('Outcome', 0) or 0)
+                    inferred_team_id = None
+                    if explicit_team_id is None and participant_outcome:
+                        inferred_team_id = f"outcome:{participant_outcome}"
+
+                    participant_csr, participant_csr_tier = self._extract_csr_and_tier(p)
+
+                    all_participants.append(
+                        {
+                            'xuid': xuid_str,
+                            'gamertag': p.get('Gamertag') or p.get('PlayerName') or p.get('DisplayName'),
+                            'outcome': participant_outcome,
+                            'team_id': str(explicit_team_id) if explicit_team_id is not None else None,
+                            'inferred_team_id': inferred_team_id,
+                            'kills': participant_core_stats.get('Kills', 0),
+                            'deaths': participant_core_stats.get('Deaths', 0),
+                            'assists': participant_core_stats.get('Assists', 0),
+                            'csr': participant_csr,
+                            'csr_tier': participant_csr_tier,
+                        }
+                    )
             
             # Find our player's stats
             for player in players:
@@ -1464,18 +1662,12 @@ class HaloAPIClient:
                             map_asset_id = None
                             map_version_id = None
                         
-                        # Determine if ranked or social based on playlist ID
-                        # Common ranked playlists in Halo Infinite have specific asset IDs
-                        # You can expand this list based on actual playlist IDs
-                        is_ranked = False
-                        if playlist_asset_id:
-                            # These are example IDs - you may need to update based on actual API data
-                            ranked_playlist_ids = [
-                                '6e4e9372-5d49-4f87-b0a7-4489b5e96a0b',  # Ranked Arena
-                                'edfef3ac-9cbe-4fa2-b949-8f29deafd483',  # Ranked Slayer
-                                # Add more ranked playlist IDs as discovered
-                            ]
-                            is_ranked = playlist_asset_id in ranked_playlist_ids
+                        match_category, is_ranked, category_source = self._classify_match_category(
+                            playlist_asset_id=playlist_asset_id,
+                            playlist_version_id=playlist_version_id,
+                            playlist_info=playlist_info,
+                            match_info=match_info,
+                        )
                         
                         # Build match data with playlist information, map, and player XUIDs
                         csr, csr_tier = self._extract_csr_and_tier(player)
@@ -1492,11 +1684,14 @@ class HaloAPIClient:
                             'playlist_id': playlist_asset_id,
                             'playlist_version': playlist_version_id,
                             'is_ranked': is_ranked,
+                            'match_category': match_category,
+                            'category_source': category_source,
                             'csr': csr,
                             'csr_tier': csr_tier,
                             'map_id': map_asset_id,
                             'map_version': map_version_id,
-                            'players': player_xuids
+                            'players': player_xuids,
+                            'all_participants': all_participants,
                         }
                         return match_data
             
@@ -1773,6 +1968,14 @@ class HaloAPIClient:
                     "User-Agent": self.user_agent,
                     "Accept": "application/json"
                 }
+
+            def extract_total_matches_count(payload: Dict) -> Optional[int]:
+                """Best-effort total match count extraction from API page payload."""
+                for key in ("TotalCount", "TotalResults", "ResultCount", "Count", "totalCount", "totalResults"):
+                    value = payload.get(key)
+                    if isinstance(value, int) and value >= 0:
+                        return value
+                return None
             
             async def fetch_match_page(session, start_pos, page_size=25, retry_count=0, account_retry=0, error_retry=0, rate_limit_retry=0, force_account=None):
                 """Fetch a single page of matches with retry logic for socket errors, account rotation, 500 and 429 errors"""
@@ -1907,6 +2110,7 @@ class HaloAPIClient:
                 # Force full fetch ignores cache completely (used by #populate)
                 # Otherwise use incremental fetch if cache exists
                 print(f"Fetch params: force_full_fetch={force_full_fetch}, cached_data={'exists' if cached_data else 'none'}, matches_to_process={matches_to_process}")
+                total_matches_hint = None
                 
                 if force_full_fetch:
                     print(f"Force full fetch enabled - ignoring cache and fetching all matches...")
@@ -1925,9 +2129,12 @@ class HaloAPIClient:
                     new_matches_found = []
                     page_num = 0
                     max_pages_to_check = 1000  # Increased limit (10000 matches max with PAGE_SIZE=100)
+                    found_cached_boundary = False
+                    reached_history_end = False
                     
                     while page_num < max_pages_to_check:
-                        page = await fetch_match_page(session, page_num * PAGE_SIZE, PAGE_SIZE)
+                        start_pos = page_num * PAGE_SIZE
+                        page = await fetch_match_page(session, start_pos, PAGE_SIZE)
                         
                         if page is None:
                             # Got 401 error - need to refresh token
@@ -1942,9 +2149,24 @@ class HaloAPIClient:
                             if page_num == 0:
                                 # First page empty = player has no match history, not an error
                                 print(f"Player has no match history")
+                                reached_history_end = True
                                 break
                             print(f"Failed to fetch page {page_num}, stopping search")
                             break
+
+                        if page_num == 0:
+                            # Fetch first page payload once to get API total-count metadata if present.
+                            try:
+                                first_page_url = f"https://halostats.svc.halowaypoint.com/hi/players/xuid({xuid})/matches?start=0&count={PAGE_SIZE}"
+                                account_index = await halo_stats_rate_limiter.wait_if_needed()
+                                first_headers = get_headers_for_account(account_index)
+                                async with session.get(first_page_url, headers=first_headers) as first_response:
+                                    if first_response.status == 200:
+                                        first_payload = await first_response.json()
+                                        total_matches_hint = extract_total_matches_count(first_payload)
+                            except Exception:
+                                # Total-count hint is optional; ignore extraction failures.
+                                total_matches_hint = None
                         
                         # Check each match in this page
                         found_cached_match = False
@@ -1959,9 +2181,26 @@ class HaloAPIClient:
                         
                         # Stop if we hit a cached match or empty page
                         if found_cached_match or len(page) < PAGE_SIZE:
+                            found_cached_boundary = found_cached_match
+                            reached_history_end = len(page) < PAGE_SIZE
                             break
                         
                         page_num += 1
+
+                    if (
+                        matches_to_process >= 999999
+                        and total_matches_hint is not None
+                        and (len(existing_matches) + len(new_matches_found)) < total_matches_hint
+                        and (found_cached_boundary or reached_history_end or page_num >= max_pages_to_check - 1)
+                    ):
+                        print(
+                            "Incremental top-up did not converge to API total count "
+                            f"(cache+new={len(existing_matches) + len(new_matches_found)}, api={total_matches_hint}); "
+                            "falling back to full fetch."
+                        )
+                        use_incremental = False
+                        existing_matches = {}
+                        cached_data = None
                     
                     # NOTE: Cache completeness check removed - we don't need complete history
                     # for regular stats lookups. If the user wants complete history, they use
@@ -1969,7 +2208,9 @@ class HaloAPIClient:
                     # Having 3900 cached matches is still useful even if player has >3900 total.
                     
                     # Check if we got 401 error before returning cached data
-                    if got_401_error and not new_matches_found:
+                    if not use_incremental:
+                        print("Switching to full fetch after incremental completeness check")
+                    elif got_401_error and not new_matches_found:
                         print(f"Got 401 error, will attempt token refresh...")
                         # Don't return cached data yet, let it fall through to 401 handling below
                     elif not new_matches_found:
@@ -2231,6 +2472,9 @@ class HaloAPIClient:
                     'xuid': xuid,
                     'stat_type': stat_type,
                     'processed_matches': all_processed_matches,
+                    'total_matches_hint': total_matches_hint,
+                    'newest_cached_match_id': all_processed_matches[0].get('match_id') if all_processed_matches else None,
+                    'newest_cached_match_time': all_processed_matches[0].get('start_time') if all_processed_matches else None,
                     'incomplete_data': len(failed_matches) > 0,
                     'failed_match_count': len(failed_matches),
                     'failed_matches': failed_matches[:50] if len(failed_matches) <= 50 else failed_matches[:50] + ['...truncated'],

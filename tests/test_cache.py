@@ -95,3 +95,58 @@ def test_get_player_processed_matches_includes_medals_when_available(tmp_path):
     assert ranked["medals"][0]["NameId"] == 622331684
 
     cache.close()
+
+
+def test_save_player_stats_persists_match_participants_with_team_fields(tmp_path):
+    cache = PlayerStatsCacheV2(str(tmp_path / "cache.db"))
+    payload = _stats_payload()
+    payload["processed_matches"][0]["all_participants"] = [
+        {
+            "xuid": "xuid-1",
+            "gamertag": "PlayerOne",
+            "outcome": 2,
+            "team_id": "1",
+            "inferred_team_id": None,
+            "kills": 11,
+            "deaths": 4,
+            "assists": 6,
+            "csr": 1500,
+            "csr_tier": "Platinum 2",
+        },
+        {
+            "xuid": "xuid-2",
+            "gamertag": "Teammate",
+            "outcome": 2,
+            "team_id": "1",
+            "inferred_team_id": None,
+            "kills": 8,
+            "deaths": 7,
+            "assists": 3,
+            "csr": None,
+            "csr_tier": None,
+        },
+        {
+            "xuid": "xuid-3",
+            "gamertag": "Opponent",
+            "outcome": 3,
+            "team_id": "2",
+            "inferred_team_id": None,
+            "kills": 9,
+            "deaths": 8,
+            "assists": 2,
+            "csr": None,
+            "csr_tier": None,
+        },
+    ]
+
+    assert cache.save_player_stats("xuid-1", "overall", payload, "PlayerOne") is True
+
+    participants = cache.db.get_match_participants("m-ranked")
+    assert len(participants) == 3
+
+    by_xuid = {row["xuid"]: row for row in participants}
+    assert by_xuid["xuid-1"]["team_id"] == "1"
+    assert by_xuid["xuid-2"]["team_id"] == "1"
+    assert by_xuid["xuid-3"]["team_id"] == "2"
+
+    cache.close()

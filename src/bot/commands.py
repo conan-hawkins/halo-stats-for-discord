@@ -4,11 +4,9 @@ Discord bot commands for Halo Infinite stats
 
 from datetime import datetime
 import discord
-from discord.ext import commands
 
 from src.api.client import StatsFind1, get_players_from_recent_matches
-from src.bot.utils import get_gamertag_for_member
-from src.bot.embeds import format_error_embed, format_stats_embed, format_leaderboard_embed
+from src.bot.embeds import format_error_embed, format_stats_embed
 
 
 async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_process=None):
@@ -63,89 +61,6 @@ async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_p
         await ctx.send(f"An error occurred: {e}")
 
 
-async def collect_server_stats(ctx, bot):
-    """
-    Collect stats from all server members and create a leaderboard
-    
-    Args:
-        ctx: Discord context
-        bot: Discord bot instance
-    """
-    print(f"Server stats command initiated by {ctx.author}")
-    
-    loading_embed = discord.Embed(
-        title="Collecting Server Stats...",
-        description="Scanning all server members and fetching Halo stats...\nThis may take a while!",
-        colour=0xFFA500,
-        timestamp=datetime.now()
-    )
-    loading_message = await ctx.send(embed=loading_embed)
-    
-    members = [member for member in ctx.guild.members if not member.bot]
-    print(f"Found {len(members)} non-bot members in server")
-    
-    member_stats = []
-    successful_fetches = 0
-    failed_fetches = 0
-    
-    for member in members:
-        try:
-            gamertag_attempts = await get_gamertag_for_member(member, bot)
-            
-            print(f"Attempting to fetch stats for Discord user: {member.name}")
-            print(f"   Gamertag attempts (in order): {gamertag_attempts}")
-            
-            stats_found = False
-            for gamertag in gamertag_attempts:
-                if stats_found:
-                    break
-                    
-                print(f"   Trying '{gamertag}'...")
-                await StatsFind1.page_getter(gamertag, "stats", matches_to_process=None)
-            
-                if StatsFind1.error_no == 0 and StatsFind1.stats_list and len(StatsFind1.stats_list) >= 7:
-                    kd_ratio = float(StatsFind1.stats_list[0]) if StatsFind1.stats_list[0] != 'N/A' else 0
-                    win_rate = float(StatsFind1.stats_list[1].rstrip('%')) if '%' in StatsFind1.stats_list[1] else 0
-                    avg_kda = float(StatsFind1.stats_list[2]) if StatsFind1.stats_list[2] != 'N/A' else 0
-                    kills = int(StatsFind1.stats_list[4]) if StatsFind1.stats_list[4].isdigit() else 0
-                    games_played = int(StatsFind1.stats_list[6]) if StatsFind1.stats_list[6].isdigit() else 0
-                    
-                    member_stats.append({
-                        'discord_name': member.display_name,
-                        'gamertag': gamertag,
-                        'kd_ratio': kd_ratio,
-                        'win_rate': win_rate,
-                        'avg_kda': avg_kda,
-                        'kills': kills,
-                        'games_played': games_played
-                    })
-                    successful_fetches += 1
-                    stats_found = True
-                    print(f"Successfully fetched stats for {gamertag}")
-                else:
-                    print(f"No stats found for '{gamertag}', trying next option...")
-            
-            if not stats_found:
-                failed_fetches += 1
-                print(f"Could not find stats for {member.name} with any gamertag variation")
-                
-        except Exception as e:
-            failed_fetches += 1
-            print(f"Error fetching stats for {member.display_name}: {e}")
-    
-    member_stats.sort(key=lambda x: x['kd_ratio'], reverse=True)
-    
-    leaderboard_embed = await format_leaderboard_embed(
-        ctx.guild.name, 
-        member_stats, 
-        successful_fetches, 
-        len(members)
-    )
-    
-    await loading_message.edit(embed=leaderboard_embed)
-    print(f"Server stats command completed: {successful_fetches} successful, {failed_fetches} failed")
-
-
 async def populate_player_cache(ctx):
     """
     Populate the player cache by scanning recent matches
@@ -194,7 +109,6 @@ async def populate_player_cache(ctx):
 
 __all__ = [
     "fetch_and_display_stats",
-    "collect_server_stats",
     "populate_player_cache",
 ]
 
