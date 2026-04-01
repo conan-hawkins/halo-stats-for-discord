@@ -159,11 +159,23 @@ class HaloSocialGraphDB:
                 avg_csr_diff REAL DEFAULT 0,
                 same_team_count INTEGER DEFAULT 0,
                 opposing_team_count INTEGER DEFAULT 0,
+                source_type TEXT DEFAULT 'participants',
+                is_inferred INTEGER DEFAULT 0,
+                is_partial INTEGER DEFAULT 0,
+                coverage_ratio REAL DEFAULT 1.0,
+                is_halo_active_pair INTEGER DEFAULT 0,
                 PRIMARY KEY (src_xuid, dst_xuid),
                 FOREIGN KEY (src_xuid) REFERENCES graph_players(xuid),
                 FOREIGN KEY (dst_xuid) REFERENCES graph_players(xuid)
             )
         """)
+
+        # Migration-safe co-play quality metadata columns.
+        self._ensure_column_exists(cursor, "graph_coplay", "source_type", "TEXT DEFAULT 'participants'")
+        self._ensure_column_exists(cursor, "graph_coplay", "is_inferred", "INTEGER DEFAULT 0")
+        self._ensure_column_exists(cursor, "graph_coplay", "is_partial", "INTEGER DEFAULT 0")
+        self._ensure_column_exists(cursor, "graph_coplay", "coverage_ratio", "REAL DEFAULT 1.0")
+        self._ensure_column_exists(cursor, "graph_coplay", "is_halo_active_pair", "INTEGER DEFAULT 0")
 
         # ============================================================
         # Table 4b: Persisted inferred partners
@@ -244,6 +256,8 @@ class HaloSocialGraphDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_src ON graph_coplay(src_xuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_dst ON graph_coplay(dst_xuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_matches ON graph_coplay(matches_together)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_source_partial ON graph_coplay(source_type, is_partial)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_coplay_active_pair ON graph_coplay(is_halo_active_pair)")
 
         # Persisted inferred-friend indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_inferred_owner ON graph_inferred_friends(owner_xuid)")
@@ -961,7 +975,12 @@ class HaloSocialGraphDB:
                 same_team_count,
                 opposing_team_count,
                 first_played,
-                last_played
+                last_played,
+                source_type,
+                is_inferred,
+                is_partial,
+                                coverage_ratio,
+                                is_halo_active_pair
             FROM graph_coplay
             WHERE src_xuid IN ({placeholders})
               AND dst_xuid IN ({placeholders})
@@ -983,6 +1002,11 @@ class HaloSocialGraphDB:
         total_minutes: int = 0,
         same_team_count: int = 0,
         opposing_team_count: int = 0,
+        source_type: str = 'participants',
+        is_inferred: bool = False,
+        is_partial: bool = False,
+        coverage_ratio: float = 1.0,
+        is_halo_active_pair: bool = False,
     ) -> bool:
         """Insert or overwrite a co-play edge with absolute values."""
         conn = self._get_connection()
@@ -992,8 +1016,9 @@ class HaloSocialGraphDB:
             cursor.execute("""
                 INSERT INTO graph_coplay
                 (src_xuid, dst_xuid, matches_together, wins_together,
-                 last_played, first_played, total_minutes, same_team_count, opposing_team_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_played, first_played, total_minutes, same_team_count, opposing_team_count,
+                 source_type, is_inferred, is_partial, coverage_ratio, is_halo_active_pair)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(src_xuid, dst_xuid) DO UPDATE SET
                     matches_together = excluded.matches_together,
                     wins_together = excluded.wins_together,
@@ -1001,7 +1026,12 @@ class HaloSocialGraphDB:
                     first_played = excluded.first_played,
                     total_minutes = excluded.total_minutes,
                     same_team_count = excluded.same_team_count,
-                    opposing_team_count = excluded.opposing_team_count
+                    opposing_team_count = excluded.opposing_team_count,
+                    source_type = excluded.source_type,
+                    is_inferred = excluded.is_inferred,
+                    is_partial = excluded.is_partial,
+                    coverage_ratio = excluded.coverage_ratio,
+                    is_halo_active_pair = excluded.is_halo_active_pair
             """, (
                 src_xuid,
                 dst_xuid,
@@ -1012,6 +1042,11 @@ class HaloSocialGraphDB:
                 int(total_minutes or 0),
                 int(same_team_count or 0),
                 int(opposing_team_count or 0),
+                source_type or 'participants',
+                int(bool(is_inferred)),
+                int(bool(is_partial)),
+                max(0.0, min(1.0, float(coverage_ratio if coverage_ratio is not None else 1.0))),
+                int(bool(is_halo_active_pair)),
             ))
             conn.commit()
             return True

@@ -1,6 +1,7 @@
 import pytest
 import discord
 import json
+from io import BytesIO
 from types import SimpleNamespace
 
 from src.bot.cogs.graph import GraphCog, NetworkFilterView, NetworkRefreshView
@@ -236,6 +237,20 @@ async def test_crawlgames_run_inline_uses_existing_scope_without_friend_crawl(mo
         def get_player(self, xuid):
             return {"gamertag": xuid}
 
+        def _get_connection(self):
+            class _Cursor:
+                def execute(self, *_args, **_kwargs):
+                    return None
+
+                def fetchall(self):
+                    return [{"xuid": "seed-xuid"}, {"xuid": "friend-xuid"}]
+
+            class _Conn:
+                def cursor(self):
+                    return _Cursor()
+
+            return _Conn()
+
         def upsert_coplay_edge(self, **kwargs):
             self.upserts.append(kwargs)
             return True
@@ -244,8 +259,7 @@ async def test_crawlgames_run_inline_uses_existing_scope_without_friend_crawl(mo
             return None
 
     class _FakeStatsDB:
-        def get_scope_match_participants(self, scope_xuids):
-            assert set(scope_xuids) == {"seed-xuid", "friend-xuid"}
+        def get_all_match_participants(self):
             return {
                 "m-1": [
                     {
@@ -298,4 +312,165 @@ async def test_crawlgames_run_inline_uses_existing_scope_without_friend_crawl(mo
 
     assert "rows written" in result
     assert "pairs 1" in result
+    assert "seed pairs 1" in result
     assert len(cog.db.upserts) == 2
+
+
+@pytest.mark.asyncio
+async def test_halonet_falls_back_to_single_match_threshold(monkeypatch):
+    class _FakeGraphDB:
+        def get_player(self, xuid):
+            return {"xuid": xuid, "gamertag": "HalcyonVidar"}
+
+        def get_halo_features(self, xuid):
+            return {"kd_ratio": 1.2, "win_rate": 55.0, "matches_played": 123}
+
+        def get_coplay_neighbors(self, xuid, min_matches=2, limit=59):
+            if min_matches >= 2:
+                return []
+            return [
+                {
+                    "partner_xuid": "friend-xuid",
+                    "matches_together": 1,
+                    "wins_together": 0,
+                    "total_minutes": 0,
+                    "same_team_count": 1,
+                    "opposing_team_count": 0,
+                    "first_played": "2026-01-01T00:00:00",
+                    "last_played": "2026-01-01T00:00:00",
+                    "gamertag": "Friend",
+                    "halo_active": 1,
+                    "kd_ratio": 1.0,
+                    "win_rate": 50.0,
+                    "matches_played": 20,
+                }
+            ]
+
+        def get_coplay_edges_within_set(self, xuids, min_matches=1):
+            # Force fallback path that builds edges from neighbors list.
+            return []
+
+        def close(self):
+            return None
+
+    async def _resolve_gamertag_to_xuid(_gamertag):
+        return "seed-xuid"
+
+    from src.bot.cogs import graph as graph_module
+
+    monkeypatch.setattr(
+        graph_module,
+        "api_client",
+        SimpleNamespace(resolve_gamertag_to_xuid=_resolve_gamertag_to_xuid),
+    )
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+    cog._render_coplay_graph = lambda *args, **kwargs: BytesIO(b"fake-png")
+
+    class _InlineCtx:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return _FakeMessage()
+
+    ctx = _InlineCtx()
+    await GraphCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
+
+    # First send is loading embed, second is final graph embed+file.
+    assert len(ctx.sent) >= 2
+    final_kwargs = ctx.sent[-1][1]
+    assert "embed" in final_kwargs
+    final_embed = final_kwargs["embed"]
+    summary_field = next((f for f in final_embed.fields if f.name == "Summary"), None)
+    assert summary_field is not None
+    assert "Min edge weight: **1**" in summary_field.value
+    assert "fallback edges with at least 1 shared match" in (final_embed.description or "")
+
+
+@pytest.mark.asyncio
+async def test_halogroups_returns_overlap_and_membership_csv(monkeypatch):
+    class _FakeGraphDB:
+        def get_player(self, xuid):
+            return {"xuid": xuid, "gamertag": "Seed"}
+
+        def get_coplay_neighbors(self, xuid, min_matches=2, limit=59):
+            return [
+                {"partner_xuid": "a", "gamertag": "A", "matches_together": 5},
+                {"partner_xuid": "b", "gamertag": "B", "matches_together": 5},
+                {"partner_xuid": "c", "gamertag": "C", "matches_together": 5},
+                {"partner_xuid": "d", "gamertag": "D", "matches_together": 5},
+            ]
+
+        def get_coplay_edges_within_set(self, xuids, min_matches=1):
+            # Directional rows; command aggregates into undirected weighted edges.
+            return [
+                {"src_xuid": "seed-xuid", "dst_xuid": "a", "matches_together": 5},
+                {"src_xuid": "a", "dst_xuid": "seed-xuid", "matches_together": 5},
+                {"src_xuid": "a", "dst_xuid": "b", "matches_together": 8},
+                {"src_xuid": "b", "dst_xuid": "a", "matches_together": 8},
+                {"src_xuid": "seed-xuid", "dst_xuid": "c", "matches_together": 3},
+                {"src_xuid": "c", "dst_xuid": "seed-xuid", "matches_together": 3},
+                {"src_xuid": "c", "dst_xuid": "d", "matches_together": 8},
+                {"src_xuid": "d", "dst_xuid": "c", "matches_together": 8},
+                {"src_xuid": "b", "dst_xuid": "c", "matches_together": 1},
+                {"src_xuid": "c", "dst_xuid": "b", "matches_together": 1},
+            ]
+
+        def close(self):
+            return None
+
+    async def _resolve_gamertag_to_xuid(_gamertag):
+        return "seed-xuid"
+
+    from src.bot.cogs import graph as graph_module
+
+    monkeypatch.setattr(
+        graph_module,
+        "api_client",
+        SimpleNamespace(resolve_gamertag_to_xuid=_resolve_gamertag_to_xuid),
+    )
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+
+    class _InlineCtx:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return _FakeMessage()
+
+    ctx = _InlineCtx()
+    await GraphCog.show_halogroups.callback(cog, ctx, "Seed")
+
+    assert len(ctx.sent) >= 2
+    final_kwargs = ctx.sent[-1][1]
+    final_embed = final_kwargs["embed"]
+    final_files = final_kwargs["files"]
+
+    assert final_embed.title.startswith("Halo Groups:")
+    summary_field = next((f for f in final_embed.fields if f.name == "Summary"), None)
+    assert summary_field is not None
+    assert "Groups:" in summary_field.value
+
+    assert len(final_files) == 2
+    filenames = {f.filename for f in final_files}
+    assert any(name.startswith("halogroups_overlap_") for name in filenames)
+    assert any(name.startswith("halogroups_members_") for name in filenames)
+
+    overlap_file = next(f for f in final_files if f.filename.startswith("halogroups_overlap_"))
+    members_file = next(f for f in final_files if f.filename.startswith("halogroups_members_"))
+
+    overlap_file.fp.seek(0)
+    members_file.fp.seek(0)
+    overlap_csv = overlap_file.fp.read().decode("utf-8")
+    members_csv = members_file.fp.read().decode("utf-8")
+
+    assert "Group,G1" in overlap_csv
+    assert "group_id,xuid,gamertag,is_center" in members_csv

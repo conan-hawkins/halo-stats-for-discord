@@ -164,3 +164,233 @@ def test_get_coplay_edges_within_set_filters_min_matches(tmp_path):
     assert ("x1", "x3") in pairs
 
     db.close()
+
+
+def test_coplay_quality_flags_and_coverage_from_backfill_logic(tmp_path, monkeypatch):
+    import one_time_backfill_graph_coplay as backfill_module
+    from src.database.schema import HaloStatsDBv2
+
+    graph_db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    stats_db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    graph_db.insert_or_update_player("x1", gamertag="Alpha", halo_active=True)
+    graph_db.insert_or_update_player("x2", gamertag="Bravo", halo_active=True)
+
+    # Match 1: explicit same team (complete)
+    stats_db.insert_match(
+        {
+            "match_id": "m1",
+            "duration": "PT10M",
+            "start_time": "2026-01-01T00:00:00",
+            "is_ranked": False,
+            "playlist_id": "playlist-social",
+            "match_category": "social",
+            "category_source": "default_non_ranked",
+            "map_id": "map-1",
+            "map_version": "v1",
+        }
+    )
+    stats_db.insert_match_participants(
+        "m1",
+        [
+            {"xuid": "x1", "outcome": 2, "team_id": "A", "kills": 10, "deaths": 4, "assists": 2},
+            {"xuid": "x2", "outcome": 2, "team_id": "A", "kills": 8, "deaths": 5, "assists": 4},
+        ],
+    )
+
+    # Match 2: inferred team ids only (inferred + complete)
+    stats_db.insert_match(
+        {
+            "match_id": "m2",
+            "duration": "PT10M",
+            "start_time": "2026-01-02T00:00:00",
+            "is_ranked": False,
+            "playlist_id": "playlist-social",
+            "match_category": "social",
+            "category_source": "default_non_ranked",
+            "map_id": "map-1",
+            "map_version": "v1",
+        }
+    )
+    stats_db.insert_match_participants(
+        "m2",
+        [
+            {"xuid": "x1", "outcome": 2, "inferred_team_id": "outcome:WIN", "kills": 11, "deaths": 6, "assists": 3},
+            {"xuid": "x2", "outcome": 2, "inferred_team_id": "outcome:WIN", "kills": 9, "deaths": 6, "assists": 1},
+        ],
+    )
+
+    # Match 3: one side missing team data (partial)
+    stats_db.insert_match(
+        {
+            "match_id": "m3",
+            "duration": "PT10M",
+            "start_time": "2026-01-03T00:00:00",
+            "is_ranked": False,
+            "playlist_id": "playlist-social",
+            "match_category": "social",
+            "category_source": "default_non_ranked",
+            "map_id": "map-1",
+            "map_version": "v1",
+        }
+    )
+    stats_db.insert_match_participants(
+        "m3",
+        [
+            {"xuid": "x1", "outcome": 2, "team_id": "A", "kills": 7, "deaths": 2, "assists": 1},
+            {"xuid": "x2", "outcome": 2, "kills": 5, "deaths": 3, "assists": 0},
+        ],
+    )
+
+    class _CacheShim:
+        def __init__(self, db):
+            self.db = db
+
+        def resolve_xuid_by_gamertag(self, _gamertag):
+            return None
+
+    monkeypatch.setattr(backfill_module, "get_graph_db", lambda: graph_db)
+    monkeypatch.setattr(backfill_module, "get_cache", lambda: _CacheShim(stats_db))
+
+    result = backfill_module.run_backfill(
+        dry_run=False,
+        batch_size=10,
+        limit_matches=None,
+        seed_xuid=None,
+        seed_gamertag=None,
+        depth=0,
+        reset_target=True,
+    )
+
+    assert result.pairs_built >= 1
+
+    conn = graph_db._get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT matches_together, is_inferred, is_partial, coverage_ratio
+        FROM graph_coplay
+        WHERE src_xuid = ? AND dst_xuid = ?
+        """,
+        ("x1", "x2"),
+    )
+    row = cursor.fetchone()
+
+    assert row is not None
+    assert row["matches_together"] == 3
+    assert row["is_inferred"] == 1
+    assert row["is_partial"] == 1
+    assert abs(float(row["coverage_ratio"]) - (2.0 / 3.0)) < 1e-9
+
+    stats_db.close()
+    graph_db.close()
+
+
+def test_coplay_backfill_rerun_idempotency(tmp_path, monkeypatch):
+    import one_time_backfill_graph_coplay as backfill_module
+    from src.database.schema import HaloStatsDBv2
+
+    graph_db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    stats_db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    graph_db.insert_or_update_player("x1", gamertag="Alpha", halo_active=True)
+    graph_db.insert_or_update_player("x2", gamertag="Bravo", halo_active=True)
+
+    stats_db.insert_match(
+        {
+            "match_id": "idempotent-m1",
+            "duration": "PT10M",
+            "start_time": "2026-01-01T00:00:00",
+            "is_ranked": False,
+            "playlist_id": "playlist-social",
+            "match_category": "social",
+            "category_source": "default_non_ranked",
+            "map_id": "map-1",
+            "map_version": "v1",
+        }
+    )
+    stats_db.insert_match_participants(
+        "idempotent-m1",
+        [
+            {"xuid": "x1", "outcome": 2, "team_id": "A", "kills": 10, "deaths": 4, "assists": 2},
+            {"xuid": "x2", "outcome": 2, "team_id": "A", "kills": 8, "deaths": 5, "assists": 4},
+        ],
+    )
+
+    class _CacheShim:
+        def __init__(self, db):
+            self.db = db
+
+        def resolve_xuid_by_gamertag(self, _gamertag):
+            return None
+
+    monkeypatch.setattr(backfill_module, "get_graph_db", lambda: graph_db)
+    monkeypatch.setattr(backfill_module, "get_cache", lambda: _CacheShim(stats_db))
+
+    first = backfill_module.run_backfill(
+        dry_run=False,
+        batch_size=10,
+        limit_matches=None,
+        seed_xuid=None,
+        seed_gamertag=None,
+        depth=0,
+        reset_target=True,
+    )
+    second = backfill_module.run_backfill(
+        dry_run=False,
+        batch_size=10,
+        limit_matches=None,
+        seed_xuid=None,
+        seed_gamertag=None,
+        depth=0,
+        reset_target=False,
+    )
+
+    conn = graph_db._get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS row_count
+        FROM graph_coplay
+        WHERE source_type = ?
+        """,
+        ("participants",),
+    )
+    row_count = cursor.fetchone()["row_count"]
+
+    cursor.execute(
+        """
+        SELECT matches_together, wins_together, same_team_count, opposing_team_count, coverage_ratio
+        FROM graph_coplay
+        WHERE src_xuid = ? AND dst_xuid = ?
+        """,
+        ("x1", "x2"),
+    )
+    snapshot_a = dict(cursor.fetchone())
+
+    # One more run to confirm values remain stable.
+    backfill_module.run_backfill(
+        dry_run=False,
+        batch_size=10,
+        limit_matches=None,
+        seed_xuid=None,
+        seed_gamertag=None,
+        depth=0,
+        reset_target=False,
+    )
+    cursor.execute(
+        """
+        SELECT matches_together, wins_together, same_team_count, opposing_team_count, coverage_ratio
+        FROM graph_coplay
+        WHERE src_xuid = ? AND dst_xuid = ?
+        """,
+        ("x1", "x2"),
+    )
+    snapshot_b = dict(cursor.fetchone())
+
+    assert first.rows_written == second.rows_written
+    assert row_count == 2  # x1->x2 and x2->x1
+    assert snapshot_a == snapshot_b
+
+    stats_db.close()
+    graph_db.close()

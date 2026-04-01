@@ -571,6 +571,47 @@ class HaloStatsDBv2:
             grouped.setdefault(row_dict['match_id'], []).append(row_dict)
 
         return grouped
+
+    def get_all_match_participants(self, limit_matches: Optional[int] = None) -> Dict[str, List[Dict]]:
+        """Get participants for all matches, optionally limited by newest match start_time."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        limit_clause = ""
+        params: List[int] = []
+        if limit_matches is not None and int(limit_matches) > 0:
+            limit_clause = "LIMIT ?"
+            params.append(int(limit_matches))
+
+        cursor.execute(
+            f"""
+            WITH selected_matches AS (
+                SELECT m.match_id
+                FROM matches m
+                ORDER BY COALESCE(m.start_time, '') DESC, m.match_id ASC
+                {limit_clause}
+            )
+            SELECT
+                mp.match_id,
+                mp.xuid,
+                mp.outcome,
+                mp.team_id,
+                mp.inferred_team_id,
+                m.start_time
+            FROM match_participants mp
+            JOIN selected_matches sm ON sm.match_id = mp.match_id
+            LEFT JOIN matches m ON m.match_id = mp.match_id
+            ORDER BY COALESCE(m.start_time, '') DESC, mp.match_id ASC
+            """,
+            params,
+        )
+
+        grouped: Dict[str, List[Dict]] = {}
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            grouped.setdefault(row_dict['match_id'], []).append(row_dict)
+
+        return grouped
     
     def get_player_stats(self, xuid: str, stat_type: str = "overall") -> Optional[Dict]:
         """Get aggregated player stats from normalized data"""

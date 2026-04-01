@@ -12,6 +12,7 @@ Contains commands for social graph analysis:
 """
 
 import asyncio
+import csv
 import io
 from collections import defaultdict
 from datetime import datetime
@@ -782,13 +783,24 @@ class GraphCog(commands.Cog, name="Graph"):
                 return
 
             center_features = self.db.get_halo_features(xuid)
-            neighbors = self.db.get_coplay_neighbors(xuid, min_matches=min_matches, limit=max_nodes - 1)
+            active_min_matches = min_matches
+            threshold_relaxed = False
+
+            neighbors = self.db.get_coplay_neighbors(xuid, min_matches=active_min_matches, limit=max_nodes - 1)
             if not neighbors:
-                await loading_msg.delete()
-                await ctx.send(
-                    f"No co-play edges found for **{gamertag}**. Run `#crawlgames {gamertag}` to build co-play data."
-                )
-                return
+                relaxed_neighbors = self.db.get_coplay_neighbors(xuid, min_matches=1, limit=max_nodes - 1)
+                if relaxed_neighbors:
+                    neighbors = relaxed_neighbors
+                    active_min_matches = 1
+                    threshold_relaxed = True
+                else:
+                    await loading_msg.delete()
+                    await ctx.send(
+                        f"No co-play edges found for **{gamertag}**. "
+                        f"If this player has stats but still shows zero edges, run `#crawlfriends {gamertag}` "
+                        "to expand graph scope and then rerun `#crawlgames`."
+                    )
+                    return
 
             node_map: Dict[str, Dict] = {
                 xuid: {
@@ -815,7 +827,7 @@ class GraphCog(commands.Cog, name="Graph"):
                 }
 
             all_xuids = list(node_map.keys())
-            raw_edges = self.db.get_coplay_edges_within_set(all_xuids, min_matches=min_matches)
+            raw_edges = self.db.get_coplay_edges_within_set(all_xuids, min_matches=active_min_matches)
 
             aggregated_edges: Dict[tuple, Dict[str, object]] = {}
             for edge in raw_edges:
@@ -855,13 +867,13 @@ class GraphCog(commands.Cog, name="Graph"):
             edges = [
                 edge
                 for edge in aggregated_edges.values()
-                if int(edge.get('matches_together') or 0) >= min_matches
+                if int(edge.get('matches_together') or 0) >= active_min_matches
             ]
 
             if not edges:
                 await loading_msg.delete()
                 await ctx.send(
-                    f"Co-play data exists for **{gamertag}**, but no edges met the current minimum shared-match threshold ({min_matches})."
+                    f"Co-play data exists for **{gamertag}**, but no edges met the current minimum shared-match threshold ({active_min_matches})."
                 )
                 return
 
@@ -874,7 +886,10 @@ class GraphCog(commands.Cog, name="Graph"):
 
             embed = discord.Embed(
                 title=f"HaloNet: {gamertag}",
-                description="Co-play links weighted by shared matches from graph DB data.",
+                description=(
+                    "Co-play links weighted by shared matches from graph DB data."
+                    + (" Showing fallback edges with at least 1 shared match." if threshold_relaxed else "")
+                ),
                 colour=0x1ABC9C,
                 timestamp=datetime.now(),
             )
@@ -884,7 +899,7 @@ class GraphCog(commands.Cog, name="Graph"):
                     f"Nodes: **{len(node_map)}**\n"
                     f"Edges: **{len(edges)}**\n"
                     f"Total shared matches: **{total_shared_matches:,}**\n"
-                    f"Min edge weight: **{min_matches}**"
+                    f"Min edge weight: **{active_min_matches}**"
                 ),
                 inline=True,
             )
@@ -932,6 +947,252 @@ class GraphCog(commands.Cog, name="Graph"):
             except Exception:
                 pass
             await ctx.send(f"Error showing halonet: {str(e)}")
+            raise
+
+    @commands.command(name='halogroups', help='Show co-play communities and overlap matrix. Usage: #halogroups <gamertag>')
+    async def show_halogroups(self, ctx: commands.Context, *inputs):
+        """Show detected co-play communities around a player and export overlap CSVs."""
+        if not inputs:
+            await ctx.send("Please provide a gamertag. Example: `#halogroups GAMERTAG`")
+            return
+
+        gamertag = ' '.join(inputs)
+        min_matches = 2
+        max_nodes = 60
+
+        loading_embed = discord.Embed(
+            title="Building Co-play Communities...",
+            description=f"Analyzing co-play groups for **{gamertag}**",
+            colour=0xFFA500,
+            timestamp=datetime.now(),
+        )
+        loading_msg = await ctx.send(embed=loading_embed)
+
+        try:
+            xuid = await api_client.resolve_gamertag_to_xuid(gamertag)
+            if not xuid:
+                await loading_msg.delete()
+                await ctx.send(f"Could not find player **{gamertag}**")
+                return
+
+            player = self.db.get_player(xuid)
+            if not player:
+                await loading_msg.delete()
+                await ctx.send(
+                    f"**{gamertag}** is not in the graph database. Run `#crawlfriends` and `#crawlgames` first."
+                )
+                return
+
+            active_min_matches = min_matches
+            threshold_relaxed = False
+
+            neighbors = self.db.get_coplay_neighbors(xuid, min_matches=active_min_matches, limit=max_nodes - 1)
+            if not neighbors:
+                relaxed_neighbors = self.db.get_coplay_neighbors(xuid, min_matches=1, limit=max_nodes - 1)
+                if relaxed_neighbors:
+                    neighbors = relaxed_neighbors
+                    active_min_matches = 1
+                    threshold_relaxed = True
+                else:
+                    await loading_msg.delete()
+                    await ctx.send(
+                        f"No co-play edges found for **{gamertag}**. Run `#crawlgames` and try again."
+                    )
+                    return
+
+            node_map: Dict[str, Dict] = {
+                xuid: {
+                    'xuid': xuid,
+                    'gamertag': gamertag,
+                    'is_center': True,
+                }
+            }
+
+            for row in neighbors:
+                partner_xuid = row.get('partner_xuid')
+                if not partner_xuid:
+                    continue
+                node_map[partner_xuid] = {
+                    'xuid': partner_xuid,
+                    'gamertag': row.get('gamertag') or partner_xuid,
+                    'is_center': False,
+                }
+
+            all_xuids = list(node_map.keys())
+            raw_edges = self.db.get_coplay_edges_within_set(all_xuids, min_matches=active_min_matches)
+
+            # Collapse directional rows into one undirected edge with summed weights.
+            aggregated_edges: Dict[tuple, Dict[str, object]] = {}
+            for edge in raw_edges:
+                src = edge.get('src_xuid')
+                dst = edge.get('dst_xuid')
+                if not src or not dst or src == dst:
+                    continue
+                key = tuple(sorted((src, dst)))
+                bucket = aggregated_edges.setdefault(
+                    key,
+                    {
+                        'src_xuid': key[0],
+                        'dst_xuid': key[1],
+                        'matches_together': 0,
+                    },
+                )
+                bucket['matches_together'] += int(edge.get('matches_together') or 0)
+
+            edges = [
+                edge
+                for edge in aggregated_edges.values()
+                if int(edge.get('matches_together') or 0) >= active_min_matches
+            ]
+
+            if not edges:
+                await loading_msg.delete()
+                await ctx.send(
+                    f"Co-play data exists for **{gamertag}**, but no edges met the current threshold ({active_min_matches})."
+                )
+                return
+
+            import networkx as nx
+
+            G = nx.Graph()
+            for xuid_key, node in node_map.items():
+                G.add_node(xuid_key, gamertag=node.get('gamertag') or xuid_key)
+
+            for edge in edges:
+                src = edge.get('src_xuid')
+                dst = edge.get('dst_xuid')
+                weight = int(edge.get('matches_together') or 0)
+                if not src or not dst or src == dst or weight <= 0:
+                    continue
+                if G.has_edge(src, dst):
+                    G[src][dst]['weight'] += weight
+                else:
+                    G.add_edge(src, dst, weight=weight)
+
+            if G.number_of_nodes() < 2 or G.number_of_edges() < 1:
+                await loading_msg.delete()
+                await ctx.send(f"Not enough connected co-play data to compute groups for **{gamertag}**.")
+                return
+
+            communities = list(nx.algorithms.community.greedy_modularity_communities(G, weight='weight'))
+            communities = sorted((set(c) for c in communities), key=lambda c: (-len(c), sorted(c)[0]))
+
+            community_of: Dict[str, int] = {}
+            for idx, members in enumerate(communities, start=1):
+                for member in members:
+                    community_of[member] = idx
+
+            group_count = len(communities)
+            matrix_weights = [[0 for _ in range(group_count)] for _ in range(group_count)]
+            matrix_edges = [[0 for _ in range(group_count)] for _ in range(group_count)]
+
+            for u, v, data in G.edges(data=True):
+                gu = community_of.get(u)
+                gv = community_of.get(v)
+                if not gu or not gv:
+                    continue
+                i = gu - 1
+                j = gv - 1
+                w = int(data.get('weight') or 0)
+                matrix_weights[i][j] += w
+                matrix_weights[j][i] += w
+                matrix_edges[i][j] += 1
+                matrix_edges[j][i] += 1
+
+            strongest_links = []
+            for i in range(group_count):
+                for j in range(i + 1, group_count):
+                    if matrix_weights[i][j] <= 0:
+                        continue
+                    strongest_links.append((i + 1, j + 1, matrix_weights[i][j], matrix_edges[i][j]))
+            strongest_links.sort(key=lambda item: item[2], reverse=True)
+
+            embed = discord.Embed(
+                title=f"Halo Groups: {gamertag}",
+                description=(
+                    "Detected co-play communities from weighted shared-match edges."
+                    + (" Using fallback threshold of 1 shared match." if threshold_relaxed else "")
+                ),
+                colour=0x1ABC9C,
+                timestamp=datetime.now(),
+            )
+            embed.add_field(
+                name="Summary",
+                value=(
+                    f"Nodes: **{G.number_of_nodes()}**\n"
+                    f"Edges: **{G.number_of_edges()}**\n"
+                    f"Groups: **{group_count}**\n"
+                    f"Min edge weight: **{active_min_matches}**"
+                ),
+                inline=True,
+            )
+
+            top_group_lines = []
+            for idx, members in enumerate(communities[:5], start=1):
+                names = sorted((node_map.get(m, {}).get('gamertag') or m) for m in members)
+                preview = ", ".join(names[:6])
+                if len(names) > 6:
+                    preview += f", +{len(names) - 6} more"
+                top_group_lines.append(f"G{idx} ({len(members)}): {preview}")
+            embed.add_field(
+                name="Top Groups",
+                value="\n".join(top_group_lines) if top_group_lines else "No groups",
+                inline=False,
+            )
+
+            if strongest_links:
+                lines = [
+                    f"G{a} <-> G{b}: {weight} shared matches across {edge_count} links"
+                    for a, b, weight, edge_count in strongest_links[:6]
+                ]
+                embed.add_field(name="Strongest Inter-Group Links", value="\n".join(lines), inline=False)
+            else:
+                embed.add_field(
+                    name="Strongest Inter-Group Links",
+                    value="No cross-group links were detected (single cluster or disconnected communities).",
+                    inline=False,
+                )
+
+            overlap_buf = io.StringIO()
+            overlap_writer = csv.writer(overlap_buf)
+            overlap_writer.writerow(["Group"] + [f"G{i}" for i in range(1, group_count + 1)])
+            for i in range(group_count):
+                overlap_writer.writerow([f"G{i + 1}"] + matrix_weights[i])
+
+            members_buf = io.StringIO()
+            members_writer = csv.writer(members_buf)
+            members_writer.writerow(["group_id", "xuid", "gamertag", "is_center"])
+            for idx, members in enumerate(communities, start=1):
+                for member_xuid in sorted(members):
+                    members_writer.writerow([
+                        idx,
+                        member_xuid,
+                        node_map.get(member_xuid, {}).get('gamertag') or member_xuid,
+                        int(member_xuid == xuid),
+                    ])
+
+            overlap_file = discord.File(
+                io.BytesIO(overlap_buf.getvalue().encode('utf-8')),
+                filename=f"halogroups_overlap_{xuid}.csv",
+            )
+            members_file = discord.File(
+                io.BytesIO(members_buf.getvalue().encode('utf-8')),
+                filename=f"halogroups_members_{xuid}.csv",
+            )
+
+            embed.set_footer(
+                text="Attached CSVs: overlap matrix (shared matches) and full group memberships"
+            )
+
+            await loading_msg.delete()
+            await ctx.send(embed=embed, files=[overlap_file, members_file])
+
+        except Exception as e:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
+            await ctx.send(f"Error showing halogroups: {str(e)}")
             raise
     
     @commands.command(name='network', help='Show a player network visualization from graph DB data. Usage: #network <gamertag>')
@@ -1770,8 +2031,8 @@ class GraphCog(commands.Cog, name="Graph"):
 
         if not run_inline:
             await ctx.send(
-                f"Starting co-play build from current graph scope for **{gamertag}** with depth {depth}. "
-                "Use `#crawlfriends` separately if you want to expand graph coverage first."
+                f"Starting participant-first co-play build for **{gamertag}** with depth {depth}. "
+                "This now builds from global match participants and reports seed-specific coverage."
             )
 
         async def run_coplay_crawl():
@@ -1793,20 +2054,12 @@ class GraphCog(commands.Cog, name="Graph"):
                     )
                     return
 
-                scope_xuids = self._collect_halo_active_scope(seed_xuid, depth)
-                if not scope_xuids:
-                    await ctx.channel.send(
-                        "No Halo-active players found in the current graph scope; no co-play edges were created. "
-                        "Run `#crawlfriends` to expand scope, then rerun `#crawlgames`."
-                    )
-                    return
-
                 if progress_callback:
                     await progress_callback(
                         {
                             "stage": "Reading participants",
                             "percent": 20.0,
-                            "detail": f"Loaded scope with {len(scope_xuids)} players",
+                            "detail": "Loading global match participants",
                         }
                     )
 
@@ -1818,126 +2071,96 @@ class GraphCog(commands.Cog, name="Graph"):
                 counted_pair_matches = set()
 
                 players_analyzed = 0
-                scope_set = set(scope_xuids)
                 stats_db = getattr(getattr(api_client, 'stats_cache', None), 'db', None)
-                scope_match_participants = {}
-                if stats_db and hasattr(stats_db, 'get_scope_match_participants'):
-                    scope_match_participants = stats_db.get_scope_match_participants(scope_xuids) or {}
+                if not stats_db or not hasattr(stats_db, 'get_all_match_participants'):
+                    await ctx.channel.send(
+                        "Participant-first co-play build requires stats DB participant access, but it is unavailable."
+                    )
+                    return
 
-                if scope_match_participants:
-                    analyzed_players = set()
-                    total_matches = len(scope_match_participants)
-                    for idx, (match_id, participants) in enumerate(sorted(scope_match_participants.items()), start=1):
-                        scoped_participants = [
-                            p for p in participants
-                            if str(p.get('xuid') or '').strip() in scope_set
-                        ]
-                        if len(scoped_participants) < 2:
+                all_match_participants = stats_db.get_all_match_participants() or {}
+                analyzed_players = set()
+                seed_matches_seen = 0
+                seed_qualifying_matches = 0
+
+                total_matches = len(all_match_participants)
+                for idx, (match_id, participants) in enumerate(all_match_participants.items(), start=1):
+                    if len(participants) < 2:
+                        continue
+
+                    normalized_participants = []
+                    seen_in_match = set()
+                    seed_in_match = False
+                    start_time = ''
+                    for participant in participants:
+                        participant_xuid = str(participant.get('xuid') or '').strip()
+                        if not participant_xuid or participant_xuid in seen_in_match:
+                            continue
+                        seen_in_match.add(participant_xuid)
+                        normalized_participants.append(participant)
+                        analyzed_players.add(participant_xuid)
+                        if participant_xuid == seed_xuid:
+                            seed_in_match = True
+                        if not start_time:
+                            start_time = str(participant.get('start_time') or '')
+
+                    if seed_in_match:
+                        seed_matches_seen += 1
+                    if len(normalized_participants) < 2:
+                        continue
+                    if seed_in_match:
+                        seed_qualifying_matches += 1
+
+                    for left, right in combinations(normalized_participants, 2):
+                        left_xuid = str(left.get('xuid') or '').strip()
+                        right_xuid = str(right.get('xuid') or '').strip()
+                        if not left_xuid or not right_xuid or left_xuid == right_xuid:
                             continue
 
-                        start_time = ''
-                        for participant in scoped_participants:
-                            participant_xuid = str(participant.get('xuid') or '').strip()
-                            if participant_xuid:
-                                analyzed_players.add(participant_xuid)
-                            if not start_time:
-                                start_time = str(participant.get('start_time') or '')
+                        src_xuid, dst_xuid = sorted((left_xuid, right_xuid))
+                        pair_key = (src_xuid, dst_xuid)
+                        pair_match_key = (match_id, src_xuid, dst_xuid)
+                        if match_id and pair_match_key in counted_pair_matches:
+                            continue
+                        if match_id:
+                            counted_pair_matches.add(pair_match_key)
 
-                        for left, right in combinations(scoped_participants, 2):
-                            left_xuid = str(left.get('xuid') or '').strip()
-                            right_xuid = str(right.get('xuid') or '').strip()
-                            if not left_xuid or not right_xuid or left_xuid == right_xuid:
-                                continue
+                        match_edge_counts[pair_key] += 1
 
-                            src_xuid, dst_xuid = sorted((left_xuid, right_xuid))
-                            pair_key = (src_xuid, dst_xuid)
-                            pair_match_key = (match_id, src_xuid, dst_xuid)
-                            if match_id and pair_match_key in counted_pair_matches:
-                                continue
-                            if match_id:
-                                counted_pair_matches.add(pair_match_key)
+                        left_team = left.get('team_id') or left.get('inferred_team_id')
+                        right_team = right.get('team_id') or right.get('inferred_team_id')
+                        if left_team and right_team:
+                            if str(left_team) == str(right_team):
+                                same_team_counts[pair_key] += 1
+                            else:
+                                opposing_team_counts[pair_key] += 1
 
-                            match_edge_counts[pair_key] += 1
+                        if start_time:
+                            existing_first = first_played.get(pair_key)
+                            existing_last = last_played.get(pair_key)
+                            if not existing_first or start_time < existing_first:
+                                first_played[pair_key] = start_time
+                            if not existing_last or start_time > existing_last:
+                                last_played[pair_key] = start_time
 
-                            left_team = left.get('team_id') or left.get('inferred_team_id')
-                            right_team = right.get('team_id') or right.get('inferred_team_id')
-                            if left_team and right_team:
-                                if str(left_team) == str(right_team):
-                                    same_team_counts[pair_key] += 1
-                                else:
-                                    opposing_team_counts[pair_key] += 1
-
-                            if start_time:
-                                existing_first = first_played.get(pair_key)
-                                existing_last = last_played.get(pair_key)
-                                if not existing_first or start_time < existing_first:
-                                    first_played[pair_key] = start_time
-                                if not existing_last or start_time > existing_last:
-                                    last_played[pair_key] = start_time
-
-                        if progress_callback and total_matches > 0:
-                            analysis_pct = 25.0 + (float(idx) / float(total_matches)) * 60.0
-                            await progress_callback(
-                                {
-                                    "stage": "Analyzing co-play",
-                                    "percent": min(85.0, analysis_pct),
-                                    "detail": f"Analyzed {idx}/{total_matches} matches",
-                                }
-                            )
-
-                    players_analyzed = len(analyzed_players)
-                else:
-                    total_scope = len(scope_xuids)
-                    for scope_xuid in scope_xuids:
-                        player = self.db.get_player(scope_xuid)
-                        player_gamertag = (player or {}).get('gamertag')
-                        stats_result = await api_client.calculate_comprehensive_stats(
-                            xuid=scope_xuid,
-                            stat_type='overall',
-                            gamertag=player_gamertag,
-                            matches_to_process=None,
+                    if progress_callback and total_matches > 0:
+                        analysis_pct = 25.0 + (float(idx) / float(total_matches)) * 60.0
+                        await progress_callback(
+                            {
+                                "stage": "Analyzing co-play",
+                                "percent": min(85.0, analysis_pct),
+                                "detail": f"Analyzed {idx}/{total_matches} matches",
+                            }
                         )
-                        if stats_result.get('error') != 0:
-                            continue
 
-                        players_analyzed += 1
-                        if progress_callback and total_scope > 0:
-                            analysis_pct = 25.0 + (float(players_analyzed) / float(total_scope)) * 60.0
-                            await progress_callback(
-                                {
-                                    "stage": "Analyzing co-play",
-                                    "percent": min(85.0, analysis_pct),
-                                    "detail": f"Analyzed {players_analyzed}/{total_scope} players",
-                                }
-                            )
-                        for match in stats_result.get('processed_matches', []):
-                            match_id = match.get('match_id')
-                            start_time = match.get('start_time') or ''
-                            participants = match.get('players')
-                            if not isinstance(participants, list) or not participants:
-                                continue
+                players_analyzed = len(analyzed_players)
+                seed_pairs_found = sum(1 for src_xuid, dst_xuid in match_edge_counts if seed_xuid in (src_xuid, dst_xuid))
 
-                            for partner_xuid in participants:
-                                partner_xuid = str(partner_xuid)
-                                if partner_xuid == scope_xuid or partner_xuid not in scope_set:
-                                    continue
-
-                                src_xuid, dst_xuid = sorted((scope_xuid, partner_xuid))
-                                pair_key = (src_xuid, dst_xuid)
-                                pair_match_key = (match_id, src_xuid, dst_xuid)
-                                if match_id and pair_match_key in counted_pair_matches:
-                                    continue
-                                if match_id:
-                                    counted_pair_matches.add(pair_match_key)
-
-                                match_edge_counts[pair_key] += 1
-                                if start_time:
-                                    existing_first = first_played.get(pair_key)
-                                    existing_last = last_played.get(pair_key)
-                                    if not existing_first or start_time < existing_first:
-                                        first_played[pair_key] = start_time
-                                    if not existing_last or start_time > existing_last:
-                                        last_played[pair_key] = start_time
+                halo_active_xuids: set[str] = set()
+                conn = self.db._get_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT xuid FROM graph_players WHERE halo_active = 1")
+                halo_active_xuids = {str(row['xuid']) for row in cursor.fetchall() if row['xuid']}
 
                 if progress_callback:
                     await progress_callback(
@@ -1949,10 +2172,13 @@ class GraphCog(commands.Cog, name="Graph"):
                     )
 
                 rows_written = 0
+                seed_rows_written = 0
                 total_pairs = max(1, len(match_edge_counts))
                 for pair_idx, ((src_xuid, dst_xuid), matches_together) in enumerate(match_edge_counts.items(), start=1):
                     first_ts = first_played.get((src_xuid, dst_xuid))
                     last_ts = last_played.get((src_xuid, dst_xuid))
+                    is_halo_active_pair = src_xuid in halo_active_xuids and dst_xuid in halo_active_xuids
+                    is_seed_pair = seed_xuid in (src_xuid, dst_xuid)
 
                     if self.db.upsert_coplay_edge(
                         src_xuid=src_xuid,
@@ -1964,8 +2190,12 @@ class GraphCog(commands.Cog, name="Graph"):
                         total_minutes=0,
                         same_team_count=same_team_counts.get((src_xuid, dst_xuid), 0),
                         opposing_team_count=opposing_team_counts.get((src_xuid, dst_xuid), 0),
+                        source_type='participants-runtime',
+                        is_halo_active_pair=is_halo_active_pair,
                     ):
                         rows_written += 1
+                        if is_seed_pair:
+                            seed_rows_written += 1
 
                     if self.db.upsert_coplay_edge(
                         src_xuid=dst_xuid,
@@ -1977,8 +2207,12 @@ class GraphCog(commands.Cog, name="Graph"):
                         total_minutes=0,
                         same_team_count=same_team_counts.get((src_xuid, dst_xuid), 0),
                         opposing_team_count=opposing_team_counts.get((src_xuid, dst_xuid), 0),
+                        source_type='participants-runtime',
+                        is_halo_active_pair=is_halo_active_pair,
                     ):
                         rows_written += 1
+                        if is_seed_pair:
+                            seed_rows_written += 1
 
                     if progress_callback and (pair_idx == 1 or pair_idx == total_pairs or pair_idx % 250 == 0):
                         write_pct = 88.0 + (float(pair_idx) / float(total_pairs)) * 10.0
@@ -2006,18 +2240,37 @@ class GraphCog(commands.Cog, name="Graph"):
                 )
                 embed.add_field(name="Seed", value=gamertag, inline=True)
                 embed.add_field(name="Depth", value=str(depth), inline=True)
-                embed.add_field(name="Scope Players", value=str(len(scope_xuids)), inline=True)
+                embed.add_field(name="Scope Mode", value="Global participants", inline=True)
                 embed.add_field(name="Players Analyzed", value=str(players_analyzed), inline=True)
                 embed.add_field(name="Unique Co-play Pairs", value=str(len(match_edge_counts)), inline=True)
                 embed.add_field(name="Co-play Rows Written", value=str(rows_written), inline=True)
-                embed.add_field(name="Participant Source", value="match_participants + fallback stats", inline=True)
+                embed.add_field(name="Seed Pairs Found", value=str(seed_pairs_found), inline=True)
+                embed.add_field(name="Seed Rows Written", value=str(seed_rows_written), inline=True)
+                embed.add_field(name="Seed Qualifying Matches", value=str(seed_qualifying_matches), inline=True)
+                embed.add_field(name="Participant Source", value="match_participants (global)", inline=True)
                 embed.add_field(name="Next Step", value=f"Run `#halonet {gamertag}`", inline=True)
+                if seed_matches_seen == 0:
+                    embed.add_field(
+                        name="Seed Not Found In Participant Rows",
+                        value="The resolved seed did not appear in any persisted match participants.",
+                        inline=False,
+                    )
+                elif seed_pairs_found == 0:
+                    embed.add_field(
+                        name="Seed Has Zero Co-play Pairs",
+                        value=(
+                            "Global pairs were built, but the seed did not form any pair in qualifying matches. "
+                            "This indicates no co-participants were persisted alongside the seed in match_participants."
+                        ),
+                        inline=False,
+                    )
+
                 if len(match_edge_counts) == 0:
                     embed.add_field(
                         name="No Co-play Pairs Found",
                         value=(
-                            "No shared-match pairs were discovered in current scope. "
-                            "Run `#crawlfriends` to expand graph coverage and rerun `#crawlgames`."
+                            "No shared-match pairs were discovered in persisted participant history. "
+                            "Ensure match_participants ingestion is populated and rerun `#crawlgames`."
                         ),
                         inline=False,
                     )
@@ -2026,8 +2279,8 @@ class GraphCog(commands.Cog, name="Graph"):
                     await ctx.channel.send(embed=embed)
                 return (
                     f"Co-play crawl completed for {gamertag}. "
-                    f"Scope players {len(scope_xuids)}, analyzed {players_analyzed}, "
-                    f"pairs {len(match_edge_counts)}, rows written {rows_written}."
+                    f"Global participant mode; analyzed {players_analyzed}, pairs {len(match_edge_counts)}, "
+                    f"rows written {rows_written}, seed pairs {seed_pairs_found}, seed rows {seed_rows_written}."
                 )
             except Exception as e:
                 if not run_inline:
