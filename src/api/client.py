@@ -786,57 +786,65 @@ class HaloAPIClient:
         Returns:
             Dict with 'friends' (list), 'is_private' (bool), and 'error' (str or None)
         """
-        # Get Xbox account credentials
-        if self.xbox_accounts:
-            account_idx = await xbox_profile_rate_limiter.acquire(_account_index)
-            account = self.xbox_accounts[account_idx] if account_idx < len(self.xbox_accounts) else self.xbox_accounts[0]
-            xbox_token = account['token']
-            uhs = account['uhs']
-        else:
-            account_idx = 0
-            # Fallback to loading from cache file (single account mode)
-            cache_file = TOKEN_CACHE_FILE
-            if not os.path.exists(cache_file):
-                print(f"Token cache not found")
-                return {'friends': [], 'is_private': False, 'error': 'no_cache'}
-            
-            with open(cache_file, 'r') as f:
-                cache = json.load(f)
-            
-            xsts_xbox = cache.get('xsts_xbox')
-            if not xsts_xbox:
-                print(f"Xbox Live XSTS token not found in cache")
-                return {'friends': [], 'is_private': False, 'error': 'no_token'}
-            
-            xbox_token = xsts_xbox.get('token')
-            uhs = xsts_xbox.get('uhs')
-        
-        if not xbox_token or not uhs:
-            print(f"Xbox Live XSTS token or UHS missing")
-            xbox_profile_rate_limiter.release()
-            return {'friends': [], 'is_private': False, 'error': 'missing_token'}
-        
         # Use People Hub API to get friends list
         friends_url = f'https://peoplehub.xboxlive.com/users/xuid({xuid})/people/social/decoration/preferredcolor,detail'
-        
-        headers = {
-            'Authorization': f'XBL3.0 x={uhs};{xbox_token}',
-            'x-xbl-contract-version': '5',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US'
-        }
         
         # Use shared cache if provided (for batch operations), otherwise load fresh
         use_shared_cache = _xuid_cache is not None
         xuid_cache = _xuid_cache if use_shared_cache else load_xuid_cache()
+
+        fallback_xbox_token = None
+        fallback_uhs = None
+        if not self.xbox_accounts:
+            # Fallback to loading from cache file (single account mode)
+            cache_file = TOKEN_CACHE_FILE
+            if not os.path.exists(cache_file):
+                print("Token cache not found")
+                return {'friends': [], 'is_private': False, 'error': 'no_cache'}
+
+            with open(cache_file, 'r') as f:
+                cache = json.load(f)
+
+            xsts_xbox = cache.get('xsts_xbox')
+            if not xsts_xbox:
+                print("Xbox Live XSTS token not found in cache")
+                return {'friends': [], 'is_private': False, 'error': 'no_token'}
+
+            fallback_xbox_token = xsts_xbox.get('token')
+            fallback_uhs = xsts_xbox.get('uhs')
         
         # Retry loop with exponential backoff
         for attempt in range(max_retries):
+            account_idx = 0
+            release_rate_limiter = False
             try:
+                if self.xbox_accounts:
+                    # On first attempt honor caller preference; retries can rebalance to other accounts.
+                    requested_account = _account_index if attempt == 0 else None
+                    account_idx = await xbox_profile_rate_limiter.acquire(requested_account)
+                    release_rate_limiter = True
+
+                    account = self.xbox_accounts[account_idx] if account_idx < len(self.xbox_accounts) else self.xbox_accounts[0]
+                    xbox_token = account.get('token')
+                    uhs = account.get('uhs')
+                else:
+                    xbox_token = fallback_xbox_token
+                    uhs = fallback_uhs
+
+                if not xbox_token or not uhs:
+                    print("Xbox Live XSTS token or UHS missing")
+                    return {'friends': [], 'is_private': False, 'error': 'missing_token'}
+
+                headers = {
+                    'Authorization': f'XBL3.0 x={uhs};{xbox_token}',
+                    'x-xbl-contract-version': '5',
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en-US'
+                }
+
                 async with aiohttp.ClientSession() as session:
                     async with session.get(friends_url, headers=headers) as response:
                         if response.status == 200:
-                            xbox_profile_rate_limiter.release()
                             data = await response.json()
                             people = data.get('people', [])
                             
@@ -876,6 +884,8 @@ class HaloAPIClient:
                         
                         elif response.status == 429:
                             # Rate limited - parse response for backoff info
+                            current_requests = 0
+                            max_requests = 0
                             try:
                                 error_data = await response.json()
                                 period_seconds = error_data.get('periodInSeconds', 300)
@@ -887,35 +897,38 @@ class HaloAPIClient:
                                 base_wait = min(period_seconds / 2, 60)  # Cap base at 60s
                                 backoff_wait = base_wait * (2 ** attempt) + (attempt * 5)
                                 backoff_wait = min(backoff_wait, period_seconds)  # Don't exceed period
-                                
-                                print(f"⚠️ Rate limited (429) for XUID {xuid} - {current_requests}/{max_requests} requests")
-                                print(f"   Attempt {attempt + 1}/{max_retries}, waiting {backoff_wait:.0f}s...")
-                                
-                                # Set backoff on this account
-                                xbox_profile_rate_limiter.set_backoff(account_idx, backoff_wait)
-                                
-                                await asyncio.sleep(backoff_wait)
-                                continue  # Retry
-                                
-                            except Exception as e:
+
+                            except Exception:
                                 # Couldn't parse - use default exponential backoff
                                 backoff_wait = 30 * (2 ** attempt)
-                                print(f"⚠️ Rate limited (429), waiting {backoff_wait}s (attempt {attempt + 1}/{max_retries})")
-                                await asyncio.sleep(backoff_wait)
-                                continue
+
+                            if self.xbox_accounts:
+                                xbox_profile_rate_limiter.set_backoff(account_idx, backoff_wait)
+                                print(f"⚠️ Rate limited (429) for XUID {xuid} on account {account_idx + 1} - {current_requests}/{max_requests} requests")
+                                print(f"   Attempt {attempt + 1}/{max_retries}, backoff {backoff_wait:.0f}s (limiter-managed)")
+
+                                if attempt < max_retries - 1:
+                                    # Yield briefly; limiter state controls real wait/rebalance behavior.
+                                    await asyncio.sleep(0)
+                                    continue
+                            else:
+                                print(f"⚠️ Rate limited (429), waiting {backoff_wait:.0f}s (attempt {attempt + 1}/{max_retries})")
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(min(backoff_wait, 30.0))
+                                    continue
+
+                            print(f"❌ Failed to get friends list for XUID {xuid} after {max_retries} retries")
+                            return {'friends': [], 'is_private': False, 'error': 'max_retries'}
                         
                         elif response.status == 401:
-                            xbox_profile_rate_limiter.release()
                             print(f"Unauthorized (401) - Xbox Live XSTS token invalid for friends list")
                             return {'friends': [], 'is_private': False, 'error': 'unauthorized'}
                         
                         elif response.status == 403:
-                            xbox_profile_rate_limiter.release()
                             print(f"Forbidden (403) - Friends list is private for XUID {xuid}")
                             return {'friends': [], 'is_private': True, 'error': None}
                         
                         else:
-                            xbox_profile_rate_limiter.release()
                             error_text = await response.text()
                             print(f"People Hub API returned status {response.status}: {error_text[:200]}")
                             return {'friends': [], 'is_private': False, 'error': f'status_{response.status}'}
@@ -923,18 +936,19 @@ class HaloAPIClient:
             except Exception as e:
                 print(f"Error getting friends list (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
-                    backoff_wait = 5 * (2 ** attempt)
-                    await asyncio.sleep(backoff_wait)
+                    # Keep retries responsive; limiter and per-account backoff handle pacing.
+                    await asyncio.sleep(0)
                     continue
                 traceback.print_exc()
-                xbox_profile_rate_limiter.release()
                 return {'friends': [], 'is_private': False, 'error': 'exception'}
-        
+            finally:
+                if release_rate_limiter:
+                    xbox_profile_rate_limiter.release()
+
         # Exhausted retries
-        xbox_profile_rate_limiter.release()
         print(f"❌ Failed to get friends list for XUID {xuid} after {max_retries} retries")
         return {'friends': [], 'is_private': False, 'error': 'max_retries'}
-    
+
     async def get_friends_of_friends(
         self,
         gamertag: str,
@@ -944,15 +958,15 @@ class HaloAPIClient:
     ) -> Dict:
         """
         Get a player's friends and friends-of-friends (2nd degree connections).
-        
+
         Uses concurrent requests across multiple Xbox accounts for faster fetching.
-        
+
         Args:
             gamertag: Xbox gamertag to start from
             max_depth: How many levels deep to go (1=friends only, 2=friends of friends)
             progress_callback: Optional async callback(current, total, stage, fof_count) for progress updates
-            concurrency: Max concurrent requests (defaults to number of Xbox accounts, capped at 3)
-        
+            concurrency: Max concurrent requests (defaults to number of Xbox accounts, capped at 5)
+
         Returns:
             Dictionary with:
                 - 'target': The target player info
@@ -960,7 +974,7 @@ class HaloAPIClient:
                 - 'friends_of_friends': List of 2nd degree connections (if depth=2)
                 - 'all_unique': Set of all unique XUIDs found
                 - 'error': Error message if any
-                
+
         Note:
             Xbox People Hub API has strict rate limits (30 req / 5 min per account).
             Uses exponential backoff with retries on 429 errors.
@@ -974,19 +988,18 @@ class HaloAPIClient:
             'new_cache_entries': 0,
             'private_friends': []  # Friends with private friends lists
         }
-        
+
         # Load XUID cache once for the entire operation (batch mode)
         xuid_cache = load_xuid_cache()
         cache_stats = {'new_entries': 0}
         cache_lock = asyncio.Lock()  # For thread-safe cache updates
         private_friends_lock = asyncio.Lock()  # For thread-safe private friends tracking
-        
-        # Set concurrency - be conservative due to strict API limits (30 req / 5 min per account)
-        # With retries, more concurrency just means more waiting on backoff
+
+        # Set concurrency - keep bounded while allowing all configured accounts by default.
         if concurrency is None:
             num_accounts = len(self.xbox_accounts) if self.xbox_accounts else 1
-            concurrency = min(num_accounts, 3)  # Cap at 3 concurrent to avoid overwhelming
-        
+            concurrency = min(num_accounts, 5)
+
         # Resolve target gamertag to XUID
         print(f"Resolving gamertag '{gamertag}' to XUID...")
         target_xuid = await self.resolve_gamertag_to_xuid(gamertag)
@@ -1053,11 +1066,12 @@ class HaloAPIClient:
             
             # Create semaphore to limit concurrent requests
             semaphore = asyncio.Semaphore(concurrency)
+            account_slots = len(self.xbox_accounts) if self.xbox_accounts else 1
             
             async def rate_limited_fetch(friend: Dict, idx: int) -> Dict:
                 """Wrapper to apply concurrency limit."""
                 async with semaphore:
-                    account_idx = idx % concurrency  # Distribute across accounts
+                    account_idx = idx % account_slots  # Distribute across all available accounts
                     return await fetch_friend_list(friend, account_idx)
             
             # Progress update task
@@ -1108,7 +1122,7 @@ class HaloAPIClient:
                 progress_task.cancel()
                 try:
                     await progress_task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, RuntimeError):
                     pass
             
             # Add all 2nd degree to unique set
@@ -2107,7 +2121,7 @@ class HaloAPIClient:
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 # Decide fetching strategy: incremental vs full refetch
-                # Force full fetch ignores cache completely (used by #populate)
+                # Force full fetch ignores cache completely.
                 # Otherwise use incremental fetch if cache exists
                 print(f"Fetch params: force_full_fetch={force_full_fetch}, cached_data={'exists' if cached_data else 'none'}, matches_to_process={matches_to_process}")
                 total_matches_hint = None
@@ -2204,7 +2218,7 @@ class HaloAPIClient:
                     
                     # NOTE: Cache completeness check removed - we don't need complete history
                     # for regular stats lookups. If the user wants complete history, they use
-                    # force_full_fetch=True (e.g., #populate command), which bypasses cache entirely.
+                    # force_full_fetch=True, which bypasses cache entirely.
                     # Having 3900 cached matches is still useful even if player has >3900 total.
                     
                     # Check if we got 401 error before returning cached data

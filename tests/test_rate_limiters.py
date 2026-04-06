@@ -63,9 +63,11 @@ async def test_xbox_rate_limiter_acquire_respects_backoff(monkeypatch):
     limiter.set_num_accounts(1)
 
     sleep_calls = []
+    sleep_lock_states = []
 
     async def fake_sleep(seconds):
         sleep_calls.append(seconds)
+        sleep_lock_states.append(limiter.lock.locked())
 
     monkeypatch.setattr(rate_limiters.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(rate_limiters.time, "time", lambda: 100.0)
@@ -76,3 +78,28 @@ async def test_xbox_rate_limiter_acquire_respects_backoff(monkeypatch):
 
     assert account == 0
     assert sleep_calls == [3.5]
+    assert sleep_lock_states == [False]
+
+
+@pytest.mark.asyncio
+async def test_halo_rate_limiter_waits_without_lock_when_all_accounts_backed_off(monkeypatch):
+    limiter = rate_limiters.HaloStatsRateLimiter(requests_per_second_per_account=1000)
+    limiter.set_num_accounts(2)
+
+    sleep_calls = []
+    sleep_lock_states = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        sleep_lock_states.append(limiter.lock.locked())
+
+    monkeypatch.setattr(rate_limiters.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(rate_limiters.time, "time", lambda: 100.0)
+    limiter._account_backoff[0] = 101.0
+    limiter._account_backoff[1] = 101.5
+
+    selected = await limiter.wait_if_needed()
+
+    assert selected in {0, 1}
+    assert sleep_calls
+    assert all(lock_state is False for lock_state in sleep_lock_states)

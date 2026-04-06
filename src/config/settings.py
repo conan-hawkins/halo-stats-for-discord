@@ -7,6 +7,11 @@ Centralizes paths and settings that may need to change together.
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env values before configuration constants are evaluated.
+load_dotenv()
+
 # =============================================================================
 # BASE PATHS
 # =============================================================================
@@ -63,6 +68,19 @@ CACHE_PROGRESS_FILE = DATA_DIR / "cache_progress.json"
 # Rate limiting settings
 REQUESTS_PER_SECOND_PER_ACCOUNT = 8
 MAX_ACCOUNTS = 5
+
+# =============================================================================
+# TERMINAL AUTH CONFIGURATION
+# =============================================================================
+
+
+def get_terminal_admin_password() -> str:
+    """Return the current terminal admin password from environment variables."""
+    return os.getenv("TERMINAL_ADMIN_PASSWORD", "").strip()
+
+# Password required to enter admin terminal mode.
+# Leave unset/empty to disable admin terminal login.
+TERMINAL_ADMIN_PASSWORD = get_terminal_admin_password()
 
 # =============================================================================
 # INITIALIZATION

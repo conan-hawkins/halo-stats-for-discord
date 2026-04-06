@@ -101,20 +101,29 @@ class XboxProfileRateLimiter:
             self._semaphore = asyncio.Semaphore(2)
         
         await self._semaphore.acquire()
-        
-        async with self.lock:
-            if account_index is None:
-                account_index = self.get_best_account()
-            
-            # Wait if this account is in backoff
-            now = time.time()
-            backoff_until = self._account_backoff.get(account_index, 0)
-            if now < backoff_until:
-                wait_time = backoff_until - now
-                print(f"⏳ Waiting {wait_time:.1f}s for account {account_index + 1} backoff...")
+
+        try:
+            wait_time = 0.0
+            selected_index = 0
+
+            async with self.lock:
+                if account_index is None:
+                    selected_index = self.get_best_account()
+                else:
+                    selected_index = int(account_index) % max(1, self.num_accounts)
+
+                now = time.time()
+                backoff_until = self._account_backoff.get(selected_index, 0)
+                wait_time = max(0.0, backoff_until - now)
+
+            if wait_time > 0:
+                print(f"⏳ Waiting {wait_time:.1f}s for account {selected_index + 1} backoff...")
                 await asyncio.sleep(wait_time)
-        
-        return account_index
+
+            return selected_index
+        except BaseException:
+            self.release()
+            raise
     
     def release(self) -> None:
         """Release a request slot."""
@@ -227,55 +236,99 @@ class HaloStatsRateLimiter:
         await self._semaphore.acquire()
         
         try:
+            selected_index: Optional[int] = None
+
             async with self.lock:
                 now = time.time()
-                
-                # Check global backoff first
-                if now < self._global_backoff_until:
-                    wait_time = self._global_backoff_until - now
-                    print(f"⏳ Global rate limit backoff: waiting {wait_time:.1f}s...")
-                    await asyncio.sleep(wait_time)
-                    now = time.time()
-                
-                # Select account if not specified
-                if account_index is None:
-                    account_index = self.get_best_account()
-                
-                # Check per-account backoff
-                account_backoff = self._account_backoff.get(account_index, 0)
-                if now < account_backoff:
-                    wait_time = account_backoff - now
-                    # Try to find another account instead of waiting
-                    for i in range(self.num_accounts):
-                        if i != account_index and now >= self._account_backoff.get(i, 0):
-                            account_index = i
-                            break
+                global_wait = max(0.0, self._global_backoff_until - now)
+
+            if global_wait > 0:
+                print(f"⏳ Global rate limit backoff: waiting {global_wait:.1f}s...")
+                await asyncio.sleep(global_wait)
+
+            async with self.lock:
+                now = time.time()
+
+                preferred_index: Optional[int] = None
+                if account_index is not None:
+                    preferred_index = int(account_index) % max(1, self.num_accounts)
+
+                if preferred_index is not None and now >= self._account_backoff.get(preferred_index, 0):
+                    selected_index = preferred_index
+                else:
+                    selected_index = None
+                    longest_idle = float('-inf')
+                    for idx in range(self.num_accounts):
+                        if now < self._account_backoff.get(idx, 0):
+                            continue
+                        idle = now - self._account_last_request.get(idx, 0)
+                        if idle > longest_idle:
+                            longest_idle = idle
+                            selected_index = idx
+
+                account_wait = 0.0
+                if selected_index is None:
+                    # All accounts are currently in backoff.
+                    selected_index = min(
+                        range(self.num_accounts),
+                        key=lambda idx: self._account_backoff.get(idx, 0),
+                    )
+                    account_wait = max(0.0, self._account_backoff.get(selected_index, 0) - now)
+
+            if account_wait > 0:
+                print(f"⏳ All accounts in backoff, waiting {account_wait:.1f}s...")
+                await asyncio.sleep(account_wait)
+
+            async with self.lock:
+                now = time.time()
+
+                # Re-check selected account availability after wait and prefer alternatives if needed.
+                backoff_wait = 0.0
+                selected_backoff_until = self._account_backoff.get(selected_index, 0)
+                if now < selected_backoff_until:
+                    fallback_index = None
+                    longest_idle = float('-inf')
+                    for idx in range(self.num_accounts):
+                        if now < self._account_backoff.get(idx, 0):
+                            continue
+                        idle = now - self._account_last_request.get(idx, 0)
+                        if idle > longest_idle:
+                            longest_idle = idle
+                            fallback_index = idx
+                    if fallback_index is not None:
+                        selected_index = fallback_index
                     else:
-                        # All accounts in backoff, wait for this one
-                        print(f"⏳ All accounts in backoff, waiting {wait_time:.1f}s...")
-                        await asyncio.sleep(wait_time)
-                        now = time.time()
-                
-                # Ensure minimum interval between requests for this account
-                last_request = self._account_last_request.get(account_index, 0)
+                        backoff_wait = max(0.0, selected_backoff_until - now)
+
+                # Enforce per-account pacing; if possible, switch to an account already out of cooldown.
+                min_interval = self.min_interval_per_account
+                last_request = self._account_last_request.get(selected_index, 0.0)
                 elapsed = now - last_request
-                if elapsed < self.min_interval_per_account:
-                    # Check if another account is available with sufficient idle time
-                    for i in range(self.num_accounts):
-                        if i != account_index:
-                            other_elapsed = now - self._account_last_request.get(i, 0)
-                            other_backoff = self._account_backoff.get(i, 0)
-                            if other_elapsed >= self.min_interval_per_account and now >= other_backoff:
-                                account_index = i
-                                elapsed = other_elapsed
-                                break
-                    
-                    # If still need to wait for this account
-                    if elapsed < self.min_interval_per_account:
-                        await asyncio.sleep(self.min_interval_per_account - elapsed)
-                
-                self._account_last_request[account_index] = time.time()
-                return account_index
+
+                if elapsed < min_interval:
+                    replacement_index = None
+                    longest_idle = float('-inf')
+                    for idx in range(self.num_accounts):
+                        if idx == selected_index:
+                            continue
+                        if now < self._account_backoff.get(idx, 0):
+                            continue
+                        idle = now - self._account_last_request.get(idx, 0.0)
+                        if idle >= min_interval and idle > longest_idle:
+                            longest_idle = idle
+                            replacement_index = idx
+                    if replacement_index is not None:
+                        selected_index = replacement_index
+                        elapsed = now - self._account_last_request.get(selected_index, 0.0)
+
+                spacing_wait = max(backoff_wait, max(0.0, min_interval - elapsed))
+
+            if spacing_wait > 0:
+                await asyncio.sleep(spacing_wait)
+
+            async with self.lock:
+                self._account_last_request[selected_index] = time.time()
+                return selected_index
         finally:
             # Release semaphore after request setup
             self._semaphore.release()

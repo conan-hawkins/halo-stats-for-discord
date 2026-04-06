@@ -167,6 +167,54 @@ def test_match_participants_persist_and_scope_query(tmp_path):
     db.close()
 
 
+def test_get_seed_match_participants_returns_full_rosters_with_limit(tmp_path):
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    db.insert_or_update_player("seed", "SeedPlayer")
+    db.insert_or_update_player("xuid-a", "Alpha")
+    db.insert_or_update_player("xuid-b", "Bravo")
+    db.insert_or_update_player("xuid-c", "Charlie")
+    db.insert_or_update_player("xuid-d", "Delta")
+
+    db.insert_match(_match("m-seed-old", ranked=False, start_time="2026-01-01T00:00:00"))
+    db.insert_match(_match("m-seed-new", ranked=False, start_time="2026-01-02T00:00:00"))
+    db.insert_match(_match("m-other", ranked=False, start_time="2026-01-03T00:00:00"))
+
+    db.insert_match_participants(
+        "m-seed-old",
+        [
+            {"xuid": "seed", "team_id": "1", "outcome": 2},
+            {"xuid": "xuid-a", "team_id": "1", "outcome": 2},
+            {"xuid": "xuid-b", "team_id": "2", "outcome": 3},
+        ],
+    )
+    db.insert_match_participants(
+        "m-seed-new",
+        [
+            {"xuid": "seed", "team_id": "2", "outcome": 3},
+            {"xuid": "xuid-c", "team_id": "1", "outcome": 2},
+        ],
+    )
+    db.insert_match_participants(
+        "m-other",
+        [
+            {"xuid": "xuid-d", "team_id": "1", "outcome": 2},
+            {"xuid": "xuid-a", "team_id": "2", "outcome": 3},
+        ],
+    )
+
+    limited_rows = db.get_seed_match_participants("seed", limit_matches=1)
+    assert list(limited_rows.keys()) == ["m-seed-new"]
+    assert {row["xuid"] for row in limited_rows["m-seed-new"]} == {"seed", "xuid-c"}
+
+    all_rows = db.get_seed_match_participants("seed")
+    assert set(all_rows.keys()) == {"m-seed-old", "m-seed-new"}
+    assert {row["xuid"] for row in all_rows["m-seed-old"]} == {"seed", "xuid-a", "xuid-b"}
+    assert "m-other" not in all_rows
+
+    db.close()
+
+
 def test_insert_match_persists_category_fields(tmp_path):
     db = HaloStatsDBv2(str(tmp_path / "stats.db"))
 

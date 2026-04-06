@@ -572,6 +572,60 @@ class HaloStatsDBv2:
 
         return grouped
 
+    def get_seed_match_participants(self, seed_xuid: str, limit_matches: Optional[int] = None) -> Dict[str, List[Dict]]:
+        """Get full match rosters for matches where the seed player participated."""
+        normalized_seed = str(seed_xuid or '').strip()
+        if not normalized_seed:
+            return {}
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        limit_clause = ""
+        params: List[object] = [normalized_seed]
+        if limit_matches is not None and int(limit_matches) > 0:
+            limit_clause = "LIMIT ?"
+            params.append(int(limit_matches))
+
+        cursor.execute(
+            f"""
+            WITH seed_matches AS (
+                SELECT m.match_id
+                FROM matches m
+                JOIN match_participants smp ON smp.match_id = m.match_id
+                WHERE smp.xuid = ?
+                ORDER BY COALESCE(m.start_time, '') DESC, m.match_id ASC
+                {limit_clause}
+            )
+            SELECT
+                mp.match_id,
+                mp.xuid,
+                mp.outcome,
+                mp.team_id,
+                mp.inferred_team_id,
+                mp.kills,
+                mp.deaths,
+                mp.assists,
+                mp.csr,
+                mp.csr_tier,
+                p.gamertag,
+                m.start_time
+            FROM match_participants mp
+            JOIN seed_matches sm ON sm.match_id = mp.match_id
+            LEFT JOIN players p ON p.xuid = mp.xuid
+            LEFT JOIN matches m ON m.match_id = mp.match_id
+            ORDER BY COALESCE(m.start_time, '') DESC, mp.match_id ASC
+            """,
+            params,
+        )
+
+        grouped: Dict[str, List[Dict]] = {}
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            grouped.setdefault(row_dict['match_id'], []).append(row_dict)
+
+        return grouped
+
     def get_all_match_participants(self, limit_matches: Optional[int] = None) -> Dict[str, List[Dict]]:
         """Get participants for all matches, optionally limited by newest match start_time."""
         conn = self._get_connection()

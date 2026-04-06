@@ -15,6 +15,9 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# Load environment before importing project modules that read config on import.
+load_dotenv()
+
 from src.api import StatsFind1
 from src.bot.tasks import auto_refresh_tokens, auto_cache_all_players, proactive_token_refresh
 
@@ -23,7 +26,6 @@ from src.bot.tasks import auto_refresh_tokens, auto_cache_all_players, proactive
 # Bot Configuration
 # ============================================================================
 
-load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
 intents = discord.Intents.all()

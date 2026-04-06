@@ -5,7 +5,7 @@ Discord bot commands for Halo Infinite stats
 from datetime import datetime
 import discord
 
-from src.api.client import StatsFind1, get_players_from_recent_matches
+from src.api.client import StatsFind1
 from src.bot.embeds import format_error_embed, format_stats_embed
 
 
@@ -60,55 +60,7 @@ async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_p
         await loading_message.delete()
         await ctx.send(f"An error occurred: {e}")
 
-
-async def populate_player_cache(ctx):
-    """
-    Populate the player cache by scanning recent matches
-    
-    Args:
-        ctx: Discord context
-    """
-    print(f"Populate cache command initiated by {ctx.author}")
-    
-    loading_embed = discord.Embed(
-        title="Populating Player Cache...",
-        description="Scanning recent matches to build player database...\nThis may take several minutes!",
-        colour=0xFFA500,
-        timestamp=datetime.now()
-    )
-    loading_message = await ctx.send(embed=loading_embed)
-    
-    try:
-        seed_gamertag = ctx.author.display_name
-        
-        players = await get_players_from_recent_matches(seed_gamertag, num_matches=100)
-        
-        success_embed = discord.Embed(
-            title="Cache Population Complete!",
-            description=f"Found **{len(players)}** unique players from recent matches.",
-            colour=0x00FF00,
-            timestamp=datetime.now()
-        )
-        
-        await loading_message.edit(embed=success_embed)
-        print(f"Cache population complete: {len(players)} players found")
-        
-    except Exception as e:
-        import traceback
-        print(f"Error populating cache: {e}")
-        print(traceback.format_exc())
-        
-        error_embed = discord.Embed(
-            title="Cache Population Failed",
-            description=f"An error occurred: {str(e)}",
-            colour=0xFF0000,
-            timestamp=datetime.now()
-        )
-        await loading_message.edit(embed=error_embed)
-
-
 __all__ = [
     "fetch_and_display_stats",
-    "populate_player_cache",
 ]
 

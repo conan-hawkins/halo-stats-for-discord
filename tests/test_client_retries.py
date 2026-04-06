@@ -287,3 +287,102 @@ async def test_get_friends_list_429_then_success(monkeypatch):
     assert result["friends"][0]["xuid"] == "200"
     assert backoffs
     assert sleeps
+
+
+@pytest.mark.asyncio
+async def test_get_friends_list_retry_drops_fixed_account_hint(monkeypatch):
+    client = HaloAPIClient()
+    client.xbox_accounts = [
+        {"token": "xtok-1", "uhs": "u1"},
+        {"token": "xtok-2", "uhs": "u2"},
+    ]
+
+    from src.api import client as client_module
+
+    acquire_calls = []
+
+    async def fake_acquire(account_index=None):
+        acquire_calls.append(account_index)
+        return 0 if len(acquire_calls) == 1 else 1
+
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", fake_acquire)
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "release", lambda: None)
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "set_backoff", lambda idx, sec: None)
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
+
+    resp_429 = _FakeResponse(429, json_data={"periodInSeconds": 60, "currentRequests": 30, "maxRequests": 30})
+    resp_200 = _FakeResponse(
+        200,
+        json_data={
+            "people": [
+                {
+                    "xuid": "300",
+                    "gamertag": "FriendTwo",
+                    "displayName": "Friend Two",
+                    "isFollowingCaller": True,
+                    "isFollowedByCaller": True,
+                }
+            ]
+        },
+    )
+
+    sessions = [_FakeSession([resp_429]), _FakeSession([resp_200])]
+
+    class _SessionFactory:
+        def __init__(self, seq):
+            self.seq = seq
+
+        async def __aenter__(self):
+            return self.seq.pop(0)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda: _SessionFactory(sessions))
+
+    result = await client.get_friends_list("100", _account_index=0, max_retries=2)
+
+    assert result["error"] is None
+    assert acquire_calls == [0, None]
+
+
+@pytest.mark.asyncio
+async def test_get_friends_of_friends_distributes_across_all_accounts(monkeypatch):
+    client = HaloAPIClient()
+    client.xbox_accounts = [
+        {"token": "xtok-1", "uhs": "u1"},
+        {"token": "xtok-2", "uhs": "u2"},
+        {"token": "xtok-3", "uhs": "u3"},
+        {"token": "xtok-4", "uhs": "u4"},
+        {"token": "xtok-5", "uhs": "u5"},
+    ]
+
+    from src.api import client as client_module
+
+    monkeypatch.setattr(client_module, "load_xuid_cache", lambda: {})
+    monkeypatch.setattr(client_module, "save_xuid_cache", lambda _cache: None)
+
+    async def fake_resolve(_gamertag):
+        return "target-xuid"
+
+    monkeypatch.setattr(client, "resolve_gamertag_to_xuid", fake_resolve)
+
+    seen_account_indexes = []
+    direct_friends = [{"xuid": f"friend-{i}", "gamertag": f"Friend{i}"} for i in range(10)]
+
+    async def fake_get_friends_list(xuid, _xuid_cache=None, _cache_stats=None, _account_index=None, max_retries=5):
+        if xuid == "target-xuid":
+            return {"friends": direct_friends, "is_private": False, "error": None}
+        seen_account_indexes.append(_account_index)
+        return {"friends": [], "is_private": False, "error": None}
+
+    monkeypatch.setattr(client, "get_friends_list", fake_get_friends_list)
+
+    result = await client.get_friends_of_friends("TargetGT", max_depth=2)
+
+    assert result["error"] is None
+    assert set(seen_account_indexes) == {0, 1, 2, 3, 4}

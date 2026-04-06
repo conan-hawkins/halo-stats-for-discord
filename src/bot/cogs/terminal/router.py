@@ -29,8 +29,23 @@ async def execute_terminal_action(
     command_ctx,
     action: str,
     user_input: str = "",
+    access_level: str = "admin",
     progress_callback: Optional[Callable[[dict], object]] = None,
 ) -> str:
+    if access_level not in {"admin", "user"}:
+        return "Login required before running terminal commands."
+
+    user_allowed_actions = {
+        "cmd_full",
+        "cmd_ranked",
+        "cmd_casual",
+        "cmd_iss_level0",
+        "cmd_iss_level1",
+    }
+
+    if access_level == "user" and action not in user_allowed_actions:
+        return "Action not available in user terminal mode."
+
     stats_cog = bot.get_cog("Stats")
     graph_cog = bot.get_cog("Graph")
 
@@ -100,16 +115,52 @@ async def execute_terminal_action(
         await stats_cog.casual(command_ctx, user_input)
         return f"Executed #casual for {user_input}"
 
-    if action == "cmd_populate":
-        await stats_cog.populate_cache(command_ctx, user_input)
-        return f"Executed #populate for {user_input}"
-
     if action == "cmd_xboxfriends":
         await stats_cog.friends_list(command_ctx, user_input)
         return f"Executed #xboxfriends for {user_input}"
 
     if not graph_cog and action.startswith("cmd_"):
         return "Graph cog unavailable"
+
+    if action == "cmd_iss_level0":
+        result = await graph_cog.iss_level0(
+            command_ctx,
+            user_input,
+            progress_callback=progress_callback,
+            run_inline=progress_callback is not None,
+        )
+        return result or f"Executed ISS level 0 for {user_input}"
+
+    if action == "cmd_iss_level1":
+        result = await graph_cog.iss_level1(
+            command_ctx,
+            user_input,
+            progress_callback=progress_callback,
+            run_inline=progress_callback is not None,
+        )
+        return result or f"Executed ISS level 1 for {user_input}"
+
+    if action == "cmd_iss_level2":
+        if not command_ctx or not command_ctx.author.guild_permissions.administrator:
+            return "Admin permission required for ISS level 2"
+        result = await graph_cog.iss_level2(
+            command_ctx,
+            user_input,
+            progress_callback=progress_callback,
+            run_inline=progress_callback is not None,
+        )
+        return result or f"Executed ISS level 2 for {user_input}"
+
+    if action == "cmd_iss_level3":
+        if not command_ctx or not command_ctx.author.guild_permissions.administrator:
+            return "Admin permission required for ISS level 3"
+        result = await graph_cog.iss_level3(
+            command_ctx,
+            user_input,
+            progress_callback=progress_callback,
+            run_inline=progress_callback is not None,
+        )
+        return result or f"Executed ISS level 3 for {user_input}"
 
     if action == "cmd_network":
         await graph_cog.show_network(command_ctx, user_input)

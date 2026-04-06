@@ -16,7 +16,7 @@ class TerminalCog(commands.Cog, name="Terminal"):
     async def terminal(self, ctx: commands.Context):
         state = TerminalState(
             requester_id=ctx.author.id,
-            last_output=f"Session opened by {ctx.author.display_name} at {datetime.now().strftime('%H:%M:%S')}",
+            last_output=f"Session opened by {ctx.author.display_name} at {datetime.now().strftime('%H:%M:%S')}. Login required.",
         )
 
         view = TerminalView(self.bot, ctx, state)

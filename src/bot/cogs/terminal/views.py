@@ -4,6 +4,9 @@ import asyncio
 
 import discord
 
+from src.bot.task_manager import terminal_task_manager
+from src.config.settings import get_terminal_admin_password
+
 from .render import build_terminal_message_payload_async
 from .router import execute_terminal_action
 from .state import TerminalState
@@ -62,6 +65,7 @@ class TerminalView(discord.ui.View):
         self.message: Optional[discord.Message] = None
         self._action_in_progress = False
         self._loading_task: Optional[asyncio.Task] = None
+        self._active_terminal_task_id: Optional[str] = None
 
     async def _redraw(self, interaction: discord.Interaction, defer_first: bool = True) -> None:
         if defer_first and not interaction.response.is_done():
@@ -145,6 +149,75 @@ class TerminalView(discord.ui.View):
         if isinstance(detail, str):
             self.state.progress_detail = detail.strip()
 
+        if self._active_terminal_task_id:
+            await terminal_task_manager.update_progress(
+                self._active_terminal_task_id,
+                stage=self.state.loading_stage,
+                percent=self.state.progress_percent,
+                detail=self.state.progress_detail,
+            )
+
+    async def _run_terminal_action(self, item, user_input: str) -> None:
+        requester_name = getattr(getattr(self.command_ctx, "author", None), "display_name", str(self.state.requester_id))
+        action_task = asyncio.create_task(
+            execute_terminal_action(
+                self.bot,
+                self.command_ctx,
+                item.action,
+                user_input,
+                access_level=(self.state.access_level or ""),
+                progress_callback=self._handle_progress_update,
+            )
+        )
+        task_id = await terminal_task_manager.register_task(
+            action_label=item.label,
+            requester_id=self.state.requester_id,
+            requester_name=str(requester_name),
+            task=action_task,
+        )
+        self._active_terminal_task_id = task_id
+
+        self.state.last_output = f"[{task_id}] Running {item.label}..."
+        await self._start_loading(item.label, stage="Running command")
+
+        try:
+            result = await action_task
+            await terminal_task_manager.mark_completed(task_id)
+            self.state.last_output = f"[{task_id}] {result}"
+        except asyncio.CancelledError:
+            await terminal_task_manager.mark_cancelled(task_id)
+            self.state.last_output = f"[{task_id}] {item.label} was cancelled."
+        except Exception as exc:
+            await terminal_task_manager.mark_failed(task_id, str(exc))
+            self.state.last_error = str(exc)
+            self.state.last_output = f"[{task_id}] Action failed"
+        finally:
+            await self._stop_loading()
+            if self._active_terminal_task_id == task_id:
+                self._active_terminal_task_id = None
+
+    def _format_running_tasks_output(self, tasks) -> str:
+        if not tasks:
+            return "No terminal commands are currently in progress."
+
+        lines = [
+            "IN-PROGRESS TERMINAL COMMANDS",
+            "",
+        ]
+
+        for task in tasks:
+            owner = f"{task.requester_name} ({task.requester_id})"
+            stage = task.stage or task.status
+            pct = ""
+            if task.progress_percent is not None:
+                pct = f" {task.progress_percent:.1f}%"
+
+            lines.append(
+                f"[{task.task_id}] {task.action_label} | by {owner} | {task.status.upper()} | {stage}{pct} | {task.elapsed_seconds}s"
+            )
+
+        return "\n".join(lines)
+
     async def on_timeout(self):
         if not self.message:
             return
@@ -202,6 +275,41 @@ class TerminalView(discord.ui.View):
                 await self._redraw(interaction)
                 return
 
+            if item.action == "auth_user":
+                self.state.set_access_level("user")
+                self.state.last_output = "User terminal access granted."
+                await self._redraw(interaction)
+                return
+
+            if item.action == "auth_admin":
+                modal = TerminalInputModal(title="ADMIN LOGIN", label=item.input_hint or "Admin password")
+                await interaction.response.send_modal(modal)
+                await modal.wait()
+                password = (modal.submitted_value or "").strip()
+                admin_password = get_terminal_admin_password()
+
+                if not admin_password:
+                    self.state.login_error = "Admin login unavailable: TERMINAL_ADMIN_PASSWORD is not set."
+                    await self._redraw_message()
+                    return
+
+                if password == admin_password:
+                    self.state.set_access_level("admin")
+                    self.state.last_output = "Admin terminal access granted."
+                    await self._redraw_message()
+                    return
+
+                self.state.login_error = "Invalid admin password."
+                self.state.last_error = ""
+                self.state.last_output = "Admin login failed."
+                await self._redraw_message()
+                return
+
+            if not self.state.is_authenticated:
+                self.state.last_error = "Login required before running commands."
+                await self._redraw(interaction)
+                return
+
             user_input = ""
             if item.requires_input:
                 modal = TerminalInputModal(title="TERMINAL INPUT", label=item.input_hint or "Input")
@@ -213,47 +321,14 @@ class TerminalView(discord.ui.View):
                     await self._redraw_message()
                     return
 
-                self.state.last_output = f"Running {item.label}..."
-                await self._start_loading(item.label, stage="Running command")
-
-                try:
-                    result = await execute_terminal_action(
-                        self.bot,
-                        self.command_ctx,
-                        item.action,
-                        user_input,
-                        progress_callback=self._handle_progress_update,
-                    )
-                    self.state.last_output = result
-                except Exception as exc:
-                    self.state.last_error = str(exc)
-                    self.state.last_output = "Action failed"
-                finally:
-                    await self._stop_loading()
-
+                await self._run_terminal_action(item, user_input)
                 await self._redraw_message()
                 return
 
-            self.state.last_output = f"Running {item.label}..."
+            self.state.last_output = f"Preparing {item.label}..."
             await self._redraw(interaction)
 
-            await self._start_loading(item.label, stage="Running command")
-
-            try:
-                result = await execute_terminal_action(
-                    self.bot,
-                    self.command_ctx,
-                    item.action,
-                    user_input,
-                    progress_callback=self._handle_progress_update,
-                )
-                self.state.last_output = result
-            except Exception as exc:
-                self.state.last_error = str(exc)
-                self.state.last_output = "Action failed"
-            finally:
-                await self._stop_loading()
-
+            await self._run_terminal_action(item, user_input)
             await self._redraw_message()
         finally:
             self._end_action()
@@ -300,3 +375,78 @@ class TerminalView(discord.ui.View):
             file=file,
             ephemeral=False,
         )
+
+    @discord.ui.button(label="View Tasks", style=discord.ButtonStyle.primary, row=1)
+    async def view_tasks(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._authorized(interaction):
+            await interaction.response.send_message("Only the requester can use this terminal.", ephemeral=True)
+            return
+
+        if not self.state.is_authenticated:
+            await interaction.response.send_message("Login first to view tasks.", ephemeral=True)
+            return
+
+        tasks = await terminal_task_manager.list_running_tasks(
+            requester_id=self.state.requester_id,
+            is_admin=self.state.is_admin,
+        )
+        self.state.last_output = self._format_running_tasks_output(tasks)
+        self.state.last_error = ""
+        await self._redraw(interaction)
+
+    @discord.ui.button(label="Stop Task", style=discord.ButtonStyle.secondary, row=1)
+    async def stop_task(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._authorized(interaction):
+            await interaction.response.send_message("Only the requester can use this terminal.", ephemeral=True)
+            return
+
+        if not self.state.is_authenticated:
+            await interaction.response.send_message("Login first to stop tasks.", ephemeral=True)
+            return
+
+        modal = TerminalInputModal(title="STOP TASK", label="Task ID")
+        await interaction.response.send_modal(modal)
+        await modal.wait()
+
+        task_id = (modal.submitted_value or "").strip()
+        success, message = await terminal_task_manager.cancel_task(
+            task_id=task_id,
+            requester_id=self.state.requester_id,
+            is_admin=self.state.is_admin,
+        )
+
+        self.state.last_output = message
+        self.state.last_error = "" if success else message
+        await self._redraw_message()
+
+    @discord.ui.button(label="Stop All", style=discord.ButtonStyle.danger, row=1)
+    async def stop_all_tasks(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._authorized(interaction):
+            await interaction.response.send_message("Only the requester can use this terminal.", ephemeral=True)
+            return
+
+        if not self.state.is_authenticated:
+            await interaction.response.send_message("Login first to stop tasks.", ephemeral=True)
+            return
+
+        _count, message = await terminal_task_manager.cancel_all(
+            requester_id=self.state.requester_id,
+            is_admin=self.state.is_admin,
+        )
+        self.state.last_output = message
+        self.state.last_error = ""
+        await self._redraw(interaction)
+
+    @discord.ui.button(label="Logout", style=discord.ButtonStyle.secondary, row=1)
+    async def logout(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._authorized(interaction):
+            await interaction.response.send_message("Only the requester can use this terminal.", ephemeral=True)
+            return
+
+        if not self.state.is_authenticated:
+            await interaction.response.send_message("Already at login screen.", ephemeral=True)
+            return
+
+        self.state.logout()
+        self.state.last_output = "Logged out. Select a terminal mode to continue."
+        await self._redraw(interaction)

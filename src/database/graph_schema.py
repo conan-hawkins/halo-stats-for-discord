@@ -335,6 +335,33 @@ class HaloSocialGraphDB:
         except Exception as e:
             print(f"Error inserting player {xuid}: {e}")
             return False
+
+    def insert_or_update_players_stub_batch(self, xuids: List[str]) -> int:
+        """Insert or refresh lightweight player rows for FK-safe edge writes."""
+        normalized = sorted({str(xuid).strip() for xuid in xuids if str(xuid).strip()})
+        if not normalized:
+            return 0
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+
+        try:
+            cursor.executemany(
+                """
+                INSERT INTO graph_players (xuid, first_seen, last_seen)
+                VALUES (?, ?, ?)
+                ON CONFLICT(xuid) DO UPDATE SET
+                    last_seen = excluded.last_seen
+                """,
+                [(xuid, now, now) for xuid in normalized],
+            )
+            conn.commit()
+            return len(normalized)
+        except Exception as e:
+            print(f"Error batch inserting stub players: {e}")
+            conn.rollback()
+            return 0
     
     def get_player(self, xuid: str) -> Optional[Dict]:
         """Get a player by XUID"""
@@ -1007,10 +1034,18 @@ class HaloSocialGraphDB:
         is_partial: bool = False,
         coverage_ratio: float = 1.0,
         is_halo_active_pair: bool = False,
+        suppress_errors: bool = False,
     ) -> bool:
         """Insert or overwrite a co-play edge with absolute values."""
         conn = self._get_connection()
         cursor = conn.cursor()
+
+        src_xuid = str(src_xuid or "").strip()
+        dst_xuid = str(dst_xuid or "").strip()
+        if not src_xuid or not dst_xuid:
+            if not suppress_errors:
+                print("Error upserting coplay edge: empty src_xuid or dst_xuid")
+            return False
 
         try:
             cursor.execute("""
@@ -1051,7 +1086,8 @@ class HaloSocialGraphDB:
             conn.commit()
             return True
         except Exception as e:
-            print(f"Error upserting coplay edge {src_xuid}->{dst_xuid}: {e}")
+            if not suppress_errors:
+                print(f"Error upserting coplay edge {src_xuid}->{dst_xuid}: {e}")
             return False
     
     # =========================================================================

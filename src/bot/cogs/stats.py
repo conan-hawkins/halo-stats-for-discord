@@ -5,7 +5,6 @@ Contains all player statistics related commands:
 - #full - Get complete stats from player's entire match history
 - #ranked - Get stats from ranked matches only
 - #casual - Get stats from casual/social matches only
-- #populate - Resolve and cache gamertags from recent matches
 - #cachestatus - Check background caching progress
 - #xboxfriends - Get Xbox friends and friends-of-friends network
 """
@@ -18,7 +17,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from src.api import get_players_from_recent_matches, api_client
+from src.api import api_client
 from src.bot.cache_status import load_cache_status_metrics
 from src.bot.commands import fetch_and_display_stats
 from src.config import CACHE_PROGRESS_FILE, PROJECT_ROOT, XUID_CACHE_FILE
@@ -69,8 +68,7 @@ class StatsCog(commands.Cog, name="Stats"):
             value=(
                 "`#full <gamertag>`: Full lifetime stats from all available matches.\n"
                 "`#ranked <gamertag>`: Ranked-only performance summary.\n"
-                "`#casual <gamertag>`: Social/casual playlist performance summary.\n"
-                "`#populate <gamertag>`: Resolves players from match history and updates XUID cache."
+                "`#casual <gamertag>`: Social/casual playlist performance summary."
             ),
             inline=False
         )
@@ -80,7 +78,7 @@ class StatsCog(commands.Cog, name="Stats"):
             value=(
                 "`#xboxfriends <gamertag>`: Live Xbox friends + friends-of-friends scan with blacklist checks.\n"
                 "`#network <gamertag>`: Visual friend graph from data stored in graph database.\n"
-                "`#halonet <gamertag>`: Visual co-play graph weighted by shared matches.\n"
+                "`#halonet <gamertag>`: Visual co-play graph weighted by shared matches (auto-refreshes missing seed edges).\n"
                 "`#similar <gamertag>`: Finds players with similar stat profiles from graph DB.\n"
                 "`#hubs [min_friends]`: Lists players with high Halo-active connectivity."
             ),
@@ -92,8 +90,8 @@ class StatsCog(commands.Cog, name="Stats"):
             value=(
                 "`#cachestatus`: Shows progress of background caching jobs.\n"
                 "`#graphstats`: Shows social graph database totals and health.\n"
-                "`#crawlfriends <gamertag> [depth]` / `#crawlstop`: Crawl Halo-active friends and update graph DB (admin only).\n"
-                "`#crawlgames <gamertag> [depth]`: Builds co-play edge weights from shared match history in the crawled scope (admin only)."
+                "`#crawlfriends <gamertag> [depth]` / `#crawlstop`: Crawl Halo-active friends and update graph DB (admin only, advanced backfill).\n"
+                "`#crawlgames <gamertag> [depth] [--global]`: Builds co-play edge weights from shared match history (default focused scope; --global for full sweep)."
             ),
             inline=False
         )
@@ -102,10 +100,9 @@ class StatsCog(commands.Cog, name="Stats"):
             name="Suggested Workflow",
             value=(
                 "1) Run `#xboxfriends <gamertag>` to discover social edges quickly.\n"
-                "2) Run `#network <gamertag>` to visualize what is already in graph DB.\n"
-                "3) Run `#crawlfriends <gamertag> 2` to enrich Halo-active graph structure.\n"
-                "4) Run `#crawlgames <gamertag> 2` to compute co-play edge strength from cached/shared matches.\n"
-                "5) Run `#halonet <gamertag>` to inspect co-play clusters and strong partners."
+                "2) Run `#halonet <gamertag>` to inspect co-play clusters (the command auto-refreshes missing seed edges).\n"
+                "3) Run `#network <gamertag>` for friend-link context around the same player.\n"
+                "4) If coverage is still sparse, use admin backfill commands: `#crawlfriends` then `#crawlgames`."
             ),
             inline=False
         )
@@ -130,52 +127,6 @@ class StatsCog(commands.Cog, name="Stats"):
         """Get stats from casual/social matches only"""
         gamertag = ''.join(inputs)
         await fetch_and_display_stats(ctx, gamertag, stat_type="social", matches_to_process=None)
-    
-    @commands.command(name='populate', help='Resolve and cache players from recent match history. Usage: #populate <gamertag>')
-    async def populate_cache(self, ctx: commands.Context, *inputs):
-        """Resolve gamertags to XUIDs and populate the XUID cache"""
-        if not inputs:
-            await ctx.send("Please provide a gamertag. Example: `#populate GAMERTAG`")
-            return
-        
-        gamertag = ' '.join(inputs)
-        
-        loading_embed = discord.Embed(
-            title="Resolving Gamertags...",
-            description=f"Finding and caching all players from **{gamertag}**'s match history",
-            colour=0xFFA500,
-            timestamp=datetime.now()
-        )
-        loading_message = await ctx.send(embed=loading_embed)
-
-        async def safe_update_message(embed: discord.Embed):
-            """Update loading message, falling back to a fresh message if edit fails."""
-            try:
-                await loading_message.edit(embed=embed)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                await ctx.send(embed=embed)
-        
-        try:
-            print(f"Getting player list for {gamertag}...")
-            players = await get_players_from_recent_matches(gamertag, num_matches=999999)
-            
-            if not players:
-                await loading_message.edit(content=f"Could not find any players from {gamertag}'s matches.")
-                return
-            
-            final_embed = discord.Embed(
-                title="Gamertag Resolution Complete",
-                description=f"Found and cached **{len(players)}** unique players from {gamertag}'s match history\n\n"
-                           f"All gamertags → XUIDs are now cached for fast lookup!",
-                colour=0x00FF00,
-                timestamp=datetime.now()
-            )
-            final_embed.set_footer(text="Project Goliath")
-            await loading_message.edit(embed=final_embed)
-            
-        except Exception as e:
-            await loading_message.edit(content=f"Error: {e}")
-            print(f"Error in populate_cache: {e}")
     
     @commands.command(name='cachestatus', help='Show progress and estimates for background player caching.')
     async def cache_status(self, ctx: commands.Context):

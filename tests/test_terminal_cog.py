@@ -8,8 +8,14 @@ from src.bot.cogs.terminal.router import execute_terminal_action, parse_crawl_in
 from src.bot.cogs.terminal.state import TerminalState
 
 
-def test_terminal_state_navigation_wraps_in_menu():
+def _admin_state() -> TerminalState:
     state = TerminalState(requester_id=1)
+    state.set_access_level("admin")
+    return state
+
+
+def test_terminal_state_navigation_wraps_in_menu():
+    state = _admin_state()
 
     assert state.menu_key == "root"
     assert state.current_item().label == "DATABASE STATUS"
@@ -22,7 +28,7 @@ def test_terminal_state_navigation_wraps_in_menu():
 
 
 def test_terminal_state_submenu_and_back():
-    state = TerminalState(requester_id=1)
+    state = _admin_state()
 
     state.enter_submenu("stats")
     assert state.menu_key == "stats"
@@ -37,7 +43,7 @@ def test_terminal_state_submenu_and_back():
 
 
 def test_terminal_stats_menu_excludes_server_leaderboard():
-    state = TerminalState(requester_id=1)
+    state = _admin_state()
     state.enter_submenu("stats")
 
     labels = [item.label for item in state.current_menu()]
@@ -45,7 +51,7 @@ def test_terminal_stats_menu_excludes_server_leaderboard():
 
 
 def test_terminal_crawl_menu_includes_new_crawl_actions():
-    state = TerminalState(requester_id=1)
+    state = _admin_state()
     state.enter_submenu("crawl")
 
     labels = [item.label for item in state.current_menu()]
@@ -54,8 +60,28 @@ def test_terminal_crawl_menu_includes_new_crawl_actions():
     assert "START CRAWL" not in labels
 
 
+def test_terminal_root_menu_includes_iss():
+    state = _admin_state()
+
+    labels = [item.label for item in state.current_menu()]
+    assert "ISS" in labels
+
+
+def test_terminal_iss_menu_includes_all_levels():
+    state = _admin_state()
+    state.enter_submenu("iss")
+
+    labels = [item.label for item in state.current_menu()]
+    assert labels == [
+        "ISS LEVEL 0",
+        "ISS LEVEL 1",
+        "ISS LEVEL 2",
+        "ISS LEVEL 3",
+    ]
+
+
 def test_terminal_social_menu_includes_halonet():
-    state = TerminalState(requester_id=1)
+    state = _admin_state()
     state.enter_submenu("social")
 
     labels = [item.label for item in state.current_menu()]
@@ -81,7 +107,7 @@ def test_parse_crawl_input_without_depth():
 
 
 def test_terminal_state_loading_lifecycle():
-    state = TerminalState(requester_id=1)
+    state = _admin_state()
     state.begin_loading("FULL STATS", "Running command")
 
     assert state.is_loading is True
@@ -102,7 +128,7 @@ def test_terminal_state_loading_lifecycle():
 
 
 def test_terminal_render_includes_loading_block_when_active():
-    state = TerminalState(requester_id=1)
+    state = _admin_state()
     state.begin_loading("NETWORK", "Running command")
     state.bump_loading_tick()
     state.last_output = "Running NETWORK..."
@@ -124,12 +150,62 @@ class _FakePerms:
     administrator = True
 
 
+class _FakePermsNonAdmin:
+    administrator = False
+
+
 class _FakeAuthor:
     guild_permissions = _FakePerms()
+    display_name = "Admin Tester"
+
+
+class _FakeAuthorNonAdmin:
+    guild_permissions = _FakePermsNonAdmin()
+    display_name = "User Tester"
+
+
+def test_terminal_starts_locked_on_login_menu():
+    state = TerminalState(requester_id=1)
+
+    assert state.is_authenticated is False
+    assert state.menu_key == "login"
+    labels = [item.label for item in state.current_menu()]
+    assert labels == ["ENTER USER TERMINAL", "ENTER ADMIN TERMINAL"]
+
+
+def test_terminal_user_mode_root_shows_only_stats_and_iss():
+    state = TerminalState(requester_id=1)
+    state.set_access_level("user")
+
+    labels = [item.label for item in state.current_menu()]
+    assert labels == ["STATS", "ISS"]
+
+
+def test_terminal_user_mode_hides_iss_levels_2_and_3():
+    state = TerminalState(requester_id=1)
+    state.set_access_level("user")
+    state.enter_submenu("iss")
+
+    labels = [item.label for item in state.current_menu()]
+    assert labels == ["ISS LEVEL 0", "ISS LEVEL 1"]
+
+
+def test_terminal_render_shows_login_screen_when_locked():
+    state = TerminalState(requester_id=1)
+
+    text = terminal_render._build_lines(state)
+    assert "ACCESS: LOCKED" in text
+    assert "LOGIN:" in text
+    assert "ENTER USER TERMINAL" in text
+    assert "ENTER ADMIN TERMINAL" in text
 
 
 class _FakeCtx:
     author = _FakeAuthor()
+
+
+class _FakeCtxNonAdmin:
+    author = _FakeAuthorNonAdmin()
 
 
 class _FakeGraphCog:
@@ -144,6 +220,22 @@ class _FakeGraphCog:
 
     async def start_crawl_games(self, ctx, *args, **kwargs):
         self.calls.append(("crawlgames", args, kwargs))
+
+    async def iss_level0(self, ctx, *args, **kwargs):
+        self.calls.append(("iss_level0", args, kwargs))
+        return "ISS level 0 done"
+
+    async def iss_level1(self, ctx, *args, **kwargs):
+        self.calls.append(("iss_level1", args, kwargs))
+        return "ISS level 1 done"
+
+    async def iss_level2(self, ctx, *args, **kwargs):
+        self.calls.append(("iss_level2", args, kwargs))
+        return "ISS level 2 done"
+
+    async def iss_level3(self, ctx, *args, **kwargs):
+        self.calls.append(("iss_level3", args, kwargs))
+        return "ISS level 3 done"
 
 
 class _FakeBotWithGraph:
@@ -208,6 +300,22 @@ async def test_terminal_status_cache_missing_progress_removes_unique_player_line
 
 
 @pytest.mark.asyncio
+async def test_terminal_router_blocks_user_mode_for_non_stats_and_non_iss_actions():
+    output = await execute_terminal_action(_FakeBot(), _FakeCtx(), "status_cache", access_level="user")
+    assert output == "Action not available in user terminal mode."
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_allows_user_mode_for_iss_level0():
+    graph_cog = _FakeGraphCog()
+    bot = _FakeBotWithGraph(graph_cog)
+
+    output = await execute_terminal_action(bot, _FakeCtx(), "cmd_iss_level0", "Chief117", access_level="user")
+
+    assert output == "ISS level 0 done"
+
+
+@pytest.mark.asyncio
 async def test_terminal_router_dispatches_crawlfriends_and_crawlgames():
     graph_cog = _FakeGraphCog()
     bot = _FakeBotWithGraph(graph_cog)
@@ -239,3 +347,54 @@ async def test_terminal_router_dispatches_halonet():
 
     assert output == "Executed #halonet for Chief117"
     assert graph_cog.calls[0] == ("halonet", ("Chief117",), {})
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_dispatches_iss_levels():
+    graph_cog = _FakeGraphCog()
+    bot = _FakeBotWithGraph(graph_cog)
+    ctx = _FakeCtx()
+
+    out0 = await execute_terminal_action(bot, ctx, "cmd_iss_level0", "Chief117")
+    out1 = await execute_terminal_action(bot, ctx, "cmd_iss_level1", "Chief117")
+    out2 = await execute_terminal_action(bot, ctx, "cmd_iss_level2", "Chief117")
+    out3 = await execute_terminal_action(bot, ctx, "cmd_iss_level3", "Chief117")
+
+    assert out0 == "ISS level 0 done"
+    assert out1 == "ISS level 1 done"
+    assert out2 == "ISS level 2 done"
+    assert out3 == "ISS level 3 done"
+    assert graph_cog.calls[0] == (
+        "iss_level0",
+        ("Chief117",),
+        {"progress_callback": None, "run_inline": False},
+    )
+    assert graph_cog.calls[1] == (
+        "iss_level1",
+        ("Chief117",),
+        {"progress_callback": None, "run_inline": False},
+    )
+    assert graph_cog.calls[2] == (
+        "iss_level2",
+        ("Chief117",),
+        {"progress_callback": None, "run_inline": False},
+    )
+    assert graph_cog.calls[3] == (
+        "iss_level3",
+        ("Chief117",),
+        {"progress_callback": None, "run_inline": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_rejects_iss_levels_2_and_3_for_non_admin():
+    graph_cog = _FakeGraphCog()
+    bot = _FakeBotWithGraph(graph_cog)
+    ctx = _FakeCtxNonAdmin()
+
+    out2 = await execute_terminal_action(bot, ctx, "cmd_iss_level2", "Chief117")
+    out3 = await execute_terminal_action(bot, ctx, "cmd_iss_level3", "Chief117")
+
+    assert out2 == "Admin permission required for ISS level 2"
+    assert out3 == "Admin permission required for ISS level 3"
+    assert all(call[0] not in {"iss_level2", "iss_level3"} for call in graph_cog.calls)

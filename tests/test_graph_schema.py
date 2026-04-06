@@ -15,6 +15,36 @@ def test_insert_and_get_player(tmp_path):
     db.close()
 
 
+def test_insert_or_update_players_stub_batch_creates_stub_rows(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+
+    inserted = db.insert_or_update_players_stub_batch(["x1", "x2", "x1", "", "   "])
+
+    assert inserted == 2
+    assert db.get_player("x1") is not None
+    assert db.get_player("x2") is not None
+
+    db.close()
+
+
+def test_upsert_coplay_edge_rejects_empty_xuid(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+
+    # Existing destination row is intentionally present; empty source should still fail fast.
+    db.insert_or_update_player("x2", gamertag="Beta")
+
+    ok = db.upsert_coplay_edge(
+        src_xuid="",
+        dst_xuid="x2",
+        matches_together=1,
+        suppress_errors=True,
+    )
+
+    assert ok is False
+
+    db.close()
+
+
 def test_friend_edges_and_counts(tmp_path):
     db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
     db.insert_or_update_player("x1", gamertag="Alpha")

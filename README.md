@@ -123,7 +123,6 @@ Running `pytest` generates:
 |---------|-------------|
 | `#stats <gamertag>` | Get player stats (cached) |
 | `#full <gamertag>` | Get stats from ALL match history |
-| `#populate <gamertag>` | Cache gamertags from recent matches |
 
 ### Graph Commands (Admin)
 | Command | Description |

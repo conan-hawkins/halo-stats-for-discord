@@ -14,10 +14,12 @@ SCANLINE_STEP = 3
 SCANLINE_ALPHA = 44
 GLOW_STRENGTH_OFFSETS = [(-1, 0), (1, 0), (0, -1), (0, 1), (-2, 0), (2, 0)]
 SCREEN_LABELS = {
+    "login": "LOGIN",
     "root": "MAIN MENU",
     "status": "DATABASE STATUS",
     "stats": "STATS",
     "social": "SOCIAL",
+    "iss": "ISS",
     "crawl": "CRAWL",
 }
 LOADING_FRAMES = ["[=     ]", "[==    ]", "[===   ]", "[ ===  ]", "[  === ]", "[   ===]", "[    ==]", "[     =]"]
@@ -25,12 +27,32 @@ LOADING_FRAMES = ["[=     ]", "[==    ]", "[===   ]", "[ ===  ]", "[  === ]", "[
 
 def _build_lines(state: TerminalState) -> str:
     menu = state.current_menu()
-    screen_name = SCREEN_LABELS.get(state.menu_key, state.menu_key.upper())
+    active_screen_key = state.menu_key if state.is_authenticated else "login"
+    screen_name = SCREEN_LABELS.get(active_screen_key, active_screen_key.upper())
     lines = []
     lines.append("PROJECT GOLIATH // ISS TERMINAL")
     lines.append(f"TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if state.is_authenticated:
+        lines.append(f"ACCESS: {state.access_level.upper()}")
+    else:
+        lines.append("ACCESS: LOCKED")
     lines.append(f"SCREEN: {screen_name}")
     lines.append("")
+
+    if not state.is_authenticated:
+        lines.append("LOGIN:")
+        lines.append("Select a terminal access level:")
+        lines.append("")
+        for index, item in enumerate(menu):
+            marker = ">" if index == state.selected_index else " "
+            lines.append(f"{marker} {item.label}")
+        if state.login_error:
+            lines.append("")
+            lines.append("ERROR:")
+            lines.append(state.login_error[-300:])
+
+        return "\n".join(lines)
+
     lines.append("MENU:")
 
     for index, item in enumerate(menu):

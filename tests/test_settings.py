@@ -24,3 +24,15 @@ def test_ensure_data_directories_creates_expected_paths(tmp_path, monkeypatch):
 
     assert data_dir.exists()
     assert token_dir.exists()
+
+
+def test_get_terminal_admin_password_reads_current_env(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ADMIN_PASSWORD", "  test-pass  ")
+
+    assert settings.get_terminal_admin_password() == "test-pass"
+
+
+def test_get_terminal_admin_password_empty_when_unset(monkeypatch):
+    monkeypatch.delenv("TERMINAL_ADMIN_PASSWORD", raising=False)
+
+    assert settings.get_terminal_admin_password() == ""
