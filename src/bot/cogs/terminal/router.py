@@ -2,6 +2,7 @@ import os
 from typing import Callable, Optional, Tuple
 
 from src.bot.cache_status import load_cache_status_metrics
+from src.bot.stats_profiles import get_stats_profile_for_terminal_action
 from src.config import CACHE_PROGRESS_FILE, PROJECT_ROOT, XUID_CACHE_FILE
 from src.database.graph_schema import get_graph_db
 
@@ -48,6 +49,8 @@ async def execute_terminal_action(
 
     stats_cog = bot.get_cog("Stats")
     graph_cog = bot.get_cog("Graph")
+    network_cog = bot.get_cog("Network")
+    halonet_cog = bot.get_cog("HaloNet")
 
     if action == "status_graph":
         db = get_graph_db()
@@ -103,23 +106,34 @@ async def execute_terminal_action(
     if not stats_cog and action.startswith("cmd_"):
         return "Stats cog unavailable"
 
-    if action == "cmd_full":
-        await stats_cog.full(command_ctx, user_input)
-        return f"Executed #full for {user_input}"
+    stats_profile = get_stats_profile_for_terminal_action(action)
+    if stats_profile:
+        runner = getattr(stats_cog, "run_stats_profile", None)
+        if callable(runner):
+            await runner(command_ctx, stats_profile, user_input)
+        else:
+            fallback_handler = getattr(stats_cog, stats_profile.command_name, None)
+            if not callable(fallback_handler):
+                return "Stats cog unavailable"
+            await fallback_handler(command_ctx, user_input)
 
-    if action == "cmd_ranked":
-        await stats_cog.ranked(command_ctx, user_input)
-        return f"Executed #ranked for {user_input}"
-
-    if action == "cmd_casual":
-        await stats_cog.casual(command_ctx, user_input)
-        return f"Executed #casual for {user_input}"
+        return f"Executed #{stats_profile.command_name} for {user_input}"
 
     if action == "cmd_xboxfriends":
         await stats_cog.friends_list(command_ctx, user_input)
         return f"Executed #xboxfriends for {user_input}"
 
-    if not graph_cog and action.startswith("cmd_"):
+    graph_required_actions = {
+        "cmd_iss_level0",
+        "cmd_iss_level1",
+        "cmd_iss_level2",
+        "cmd_iss_level3",
+        "cmd_hubs",
+        "cmd_crawlfriends",
+        "cmd_crawlgames",
+        "cmd_crawlstop",
+    }
+    if action in graph_required_actions and not graph_cog:
         return "Graph cog unavailable"
 
     if action == "cmd_iss_level0":
@@ -163,16 +177,18 @@ async def execute_terminal_action(
         return result or f"Executed ISS level 3 for {user_input}"
 
     if action == "cmd_network":
-        await graph_cog.show_network(command_ctx, user_input)
+        target_cog = network_cog
+        if not target_cog or not hasattr(target_cog, "show_network"):
+            return "Network cog unavailable"
+        await target_cog.show_network(command_ctx, user_input)
         return f"Executed #network for {user_input}"
 
     if action == "cmd_halonet":
-        await graph_cog.show_halonet(command_ctx, user_input)
+        target_cog = halonet_cog
+        if not target_cog or not hasattr(target_cog, "show_halonet"):
+            return "HaloNet cog unavailable"
+        await target_cog.show_halonet(command_ctx, user_input)
         return f"Executed #halonet for {user_input}"
-
-    if action == "cmd_similar":
-        await graph_cog.find_similar(command_ctx, user_input)
-        return f"Executed #similar for {user_input}"
 
     if action == "cmd_hubs":
         value = (user_input or "").strip()

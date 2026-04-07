@@ -1,8 +1,13 @@
 """
-XUID Cache Management for Halo Infinite API
+XUID Cache Management for Halo Infinite API.
 
-Provides persistent caching of XUID to Gamertag mappings to minimize
-API calls for gamertag resolution.
+Provides persistent caching of XUID to gamertag mappings to minimize API
+calls for gamertag resolution.
+
+Matching policy:
+- Lookup comparisons can normalize whitespace and case for tolerant matching.
+- Stored cache values remain the canonical display gamertag value returned by
+    Xbox APIs to avoid duplicate stripped/non-stripped entries per XUID.
 """
 
 import traceback
@@ -15,6 +20,21 @@ from src.config import XUID_CACHE_FILE
 
 
 XUID_HISTORY_FILE = Path(XUID_CACHE_FILE).with_name("xuid_gamertag_history.json")
+
+
+def _normalize_gamertag_for_lookup(gamertag: Any) -> str:
+    """Normalize gamertag text for strict cache comparisons."""
+    if not isinstance(gamertag, str):
+        return ""
+
+    # Collapse repeated whitespace and compare case-insensitively.
+    return " ".join(gamertag.split()).casefold()
+
+
+def _normalize_gamertag_alias_key(gamertag: Any) -> str:
+    """Normalize gamertag text for optional alias matching without spaces."""
+    normalized = _normalize_gamertag_for_lookup(gamertag)
+    return normalized.replace(" ", "")
 
 
 def _normalize_gamertag_value(value: Any) -> Optional[str]:

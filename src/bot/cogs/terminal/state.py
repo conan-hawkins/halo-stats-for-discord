@@ -21,7 +21,7 @@ TERMINAL_MENUS: Dict[str, List[TerminalMenuItem]] = {
     "root": [
         TerminalMenuItem("DATABASE STATUS", submenu="status", description="Open graph and cache database status tools."),
         TerminalMenuItem("STATS", submenu="stats", description="Open full/ranked/casual lookup commands."),
-        TerminalMenuItem("SOCIAL", submenu="social", description="Open live friends lookup, graph visualization, and similarity tools."),
+        TerminalMenuItem("SOCIAL", submenu="social", description="Open live friends lookup and graph visualization tools."),
         TerminalMenuItem("ISS", submenu="iss", description="Run blacklist-aware ISS checks with optional history analysis levels."),
         TerminalMenuItem("CRAWL", submenu="crawl", description="Open background crawl controls for friends expansion and co-play modeling."),
     ],
@@ -38,7 +38,6 @@ TERMINAL_MENUS: Dict[str, List[TerminalMenuItem]] = {
         TerminalMenuItem("XBOX FRIENDS", action="cmd_xboxfriends", requires_input=True, input_hint="Gamertag", description="Show Xbox friends for a player."),
         TerminalMenuItem("NETWORK", action="cmd_network", requires_input=True, input_hint="Gamertag", description="Build and display a player's local network graph."),
         TerminalMenuItem("HALONET", action="cmd_halonet", requires_input=True, input_hint="Gamertag", description="Build and display a player's co-play network graph."),
-        TerminalMenuItem("SIMILAR", action="cmd_similar", requires_input=True, input_hint="Gamertag", description="Find players with similar match-history patterns."),
         TerminalMenuItem("HUBS", action="cmd_hubs", requires_input=True, input_hint="Min friends (optional)", description="Find highly connected hub players in the graph."),
     ],
     "iss": [

@@ -81,22 +81,17 @@ def test_crawl_queue_lifecycle(tmp_path):
     db.close()
 
 
-def test_halo_features_and_knn(tmp_path):
+def test_halo_features_round_trip(tmp_path):
     db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
     db.insert_or_update_player("x1", gamertag="Alpha", halo_active=True)
-    db.insert_or_update_player("x2", gamertag="Beta", halo_active=True)
-    db.insert_or_update_player("x3", gamertag="Gamma", halo_active=True)
 
     db.insert_or_update_halo_features("x1", gamertag="Alpha", csr=1200, kd_ratio=1.4, win_rate=55, matches_played=30)
-    db.insert_or_update_halo_features("x2", gamertag="Beta", csr=1180, kd_ratio=1.35, win_rate=53, matches_played=28)
-    db.insert_or_update_halo_features("x3", gamertag="Gamma", csr=800, kd_ratio=0.9, win_rate=42, matches_played=40)
 
     features = db.get_halo_features("x1")
-    neighbors = db.get_similar_players_knn("x1", k=2)
 
     assert features["csr"] == 1200
-    assert len(neighbors) == 2
-    assert neighbors[0]["xuid"] == "x2"
+    assert features["kd_ratio"] == 1.4
+    assert features["win_rate"] == 55
 
     db.close()
 
@@ -197,7 +192,7 @@ def test_get_coplay_edges_within_set_filters_min_matches(tmp_path):
 
 
 def test_coplay_quality_flags_and_coverage_from_backfill_logic(tmp_path, monkeypatch):
-    import one_time_backfill_graph_coplay as backfill_module
+    from src.database import coplay_backfill as backfill_module
     from src.database.schema import HaloStatsDBv2
 
     graph_db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
@@ -317,7 +312,7 @@ def test_coplay_quality_flags_and_coverage_from_backfill_logic(tmp_path, monkeyp
 
 
 def test_coplay_backfill_rerun_idempotency(tmp_path, monkeypatch):
-    import one_time_backfill_graph_coplay as backfill_module
+    from src.database import coplay_backfill as backfill_module
     from src.database.schema import HaloStatsDBv2
 
     graph_db = HaloSocialGraphDB(str(tmp_path / "graph.db"))

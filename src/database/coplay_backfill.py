@@ -1,21 +1,12 @@
-#!/usr/bin/env python3
 """
-Backfill graph_coplay from existing normalized match participant data.
+Utilities for backfilling graph_coplay edges from normalized match participant data.
 
-This utility builds co-play edges from stats DB tables (matches + match_participants)
-and writes deterministic edges into graph DB's graph_coplay table.
-
-Default mode is dry-run. Use --run to write rows.
-
-Examples:
-    python one_time_backfill_graph_coplay.py --dry-run
-    python one_time_backfill_graph_coplay.py --run --limit-matches 5000 --batch-size 200
-    python one_time_backfill_graph_coplay.py --run --seed-gamertag "Player Name" --depth 2
+This module intentionally keeps the one-time script logic in maintained source code
+so tests and future tooling can reuse the behavior without depending on ad-hoc files.
 """
 
 from __future__ import annotations
 
-import argparse
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
@@ -335,58 +326,4 @@ def run_backfill(
     return result
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Backfill graph_coplay from match participants.")
-    parser.add_argument("--dry-run", action="store_true", help="Preview work without writing (default if --run is not set)")
-    parser.add_argument("--run", action="store_true", help="Execute writes to graph_coplay")
-    parser.add_argument("--limit-matches", type=int, default=None, help="Limit number of scoped matches analyzed")
-    parser.add_argument("--batch-size", type=int, default=200, help="Progress log interval in pair count")
-    parser.add_argument("--seed-xuid", type=str, default=None, help="Optional seed XUID for scoped traversal")
-    parser.add_argument("--seed-gamertag", type=str, default=None, help="Optional seed gamertag for scoped traversal")
-    parser.add_argument("--depth", type=int, default=2, help="Traversal depth when seed scope is used")
-    parser.add_argument("--reset-target", action="store_true", help="Delete existing participants-source rows before writing")
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    dry_run = not args.run or args.dry_run
-
-    print("=" * 70)
-    print("Graph Co-play Backfill")
-    print("Source: matches + match_participants")
-    print(f"Mode: {'DRY-RUN' if dry_run else 'WRITE'}")
-    print("=" * 70)
-
-    try:
-        result = run_backfill(
-            dry_run=dry_run,
-            batch_size=max(1, int(args.batch_size or 1)),
-            limit_matches=args.limit_matches,
-            seed_xuid=args.seed_xuid,
-            seed_gamertag=args.seed_gamertag,
-            depth=max(0, int(args.depth or 0)),
-            reset_target=bool(args.reset_target),
-        )
-    except Exception as exc:
-        print(f"[BACKFILL] Failed: {exc}")
-        return 1
-
-    print("\nSummary")
-    print(f"- Scope players: {result.scope_players}")
-    print(f"- Matches considered: {result.matches_considered}")
-    print(f"- Unique pairs built: {result.pairs_built}")
-    print(f"- Inferred pairs: {result.inferred_pairs}")
-    print(f"- Partial pairs: {result.partial_pairs}")
-    print(f"- Rows written: {result.rows_written}")
-
-    if dry_run:
-        print("\nDry-run complete. Re-run with --run to apply changes.")
-    else:
-        print("\nWrite complete.")
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = ["PairStats", "BackfillResult", "run_backfill"]

@@ -8,11 +8,13 @@ from datetime import datetime, timedelta, timezone
 from src.bot.cogs.graph import (
     CrawlProgressView,
     GraphCog,
-    HaloNetFilterView,
-    HaloNetRefreshView,
-    NetworkFilterView,
-    NetworkRefreshView,
 )
+from src.bot.cogs.graph_commands.display.halonet.ui import HaloNetFilterView, HaloNetRefreshView
+from src.bot.cogs.graph_commands.display.network.ui import NetworkFilterView, NetworkRefreshView
+from src.bot.cogs.graph_commands.display.halonet.cog import HaloNetCog
+from src.bot.cogs import graph as graph_module
+from src.bot.cogs.graph_commands.display.halonet import cog as halonet_module
+from src.bot.cogs.graph_commands.display.network import cog as network_module
 from src.bot.cogs import stats as stats_module
 from src.bot.cogs.stats import StatsCog
 
@@ -38,6 +40,32 @@ class _FakeMessage:
 
     async def delete(self):
         return None
+
+
+class _TrackingMessage(_FakeMessage):
+    def __init__(self):
+        super().__init__()
+        self.edits = []
+
+    async def edit(self, *args, **kwargs):
+        payload = {"args": args, "kwargs": kwargs}
+        self.edits.append(payload)
+        self.last_edit = payload
+        return None
+
+
+class _FriendsCtx(_FakeCtx):
+    def __init__(self, loading_message=None):
+        super().__init__()
+        self.loading_message = loading_message or _TrackingMessage()
+        self._send_count = 0
+
+    async def send(self, *args, **kwargs):
+        self.sent.append((args, kwargs))
+        self._send_count += 1
+        if self._send_count == 1:
+            return self.loading_message
+        return _TrackingMessage()
 
 
 class _FakeUser:
@@ -82,26 +110,13 @@ async def test_stats_cog_full_ranked_casual_dispatch(monkeypatch):
     await StatsCog.ranked.callback(cog, ctx, "A", "B")
     await StatsCog.casual.callback(cog, ctx, "A", "B")
 
-    assert calls[0] == ("AB", "stats", None)
-    assert calls[1] == ("AB", "ranked", None)
-    assert calls[2] == ("AB", "social", None)
+    assert calls[0] == ("A B", "stats", None)
+    assert calls[1] == ("A B", "ranked", None)
+    assert calls[2] == ("A B", "social", None)
 
 
 def test_stats_cog_excludes_removed_server_command():
     assert not hasattr(StatsCog, "server_stats")
-
-
-@pytest.mark.asyncio
-async def test_graph_find_similar_requires_input():
-    cog = GraphCog(bot=object())
-    ctx = _FakeCtx()
-
-    await GraphCog.find_similar.callback(cog, ctx)
-
-    assert ctx.sent
-    msg = ctx.sent[0][0][0]
-    assert "Please provide a gamertag" in msg
-    cog.db.close()
 
 
 @pytest.mark.asyncio
@@ -163,6 +178,189 @@ async def test_cache_status_embed_no_progress_file_still_shows_resolved_from_cac
     assert any("No active match scan progress file" in value for value in values)
     assert any("Resolved gamertags: **3**" in value for value in values)
     assert all("Unique players" not in value for value in values)
+
+
+@pytest.mark.asyncio
+async def test_xboxfriends_happy_path_updates_progress_and_final_embed(monkeypatch):
+    progress_stages = []
+
+    async def fake_get_friends_of_friends(gamertag, max_depth=2, progress_callback=None):
+        if progress_callback:
+            await progress_callback(0, 2, "friends_found", 0)
+            progress_stages.append("friends_found")
+            await progress_callback(1, 2, "checking_fof", 1)
+            progress_stages.append("checking_fof")
+
+        return {
+            "target": {"xuid": "target-xuid", "gamertag": gamertag},
+            "friends": [
+                {"xuid": "friend-good", "gamertag": "Good Friend", "is_mutual": True},
+                {"xuid": "friend-bad", "gamertag": "Bad Friend", "is_mutual": False},
+            ],
+            "friends_of_friends": [
+                {
+                    "xuid": "fof-bad",
+                    "gamertag": "FoF Bad",
+                    "via": "Good Friend",
+                    "is_mutual": False,
+                }
+            ],
+            "private_friends": [{"xuid": "private-1", "gamertag": "Private One"}],
+            "error": None,
+        }
+
+    class _FakeGraphDB:
+        def __init__(self):
+            self.players = []
+            self.edge_batches = []
+
+        def insert_or_update_player(self, **kwargs):
+            self.players.append(kwargs)
+            return True
+
+        def insert_friend_edges_batch(self, edges):
+            self.edge_batches.append(list(edges))
+            return len(edges)
+
+    fake_graph_db = _FakeGraphDB()
+
+    monkeypatch.setattr(
+        stats_module,
+        "api_client",
+        SimpleNamespace(get_friends_of_friends=fake_get_friends_of_friends),
+    )
+    monkeypatch.setattr(stats_module, "get_graph_db", lambda: fake_graph_db)
+    monkeypatch.setattr(stats_module.Path, "exists", lambda _self: True)
+    monkeypatch.setattr(
+        stats_module.Path,
+        "read_text",
+        lambda _self, encoding="utf-8-sig": json.dumps(
+            {"friend-bad": "Known Bad", "fof-bad": "Known FoF"}
+        ),
+    )
+
+    cog = StatsCog(bot=object())
+    ctx = _FriendsCtx()
+
+    await StatsCog.friends_list.callback(cog, ctx, "Test", "Player")
+
+    assert progress_stages == ["friends_found", "checking_fof"]
+    assert len(ctx.sent) == 1
+    assert ctx.sent[0][1]["embed"].title == "🔍 Fetching Friends List..."
+
+    edits = ctx.loading_message.edits
+    assert len(edits) >= 3
+
+    first_progress = edits[0]["kwargs"]["embed"]
+    second_progress = edits[1]["kwargs"]["embed"]
+    final_embed = edits[-1]["kwargs"]["embed"]
+
+    assert "Progress: 0/2 friends checked" in (first_progress.description or "")
+    assert "Progress: **1/2** friends checked" in (second_progress.description or "")
+
+    assert final_embed.title == "👥 Friends Network: Test Player"
+    field_names = [field.name for field in final_embed.fields]
+    assert any(name.startswith("📋 Direct Friends") for name in field_names)
+    assert "📊 Summary" in field_names
+    assert any("Known Bad" in (field.value or "") for field in final_embed.fields)
+
+
+@pytest.mark.asyncio
+async def test_xboxfriends_api_error_updates_loading_message_with_error_embed(monkeypatch):
+    async def fake_get_friends_of_friends(_gamertag, max_depth=2, progress_callback=None):
+        return {
+            "friends": [],
+            "friends_of_friends": [],
+            "private_friends": [],
+            "error": "request failed",
+        }
+
+    monkeypatch.setattr(
+        stats_module,
+        "api_client",
+        SimpleNamespace(get_friends_of_friends=fake_get_friends_of_friends),
+    )
+    monkeypatch.setattr(stats_module.Path, "exists", lambda _self: False)
+
+    cog = StatsCog(bot=object())
+    ctx = _FriendsCtx()
+
+    await StatsCog.friends_list.callback(cog, ctx, "Error", "Player")
+
+    assert ctx.loading_message.edits
+    error_embed = ctx.loading_message.edits[-1]["kwargs"]["embed"]
+    assert error_embed.title == "❌ Error"
+    assert error_embed.description == "request failed"
+
+
+@pytest.mark.asyncio
+async def test_xboxfriends_fetch_exception_updates_loading_message_with_error_embed(monkeypatch):
+    async def fake_get_friends_of_friends(_gamertag, max_depth=2, progress_callback=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        stats_module,
+        "api_client",
+        SimpleNamespace(get_friends_of_friends=fake_get_friends_of_friends),
+    )
+    monkeypatch.setattr(stats_module.Path, "exists", lambda _self: False)
+
+    cog = StatsCog(bot=object())
+    ctx = _FriendsCtx()
+
+    await StatsCog.friends_list.callback(cog, ctx, "Error", "Player")
+
+    assert ctx.loading_message.edits
+    error_embed = ctx.loading_message.edits[-1]["kwargs"]["embed"]
+    assert error_embed.title == "❌ Error"
+    assert "An error occurred: network down" in (error_embed.description or "")
+
+
+@pytest.mark.asyncio
+async def test_xboxfriends_empty_input_sends_prompt(monkeypatch):
+    cog = StatsCog(bot=object())
+    ctx = _FriendsCtx()
+
+    await StatsCog.friends_list.callback(cog, ctx)
+
+    assert ctx.sent
+    assert "Please provide a gamertag" in ctx.sent[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_xboxfriends_graph_persistence_failure_still_sends_result_embed(monkeypatch):
+    async def fake_get_friends_of_friends(gamertag, max_depth=2, progress_callback=None):
+        return {
+            "target": {"xuid": "target-xuid", "gamertag": gamertag},
+            "friends": [{"xuid": "friend-1", "gamertag": "Friend One", "is_mutual": True}],
+            "friends_of_friends": [],
+            "private_friends": [],
+            "error": None,
+        }
+
+    class _FailingGraphDB:
+        def insert_or_update_player(self, **kwargs):
+            raise RuntimeError("db unavailable")
+
+        def insert_friend_edges_batch(self, edges):
+            return 0
+
+    monkeypatch.setattr(
+        stats_module,
+        "api_client",
+        SimpleNamespace(get_friends_of_friends=fake_get_friends_of_friends),
+    )
+    monkeypatch.setattr(stats_module, "get_graph_db", lambda: _FailingGraphDB())
+    monkeypatch.setattr(stats_module.Path, "exists", lambda _self: False)
+
+    cog = StatsCog(bot=object())
+    ctx = _FriendsCtx()
+
+    await StatsCog.friends_list.callback(cog, ctx, "Seed", "Player")
+
+    assert ctx.loading_message.edits
+    final_embed = ctx.loading_message.edits[-1]["kwargs"]["embed"]
+    assert final_embed.title == "👥 Friends Network: Seed Player"
 
 
 @pytest.mark.asyncio
@@ -229,6 +427,97 @@ async def test_network_refresh_button_restores_active_controls_preserving_filter
     assert restored_view.min_link_strength == 10.0
     assert restored_view.clustered is True
     assert restored_view.message is interaction.message
+
+
+@pytest.mark.asyncio
+async def test_network_cog_show_network_uses_shared_runtime(monkeypatch):
+    calls = {}
+    fake_db = object()
+
+    async def fake_execute_show_network(cog, ctx, db, inputs):
+        calls["args"] = (cog, ctx, db, inputs)
+
+    monkeypatch.setattr(network_module, "get_graph_db", lambda: fake_db)
+    monkeypatch.setattr(network_module, "execute_show_network", fake_execute_show_network)
+
+    cog = network_module.NetworkCog(bot=object())
+    ctx = _FakeCtx()
+
+    await network_module.NetworkCog.show_network.callback(cog, ctx, "Chief", "117")
+
+    assert "args" in calls
+    assert calls["args"][0] is cog
+    assert calls["args"][2] is fake_db
+    assert calls["args"][3] == ("Chief", "117")
+
+
+@pytest.mark.asyncio
+async def test_graph_show_network_internal_method_uses_shared_runtime(monkeypatch):
+    calls = {}
+    fake_db = object()
+
+    async def fake_execute_show_network(cog, ctx, db, inputs):
+        calls["args"] = (cog, ctx, db, inputs)
+
+    monkeypatch.setattr(graph_module, "get_graph_db", lambda: fake_db)
+    monkeypatch.setattr(graph_module, "execute_show_network", fake_execute_show_network)
+
+    cog = GraphCog(bot=object())
+    ctx = _FakeCtx()
+
+    await cog.show_network(ctx, "Chief117")
+
+    assert "args" in calls
+    assert calls["args"][0] is cog
+    assert calls["args"][2] is fake_db
+    assert calls["args"][3] == ("Chief117",)
+
+
+def test_graph_render_network_graph_uses_shared_renderer(monkeypatch):
+    fake_db = object()
+    calls = {}
+
+    def fake_render_network_graph(
+        db,
+        center_xuid,
+        center_gamertag,
+        halo_friends,
+        center_features,
+        clustered=False,
+        min_group_size=0,
+        min_link_strength=1.0,
+    ):
+        calls["args"] = {
+            "db": db,
+            "center_xuid": center_xuid,
+            "center_gamertag": center_gamertag,
+            "clustered": clustered,
+            "min_group_size": min_group_size,
+            "min_link_strength": min_link_strength,
+        }
+        return BytesIO(b"rendered")
+
+    monkeypatch.setattr(graph_module, "get_graph_db", lambda: fake_db)
+    monkeypatch.setattr(graph_module, "render_network_graph", fake_render_network_graph)
+
+    cog = GraphCog(bot=object())
+    rendered = cog._render_network_graph(
+        "xuid-seed",
+        "Seed",
+        [],
+        None,
+        clustered=True,
+        min_group_size=5,
+        min_link_strength=7.0,
+    )
+
+    assert rendered.getvalue() == b"rendered"
+    assert calls["args"]["db"] is fake_db
+    assert calls["args"]["center_xuid"] == "xuid-seed"
+    assert calls["args"]["center_gamertag"] == "Seed"
+    assert calls["args"]["clustered"] is True
+    assert calls["args"]["min_group_size"] == 5
+    assert calls["args"]["min_link_strength"] == 7.0
 
 
 @pytest.mark.asyncio
@@ -850,15 +1139,13 @@ async def test_halonet_falls_back_to_single_match_threshold(monkeypatch):
     async def _resolve_gamertag_to_xuid(_gamertag):
         return "seed-xuid"
 
-    from src.bot.cogs import graph as graph_module
-
     monkeypatch.setattr(
-        graph_module,
+        halonet_module,
         "api_client",
         SimpleNamespace(resolve_gamertag_to_xuid=_resolve_gamertag_to_xuid),
     )
 
-    cog = GraphCog(bot=object())
+    cog = HaloNetCog(bot=object())
     cog.db.close()
     cog.db = _FakeGraphDB()
     cog._render_coplay_graph = lambda *args, **kwargs: BytesIO(b"fake-png")
@@ -872,7 +1159,7 @@ async def test_halonet_falls_back_to_single_match_threshold(monkeypatch):
             return _FakeMessage()
 
     ctx = _InlineCtx()
-    await GraphCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
+    await HaloNetCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
 
     # First send is loading embed, second is final graph embed+file.
     assert len(ctx.sent) >= 2
@@ -927,15 +1214,13 @@ async def test_halonet_auto_heals_missing_seed_edges(monkeypatch):
     async def _resolve_gamertag_to_xuid(_gamertag):
         return "seed-xuid"
 
-    from src.bot.cogs import graph as graph_module
-
     monkeypatch.setattr(
-        graph_module,
+        halonet_module,
         "api_client",
         SimpleNamespace(resolve_gamertag_to_xuid=_resolve_gamertag_to_xuid),
     )
 
-    cog = GraphCog(bot=object())
+    cog = HaloNetCog(bot=object())
     cog.db.close()
     fake_db = _FakeGraphDB()
     cog.db = fake_db
@@ -963,7 +1248,7 @@ async def test_halonet_auto_heals_missing_seed_edges(monkeypatch):
             return _FakeMessage()
 
     ctx = _InlineCtx()
-    await GraphCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
+    await HaloNetCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
 
     assert auto_heal_calls["count"] == 1
     assert len(ctx.sent) >= 2
@@ -993,15 +1278,13 @@ async def test_halonet_reports_auto_heal_skip_when_no_edges_after_retry(monkeypa
     async def _resolve_gamertag_to_xuid(_gamertag):
         return "seed-xuid"
 
-    from src.bot.cogs import graph as graph_module
-
     monkeypatch.setattr(
-        graph_module,
+        halonet_module,
         "api_client",
         SimpleNamespace(resolve_gamertag_to_xuid=_resolve_gamertag_to_xuid),
     )
 
-    cog = GraphCog(bot=object())
+    cog = HaloNetCog(bot=object())
     cog.db.close()
     cog.db = _FakeGraphDB()
 
@@ -1023,7 +1306,7 @@ async def test_halonet_reports_auto_heal_skip_when_no_edges_after_retry(monkeypa
             return _FakeMessage()
 
     ctx = _InlineCtx()
-    await GraphCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
+    await HaloNetCog.show_halonet.callback(cog, ctx, "HalcyonVidar")
 
     assert len(ctx.sent) >= 2
     final_args = ctx.sent[-1][0]
@@ -1035,7 +1318,7 @@ async def test_halonet_reports_auto_heal_skip_when_no_edges_after_retry(monkeypa
 
 @pytest.mark.asyncio
 async def test_halonet_failed_auto_heal_uses_short_retry_window(monkeypatch):
-    cog = GraphCog(bot=object())
+    cog = HaloNetCog(bot=object())
 
     async def _fake_run(seed_xuid, seed_gamertag):
         return {
@@ -1064,7 +1347,7 @@ async def test_halonet_failed_auto_heal_uses_short_retry_window(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_halonet_successful_auto_heal_keeps_long_cooldown(monkeypatch):
-    cog = GraphCog(bot=object())
+    cog = HaloNetCog(bot=object())
 
     async def _fake_run(seed_xuid, seed_gamertag):
         return {

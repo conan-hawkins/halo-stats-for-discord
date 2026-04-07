@@ -48,6 +48,8 @@ async def load_cogs():
     cog_modules = [
         "src.bot.cogs.stats",
         "src.bot.cogs.graph",
+        "src.bot.cogs.graph_commands.display.network.cog",
+        "src.bot.cogs.graph_commands.display.halonet.cog",
         "src.bot.cogs.terminal",
     ]
     

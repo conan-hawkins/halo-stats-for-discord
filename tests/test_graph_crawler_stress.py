@@ -9,6 +9,7 @@ class _StressDB:
         self.completed = []
         self.inserted_players = []
         self.crawled = []
+        self.refreshed_snapshots = []
 
     def get_next_from_queue(self, batch_size=10):
         if self._batches:
@@ -35,6 +36,15 @@ class _StressDB:
 
     def add_to_crawl_queue_batch(self, items):
         return len(items)
+
+    def refresh_inferred_group_snapshot(self, owner_xuid):
+        self.refreshed_snapshots.append(owner_xuid)
+        return {
+            "social_group_size": 0,
+            "social_group_size_inferred": False,
+            "social_group_source": "direct",
+            "inferred_partner_xuids": [],
+        }
 
     def get_queue_stats(self):
         return {"pending": 0, "in_progress": 0, "total": len(self.completed)}

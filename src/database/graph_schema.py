@@ -11,7 +11,6 @@ Implements the data model for:
 This schema supports:
 - Connected components analysis
 - Hub & spoke detection
-- KNN player similarity
 - Community detection
 - Influence modeling
 
@@ -835,53 +834,6 @@ class HaloSocialGraphDB:
         cursor.execute("SELECT * FROM halo_features WHERE xuid = ?", (xuid,))
         row = cursor.fetchone()
         return dict(row) if row else None
-    
-    def get_similar_players_knn(
-        self,
-        xuid: str,
-        k: int = 3,
-        csr_weight: float = 1.0,
-        kd_weight: float = 1.0,
-        winrate_weight: float = 0.5
-    ) -> List[Dict]:
-        """
-        Find K nearest neighbors based on Halo features.
-        Uses simple euclidean distance on normalized features.
-        """
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        # Get target player features
-        cursor.execute("SELECT csr, kd_ratio, win_rate FROM halo_features WHERE xuid = ?", (xuid,))
-        target = cursor.fetchone()
-        
-        if not target:
-            return []
-        
-        target_csr, target_kd, target_wr = target
-        
-        # Find similar players (simple SQL distance calculation)
-        cursor.execute("""
-            SELECT 
-                hf.*,
-                gp.gamertag,
-                (
-                    ? * ABS(COALESCE(hf.csr, 0) - ?) / 1000.0 +
-                    ? * ABS(COALESCE(hf.kd_ratio, 0) - ?) +
-                    ? * ABS(COALESCE(hf.win_rate, 0) - ?) / 100.0
-                ) as distance
-            FROM halo_features hf
-            JOIN graph_players gp ON hf.xuid = gp.xuid
-            WHERE hf.xuid != ?
-            AND hf.matches_played > 10
-            ORDER BY distance ASC
-            LIMIT ?
-        """, (csr_weight, target_csr or 0, 
-              kd_weight, target_kd or 0,
-              winrate_weight, target_wr or 0,
-              xuid, k))
-        
-        return [dict(row) for row in cursor.fetchall()]
     
     # =========================================================================
     # CO-PLAY GRAPH OPERATIONS

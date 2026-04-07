@@ -215,6 +215,144 @@ async def test_calculate_comprehensive_stats_bounded_fetch_stops_at_required_pag
 
 
 @pytest.mark.asyncio
+async def test_resolve_gamertag_to_xuid_cache_hit_with_spacing_normalization(monkeypatch):
+    client = HaloAPIClient()
+    from src.api import client as client_module
+
+    monkeypatch.setattr(client_module, "load_xuid_cache", lambda: {"123": "Some   Player"})
+
+    async def _fail_acquire(*args, **kwargs):
+        raise AssertionError("rate limiter should not be called on normalized cache hit")
+
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", _fail_acquire)
+
+    result = await client.resolve_gamertag_to_xuid(" some player ")
+    assert result == "123"
+
+
+@pytest.mark.asyncio
+async def test_resolve_gamertag_to_xuid_cache_alias_hit_without_spaces(monkeypatch):
+    client = HaloAPIClient()
+    from src.api import client as client_module
+
+    monkeypatch.setattr(client_module, "load_xuid_cache", lambda: {"123": "Some Player"})
+
+    async def _fail_acquire(*args, **kwargs):
+        raise AssertionError("rate limiter should not be called on alias cache hit")
+
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", _fail_acquire)
+
+    result = await client.resolve_gamertag_to_xuid("SomePlayer")
+    assert result == "123"
+
+
+@pytest.mark.asyncio
+async def test_resolve_gamertag_to_xuid_alias_ambiguity_falls_back_to_api(monkeypatch):
+    client = HaloAPIClient()
+    from src.api import client as client_module
+
+    monkeypatch.setattr(
+        client_module,
+        "load_xuid_cache",
+        lambda: {
+            "111": "Some Player",
+            "222": "Some  Player",
+        },
+    )
+    monkeypatch.setattr(client_module.os.path, "exists", lambda path: False)
+
+    acquire_calls = {"count": 0}
+    release_calls = {"count": 0}
+
+    async def _acquire(*args, **kwargs):
+        acquire_calls["count"] += 1
+        return 0
+
+    def _release(*args, **kwargs):
+        release_calls["count"] += 1
+
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", _acquire)
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "release", _release)
+
+    result = await client.resolve_gamertag_to_xuid("SomePlayer")
+
+    assert result is None
+    assert acquire_calls["count"] == 1
+    assert release_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_gamertag_to_xuid_api_success_persists_canonical_gamertag(monkeypatch):
+    client = HaloAPIClient()
+    from src.api import client as client_module
+
+    saved = {}
+    monkeypatch.setattr(client_module, "load_xuid_cache", lambda: {})
+    monkeypatch.setattr(client_module, "save_xuid_cache", lambda payload: saved.update(payload))
+    monkeypatch.setattr(client_module.os.path, "exists", lambda path: True)
+
+    class _FakeTokenFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(client_module, "open", lambda *args, **kwargs: _FakeTokenFile(), raising=False)
+    monkeypatch.setattr(
+        client_module.json,
+        "load",
+        lambda _file: {"xsts_xbox": {"token": "token", "uhs": "uhs"}},
+    )
+
+    async def _acquire(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", _acquire)
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "release", lambda: None)
+
+    class _FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return {
+                "profileUsers": [
+                    {
+                        "id": "123",
+                        "settings": [
+                            {"id": "Gamertag", "value": "Some Player"},
+                        ],
+                    }
+                ]
+            }
+
+        async def text(self):
+            return ""
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, *args, **kwargs):
+            return _FakeResponse()
+
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda *args, **kwargs: _FakeSession())
+
+    result = await client.resolve_gamertag_to_xuid("SomePlayer")
+    assert result == "123"
+    assert saved == {"123": "Some Player"}
+
+
+@pytest.mark.asyncio
 async def test_resolve_xuid_to_gamertag_cache_hit(monkeypatch):
     client = HaloAPIClient()
     from src.api import client as client_module

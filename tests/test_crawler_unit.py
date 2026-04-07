@@ -36,6 +36,7 @@ class DummyDB:
         self.queue_batch_added = []
         self.halo_features = []
         self.halo_features_by_xuid = {}
+        self.refreshed_snapshots = []
         self.crawled = []
         self.requeued_in_progress = 0
         self.retried_failed = 0
@@ -82,6 +83,15 @@ class DummyDB:
 
     def get_halo_features(self, xuid):
         return self.halo_features_by_xuid.get(xuid)
+
+    def refresh_inferred_group_snapshot(self, owner_xuid):
+        self.refreshed_snapshots.append(owner_xuid)
+        return {
+            "social_group_size": 0,
+            "social_group_size_inferred": False,
+            "social_group_source": "private-or-empty",
+            "inferred_partner_xuids": [],
+        }
 
     def requeue_in_progress_items(self):
         return self.requeued_in_progress

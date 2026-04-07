@@ -1,12 +1,10 @@
-"""
-Discord bot commands for Halo Infinite stats
-"""
+"""Discord bot commands for Halo Infinite stats."""
 
 from datetime import datetime
-import discord
 
 from src.api.client import StatsFind1
 from src.bot.embeds import format_error_embed, format_stats_embed
+from src.bot.presentation.embeds.loading import build_stats_loading_embed
 
 
 async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_process=None):
@@ -22,16 +20,7 @@ async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_p
     print(f"[DEBUG] fetch_and_display_stats CALLED for '{gamertag}' at {datetime.now()}")
     print(f"Discord command received: {stat_type} for '{gamertag}' (matches: {'ALL' if matches_to_process is None else matches_to_process})")
 
-    loading_embed = discord.Embed(
-        title="Loading Stats...",
-        description=f"Fetching stats for **{gamertag}** from {'ALL matches' if matches_to_process is None else f'{matches_to_process} matches'}\nPlease wait...",
-        colour=0xFFA500,
-        timestamp=datetime.now()
-    )
-    loading_embed.set_footer(
-        text="Project Goliath", 
-        icon_url="https://static.wikia.nocookie.net/halo/images/a/a6/H3_Difficulty_LegendaryIcon.png/revision/latest/scale-to-width-down/150?cb=20160930195427"
-    )
+    loading_embed = build_stats_loading_embed(gamertag, matches_to_process=matches_to_process)
     print(f"[DEBUG] Sending loading embed...")
     loading_message = await ctx.send(embed=loading_embed)
     print(f"[DEBUG] Loading embed sent, message ID: {loading_message.id}")

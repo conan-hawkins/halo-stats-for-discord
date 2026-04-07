@@ -132,27 +132,14 @@ Running `pytest` generates:
 | `#crawlstop` | Stop the current crawl |
 | `#graphstats` | Show graph database statistics |
 
-## Match Categories and Historical Backfill
+## Match Categories
 
 Matches now store category metadata in the stats DB:
 
 - `match_category`: `ranked`, `social`, `custom`, or `unknown`
 - `category_source`: classifier provenance (for example `playlist_map`, `text_heuristic`, `default_non_ranked`)
 
-Historical rows can be backfilled with the one-time utility script:
-
-```bash
-python one_time_backfill_match_participants.py --dry-run
-python one_time_backfill_match_participants.py --run --only-missing-participants
-python one_time_backfill_match_participants.py --run --only-unknown-category
-python one_time_backfill_match_participants.py --run --limit 500 --batch-size 50 --sleep-ms 250
-```
-
-Recommended rollout:
-
-1. Run `--dry-run` first to inspect candidate volume.
-2. Run a small bounded pass (`--run --limit 100`) to validate behavior.
-3. Run the full backfill with optional pacing (`--sleep-ms`) if needed.
+Historical migration and one-time backfill scripts are no longer part of this repository.
 
 ## Social Graph Crawler
 

@@ -24,6 +24,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.coverage
+coverage.xml
+pytest_full.log
 data/blacklistpop.py
 
 # Virtual environments

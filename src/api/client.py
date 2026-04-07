@@ -56,6 +56,8 @@ from src.api.utils import (
     is_token_valid,
 )
 from src.api.xuid_cache import (
+    _normalize_gamertag_alias_key,
+    _normalize_gamertag_for_lookup,
     load_xuid_cache,
     save_xuid_cache,
 )
@@ -574,12 +576,42 @@ class HaloAPIClient:
             XUID string if found, None otherwise
         """
         try:
+            gamertag = (gamertag or "").strip()
+            if not gamertag:
+                return None
+
             # Check cache first (reverse lookup: gamertag => XUID)
             xuid_cache = load_xuid_cache()
+            normalized_query = _normalize_gamertag_for_lookup(gamertag)
+            alias_query = _normalize_gamertag_alias_key(gamertag)
+
+            strict_hits: List[str] = []
+            alias_hits: List[str] = []
             for xuid, cached_gamertag in xuid_cache.items():
-                if cached_gamertag.lower() == gamertag.lower():
-                    print(f"Cache hit: '{gamertag}' -> XUID: {xuid}")
-                    return str(xuid)
+                normalized_cached = _normalize_gamertag_for_lookup(cached_gamertag)
+                if normalized_cached == normalized_query:
+                    strict_hits.append(str(xuid))
+                    continue
+
+                if alias_query and _normalize_gamertag_alias_key(cached_gamertag) == alias_query:
+                    alias_hits.append(str(xuid))
+
+            if len(strict_hits) == 1:
+                xuid = strict_hits[0]
+                print(f"Cache hit: '{gamertag}' -> XUID: {xuid}")
+                return xuid
+
+            if len(strict_hits) > 1:
+                print(f"Ambiguous strict cache match for '{gamertag}' ({len(strict_hits)} candidates); falling back to API")
+
+            # Alias matching removes spaces; only trust unique candidates.
+            if len(alias_hits) == 1:
+                xuid = alias_hits[0]
+                print(f"Cache alias hit: '{gamertag}' -> XUID: {xuid}")
+                return xuid
+
+            if len(alias_hits) > 1:
+                print(f"Ambiguous alias cache match for '{gamertag}' ({len(alias_hits)} candidates); falling back to API")
             
             # Cache miss - need to resolve via API
             print(f"Cache miss for '{gamertag}', resolving via API...")
@@ -632,9 +664,28 @@ class HaloAPIClient:
                                 xuid = user.get('id')
                                 
                                 if xuid:
+                                    canonical_gamertag = None
+                                    settings = user.get('settings', [])
+                                    if isinstance(settings, list):
+                                        for setting in settings:
+                                            if not isinstance(setting, dict):
+                                                continue
+                                            if setting.get('id') != 'Gamertag':
+                                                continue
+
+                                            candidate = setting.get('value')
+                                            if isinstance(candidate, str):
+                                                candidate = candidate.strip()
+                                                if candidate:
+                                                    canonical_gamertag = candidate
+                                                    break
+
+                                    if not canonical_gamertag:
+                                        canonical_gamertag = gamertag
+
                                     print(f"Resolved '{gamertag}' to XUID: {xuid}")
                                     # Save to cache for future lookups
-                                    xuid_cache[str(xuid)] = gamertag
+                                    xuid_cache[str(xuid)] = canonical_gamertag
                                     save_xuid_cache(xuid_cache)
                                     return str(xuid)
                                 else:

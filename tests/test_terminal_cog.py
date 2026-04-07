@@ -212,6 +212,9 @@ class _FakeGraphCog:
     def __init__(self):
         self.calls = []
 
+    async def show_network(self, ctx, *args, **kwargs):
+        self.calls.append(("network", args, kwargs))
+
     async def show_halonet(self, ctx, *args, **kwargs):
         self.calls.append(("halonet", args, kwargs))
 
@@ -248,6 +251,80 @@ class _FakeBotWithGraph:
         if name == "Graph":
             return self.graph_cog
         return None
+
+
+class _FakeNetworkCog:
+    def __init__(self):
+        self.calls = []
+
+    async def show_network(self, ctx, *args, **kwargs):
+        self.calls.append(("network", args, kwargs))
+
+
+class _FakeHaloNetCog:
+    def __init__(self):
+        self.calls = []
+
+    async def show_halonet(self, ctx, *args, **kwargs):
+        self.calls.append(("halonet", args, kwargs))
+
+
+class _FakeBotWithStandaloneSocialCogs:
+    def __init__(self, graph_cog, network_cog=None, halonet_cog=None):
+        self.graph_cog = graph_cog
+        self.network_cog = network_cog
+        self.halonet_cog = halonet_cog
+
+    def get_cog(self, name):
+        if name == "Stats":
+            return object()
+        if name == "Graph":
+            return self.graph_cog
+        if name == "Network":
+            return self.network_cog
+        if name == "HaloNet":
+            return self.halonet_cog
+        return None
+
+
+class _FakeStatsCog:
+    def __init__(self):
+        self.calls = []
+
+    async def run_stats_profile(self, ctx, profile, gamertag):
+        self.calls.append((profile.command_name, profile.fetch_stat_type, gamertag))
+
+
+class _FakeBotWithStats:
+    def __init__(self, stats_cog):
+        self.stats_cog = stats_cog
+
+    def get_cog(self, name):
+        if name == "Stats":
+            return self.stats_cog
+        if name == "Graph":
+            return None
+        return None
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_dispatches_stats_profiles():
+    stats_cog = _FakeStatsCog()
+    bot = _FakeBotWithStats(stats_cog)
+    ctx = _FakeCtx()
+
+    out_full = await execute_terminal_action(bot, ctx, "cmd_full", "Chief117")
+    out_ranked = await execute_terminal_action(bot, ctx, "cmd_ranked", "Chief117")
+    out_casual = await execute_terminal_action(bot, ctx, "cmd_casual", "Chief117")
+
+    assert out_full == "Executed #full for Chief117"
+    assert out_ranked == "Executed #ranked for Chief117"
+    assert out_casual == "Executed #casual for Chief117"
+    assert stats_cog.calls == [
+        ("full", "stats", "Chief117"),
+        ("ranked", "ranked", "Chief117"),
+        ("casual", "social", "Chief117"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -339,14 +416,51 @@ async def test_terminal_router_dispatches_crawlfriends_and_crawlgames():
 
 
 @pytest.mark.asyncio
-async def test_terminal_router_dispatches_halonet():
+async def test_terminal_router_requires_standalone_halonet_cog():
     graph_cog = _FakeGraphCog()
     bot = _FakeBotWithGraph(graph_cog)
 
     output = await execute_terminal_action(bot, _FakeCtx(), "cmd_halonet", "Chief117")
 
+    assert output == "HaloNet cog unavailable"
+    assert graph_cog.calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_prefers_standalone_network_cog():
+    graph_cog = _FakeGraphCog()
+    network_cog = _FakeNetworkCog()
+    bot = _FakeBotWithStandaloneSocialCogs(graph_cog=graph_cog, network_cog=network_cog)
+
+    output = await execute_terminal_action(bot, _FakeCtx(), "cmd_network", "Chief117")
+
+    assert output == "Executed #network for Chief117"
+    assert network_cog.calls == [("network", ("Chief117",), {})]
+    assert all(call[0] != "network" for call in graph_cog.calls)
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_requires_standalone_network_cog():
+    graph_cog = _FakeGraphCog()
+    bot = _FakeBotWithStandaloneSocialCogs(graph_cog=graph_cog, network_cog=None)
+
+    output = await execute_terminal_action(bot, _FakeCtx(), "cmd_network", "Chief117")
+
+    assert output == "Network cog unavailable"
+    assert graph_cog.calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_router_prefers_standalone_halonet_cog():
+    graph_cog = _FakeGraphCog()
+    halonet_cog = _FakeHaloNetCog()
+    bot = _FakeBotWithStandaloneSocialCogs(graph_cog=graph_cog, halonet_cog=halonet_cog)
+
+    output = await execute_terminal_action(bot, _FakeCtx(), "cmd_halonet", "Chief117")
+
     assert output == "Executed #halonet for Chief117"
-    assert graph_cog.calls[0] == ("halonet", ("Chief117",), {})
+    assert halonet_cog.calls == [("halonet", ("Chief117",), {})]
+    assert all(call[0] != "halonet" for call in graph_cog.calls)
 
 
 @pytest.mark.asyncio
