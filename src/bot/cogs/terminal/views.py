@@ -137,9 +137,24 @@ class TerminalView(discord.ui.View):
         if not isinstance(payload, dict):
             return
 
+        task_status: Optional[str] = None
+        raw_status = payload.get("_status")
+        if not isinstance(raw_status, str):
+            raw_status = payload.get("status")
+        if isinstance(raw_status, str) and raw_status.strip():
+            normalized_status = raw_status.strip().lower()
+            if normalized_status in {"running", "cancelling", "completed", "failed", "cancelled"}:
+                task_status = normalized_status
+
         stage = payload.get("stage")
         if isinstance(stage, str) and stage.strip():
             self.state.loading_stage = stage.strip()
+        elif task_status == "completed":
+            self.state.loading_stage = "Completed"
+        elif task_status == "failed":
+            self.state.loading_stage = "Failed"
+        elif task_status == "cancelled":
+            self.state.loading_stage = "Cancelled"
 
         percent = payload.get("percent")
         if isinstance(percent, (int, float)):
@@ -155,6 +170,7 @@ class TerminalView(discord.ui.View):
                 stage=self.state.loading_stage,
                 percent=self.state.progress_percent,
                 detail=self.state.progress_detail,
+                status=task_status,
             )
 
     async def _run_terminal_action(self, item, user_input: str) -> None:

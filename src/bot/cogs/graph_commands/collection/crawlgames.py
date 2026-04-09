@@ -99,8 +99,8 @@ class CrawlGamesCommandMixin:
                 xuid=seed_xuid,
                 stat_type="overall",
                 gamertag=seed_gamertag,
-                matches_to_process=300,
-                force_full_fetch=True,
+                matches_to_process=None,
+                force_full_fetch=False,
             )
         except Exception as exc:
             return {"ok": False, "message": f"Stats refresh failed: {exc}"}
@@ -207,8 +207,10 @@ class CrawlGamesCommandMixin:
         progress_message: Optional[discord.Message] = None
         progress_view: Optional[CrawlProgressView] = None
         last_embed_update_at = 0.0
+        completion_fallback_sent = False
 
         progress_state: Dict[str, object] = {
+            "status": "RUNNING",
             "stage": "Preparing scope",
             "percent": 0.0,
             "detail": "Initializing crawl",
@@ -216,11 +218,21 @@ class CrawlGamesCommandMixin:
             "players_analyzed": 0,
             "unique_pairs": 0,
             "rows_written": 0,
+            "rows_changed_target": 0,
+            "rows_skipped_unchanged": 0,
             "write_failures": 0,
             "seed_pairs": 0,
             "seed_rows": 0,
             "seed_matches": 0,
             "stub_rows": 0,
+            "seed_verified_matches": 0,
+            "seed_complete_before": 0,
+            "seed_incomplete_before": 0,
+            "seed_backfill_attempted": 0,
+            "seed_backfill_successful": 0,
+            "seed_backfill_failed": 0,
+            "seed_complete_after": 0,
+            "seed_incomplete_after": 0,
             "failure_examples": [],
         }
 
@@ -230,7 +242,14 @@ class CrawlGamesCommandMixin:
             filled = max(0, min(width, filled))
             return f"[{'#' * filled}{'-' * (width - filled)}] {bounded:5.1f}%"
 
-        def _build_progress_embed(status: str) -> discord.Embed:
+        def _normalize_status(status: Optional[str]) -> str:
+            normalized = str(status or progress_state.get("status") or "RUNNING").strip().upper()
+            if normalized not in {"RUNNING", "COMPLETED", "FAILED", "CANCELLED"}:
+                normalized = "RUNNING"
+            return normalized
+
+        def _build_progress_embed(status: Optional[str] = None) -> discord.Embed:
+            status = _normalize_status(status)
             elapsed = max(0, int((datetime.now(timezone.utc) - crawl_started_at).total_seconds()))
             percent = float(progress_state.get("percent") or 0.0)
 
@@ -267,10 +286,32 @@ class CrawlGamesCommandMixin:
             embed.add_field(name="Players Analyzed", value=str(progress_state.get("players_analyzed") or 0), inline=True)
             embed.add_field(name="Unique Co-play Pairs", value=str(progress_state.get("unique_pairs") or 0), inline=True)
             embed.add_field(name="Co-play Rows Written", value=str(progress_state.get("rows_written") or 0), inline=True)
+            embed.add_field(name="Changed Rows Targeted", value=str(progress_state.get("rows_changed_target") or 0), inline=True)
+            embed.add_field(name="Unchanged Rows Skipped", value=str(progress_state.get("rows_skipped_unchanged") or 0), inline=True)
             embed.add_field(name="Write Failures", value=str(progress_state.get("write_failures") or 0), inline=True)
             embed.add_field(name="Seed Pairs Found", value=str(progress_state.get("seed_pairs") or 0), inline=True)
             embed.add_field(name="Seed Rows Written", value=str(progress_state.get("seed_rows") or 0), inline=True)
             embed.add_field(name="Seed Qualifying Matches", value=str(progress_state.get("seed_matches") or 0), inline=True)
+            seed_verified_matches = int(progress_state.get("seed_verified_matches") or 0)
+            embed.add_field(name="Seed Verified Matches", value=str(seed_verified_matches), inline=True)
+            embed.add_field(
+                name="Seed Coverage (Before)",
+                value=f"{int(progress_state.get('seed_complete_before') or 0)}/{seed_verified_matches}",
+                inline=True,
+            )
+            embed.add_field(
+                name="Seed Backfill Success",
+                value=(
+                    f"{int(progress_state.get('seed_backfill_successful') or 0)}/"
+                    f"{int(progress_state.get('seed_backfill_attempted') or 0)}"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Seed Coverage (After)",
+                value=f"{int(progress_state.get('seed_complete_after') or 0)}/{seed_verified_matches}",
+                inline=True,
+            )
             embed.add_field(name="Stub Players Ensured", value=str(progress_state.get("stub_rows") or 0), inline=True)
 
             failure_examples = progress_state.get("failure_examples") or []
@@ -280,8 +321,11 @@ class CrawlGamesCommandMixin:
 
             return embed
 
-        async def _refresh_progress_embed(status: str = "RUNNING", force: bool = False) -> None:
-            nonlocal last_embed_update_at
+        async def _refresh_progress_embed(status: Optional[str] = None, force: bool = False) -> None:
+            nonlocal last_embed_update_at, completion_fallback_sent
+            status = _normalize_status(status)
+            progress_state["status"] = status
+
             if run_inline or not progress_message:
                 return
 
@@ -293,31 +337,54 @@ class CrawlGamesCommandMixin:
             try:
                 await progress_message.edit(embed=_build_progress_embed(status), view=progress_view)
             except Exception:
+                if status == "COMPLETED" and not completion_fallback_sent:
+                    completion_fallback_sent = True
+                    completion_message = f"Co-play crawl completed for **{gamertag}**."
+                    completion_detail = str(progress_state.get("detail") or "").strip()
+                    if completion_detail:
+                        completion_message = f"{completion_message} {completion_detail}"
+                    channel = getattr(ctx, "channel", None)
+                    if channel is not None:
+                        try:
+                            await channel.send(completion_message)
+                        except Exception:
+                            pass
                 return
 
-        async def _emit_progress(stage: str, percent: float, detail: str, force: bool = False) -> None:
+        async def _emit_progress(
+            stage: str,
+            percent: float,
+            detail: str,
+            force: bool = False,
+            status: Optional[str] = None,
+        ) -> None:
+            normalized_status = _normalize_status(status) if status else _normalize_status(None)
+            progress_state["status"] = normalized_status
             progress_state["stage"] = stage
             progress_state["percent"] = max(0.0, min(100.0, float(percent)))
             progress_state["detail"] = detail
 
             if progress_callback:
                 try:
+                    callback_payload = {
+                        "stage": stage,
+                        "percent": progress_state["percent"],
+                        "detail": detail,
+                    }
+                    if status:
+                        callback_payload["_status"] = normalized_status.lower()
                     await progress_callback(
-                        {
-                            "stage": stage,
-                            "percent": progress_state["percent"],
-                            "detail": detail,
-                        }
+                        callback_payload
                     )
                 except Exception:
                     pass
 
-            await _refresh_progress_embed(status="RUNNING", force=force)
+            await _refresh_progress_embed(force=force)
 
         if not run_inline:
             requester_id = int(getattr(getattr(ctx, "author", None), "id", 0) or 0)
             progress_view = CrawlProgressView(self, requester_id=requester_id)
-            progress_message = await ctx.send(embed=_build_progress_embed("RUNNING"), view=progress_view)
+            progress_message = await ctx.send(embed=_build_progress_embed(), view=progress_view)
             progress_view.message = progress_message
 
         async def run_coplay_crawl():
@@ -326,15 +393,16 @@ class CrawlGamesCommandMixin:
 
                 seed_xuid = await api.resolve_gamertag_to_xuid(gamertag)
                 if not seed_xuid:
+                    progress_state["status"] = "FAILED"
                     progress_state["detail"] = (
                         f"Could not resolve {gamertag}. Run #crawlfriends first if this player is not yet discovered."
                     )
-                    await _refresh_progress_embed(status="FAILED", force=True)
+                    await _refresh_progress_embed(force=True)
                     if progress_view:
                         await progress_view.deactivate()
                     return f"Could not resolve {gamertag}; co-play build skipped."
 
-                await _emit_progress("Hydrating seed history", 12.0, f"Fetching recent match history for {gamertag}", force=True)
+                await _emit_progress("Hydrating seed history", 12.0, f"Syncing lifetime match history for {gamertag}", force=True)
                 seed_hydrate_result = await self._hydrate_seed_match_history(seed_xuid, gamertag)
                 if seed_hydrate_result.get("ok"):
                     hydrate_detail = (
@@ -343,7 +411,48 @@ class CrawlGamesCommandMixin:
                     )
                 else:
                     hydrate_detail = str(seed_hydrate_result.get("message") or "Seed history hydration failed")
-                await _emit_progress("Reading participants", 20.0, hydrate_detail, force=True)
+
+                participant_detail = "Seed participant backfill helper unavailable."
+                if hasattr(api, "backfill_seed_match_participants"):
+                    await _emit_progress(
+                        "Repairing seed rosters",
+                        16.0,
+                        f"Checking participant coverage for {gamertag}",
+                        force=True,
+                    )
+                    seed_backfill_result = await api.backfill_seed_match_participants(seed_xuid, gamertag)
+
+                    progress_state["seed_verified_matches"] = int(seed_backfill_result.get("verified_matches") or 0)
+                    progress_state["seed_complete_before"] = int(seed_backfill_result.get("complete_matches_before") or 0)
+                    progress_state["seed_incomplete_before"] = int(seed_backfill_result.get("incomplete_matches_before") or 0)
+                    progress_state["seed_backfill_attempted"] = int(seed_backfill_result.get("attempted_backfills") or 0)
+                    progress_state["seed_backfill_successful"] = int(seed_backfill_result.get("successful_backfills") or 0)
+                    progress_state["seed_backfill_failed"] = int(seed_backfill_result.get("failed_backfills") or 0)
+                    progress_state["seed_complete_after"] = int(seed_backfill_result.get("complete_matches_after") or 0)
+                    progress_state["seed_incomplete_after"] = int(seed_backfill_result.get("incomplete_matches_after") or 0)
+
+                    if seed_backfill_result.get("ok"):
+                        participant_detail = (
+                            f"Seed participant coverage {progress_state['seed_complete_after']}/"
+                            f"{progress_state['seed_verified_matches']} complete; repaired "
+                            f"{progress_state['seed_backfill_successful']}/"
+                            f"{progress_state['seed_backfill_attempted']} missing rosters"
+                        )
+                        if int(progress_state["seed_backfill_failed"] or 0) > 0:
+                            participant_detail = (
+                                f"{participant_detail}, {progress_state['seed_backfill_failed']} failed"
+                            )
+                    else:
+                        participant_detail = str(
+                            seed_backfill_result.get("message") or "Seed participant backfill failed"
+                        )
+
+                await _emit_progress(
+                    "Reading participants",
+                    20.0,
+                    f"{hydrate_detail}. {participant_detail}",
+                    force=True,
+                )
 
                 match_edge_counts: Dict[tuple[str, str], int] = defaultdict(int)
                 same_team_counts: Dict[tuple[str, str], int] = defaultdict(int)
@@ -355,8 +464,9 @@ class CrawlGamesCommandMixin:
                 players_analyzed = 0
                 stats_db = getattr(getattr(api, "stats_cache", None), "db", None)
                 if not stats_db:
+                    progress_state["status"] = "FAILED"
                     progress_state["detail"] = "Participant database is unavailable."
-                    await _refresh_progress_embed(status="FAILED", force=True)
+                    await _refresh_progress_embed(force=True)
                     if progress_view:
                         await progress_view.deactivate()
                     return "Participant-first co-play build requires stats DB participant access, but it is unavailable."
@@ -368,7 +478,7 @@ class CrawlGamesCommandMixin:
                             scope_xuids = [seed_xuid] + scope_xuids
                         progress_state["scope_mode"] = f"Scoped participants ({len(scope_xuids)} players)"
                         progress_state["detail"] = f"Loading scoped participants from {len(scope_xuids)} scoped players"
-                        await _refresh_progress_embed(status="RUNNING", force=True)
+                        await _refresh_progress_embed(force=True)
                         all_match_participants = stats_db.get_scope_match_participants(scope_xuids) or {}
 
                         seed_overlay_matches = 0
@@ -393,19 +503,21 @@ class CrawlGamesCommandMixin:
                     elif hasattr(stats_db, "get_all_match_participants"):
                         progress_state["scope_mode"] = "Global participants (scoped fallback)"
                         progress_state["detail"] = "Scoped mode unavailable; falling back to global participants"
-                        await _refresh_progress_embed(status="RUNNING", force=True)
+                        await _refresh_progress_embed(force=True)
                         all_match_participants = stats_db.get_all_match_participants() or {}
                     else:
+                        progress_state["status"] = "FAILED"
                         progress_state["detail"] = "Stats DB does not support participant retrieval methods."
-                        await _refresh_progress_embed(status="FAILED", force=True)
+                        await _refresh_progress_embed(force=True)
                         if progress_view:
                             await progress_view.deactivate()
                         return "Participant retrieval methods are unavailable on stats DB."
                 else:
                     progress_state["scope_mode"] = "Global participants"
                     if not hasattr(stats_db, "get_all_match_participants"):
+                        progress_state["status"] = "FAILED"
                         progress_state["detail"] = "Stats DB does not support global participant retrieval."
-                        await _refresh_progress_embed(status="FAILED", force=True)
+                        await _refresh_progress_embed(force=True)
                         if progress_view:
                             await progress_view.deactivate()
                         return "Global participant retrieval is unavailable on stats DB."
@@ -510,10 +622,89 @@ class CrawlGamesCommandMixin:
                 cursor.execute("SELECT xuid FROM graph_players WHERE halo_active = 1")
                 halo_active_xuids = {str(row["xuid"]) for row in cursor.fetchall() if row["xuid"]}
 
+                directional_edges: List[Dict[str, object]] = []
+                for (src_xuid, dst_xuid), matches_together in match_edge_counts.items():
+                    first_ts = first_played.get((src_xuid, dst_xuid))
+                    last_ts = last_played.get((src_xuid, dst_xuid))
+                    is_halo_active_pair = src_xuid in halo_active_xuids and dst_xuid in halo_active_xuids
+                    is_seed_pair = seed_xuid in (src_xuid, dst_xuid)
+
+                    base_payload = {
+                        "matches_together": int(matches_together or 0),
+                        "wins_together": 0,
+                        "first_played": first_ts,
+                        "last_played": last_ts,
+                        "total_minutes": 0,
+                        "same_team_count": int(same_team_counts.get((src_xuid, dst_xuid), 0) or 0),
+                        "opposing_team_count": int(opposing_team_counts.get((src_xuid, dst_xuid), 0) or 0),
+                        "source_type": "participants-runtime",
+                        "is_inferred": 0,
+                        "is_partial": 0,
+                        "coverage_ratio": 1.0,
+                        "is_halo_active_pair": int(bool(is_halo_active_pair)),
+                        "_is_seed_pair": is_seed_pair,
+                    }
+
+                    directional_edges.append(
+                        {
+                            "src_xuid": src_xuid,
+                            "dst_xuid": dst_xuid,
+                            **base_payload,
+                        }
+                    )
+                    directional_edges.append(
+                        {
+                            "src_xuid": dst_xuid,
+                            "dst_xuid": src_xuid,
+                            **base_payload,
+                        }
+                    )
+
+                existing_snapshots: Dict[tuple[str, str], Dict[str, object]] = {}
+                if directional_edges and hasattr(self.db, "get_coplay_edges_snapshot"):
+                    try:
+                        existing_snapshots = self.db.get_coplay_edges_snapshot(
+                            [(str(edge.get("src_xuid") or ""), str(edge.get("dst_xuid") or "")) for edge in directional_edges]
+                        ) or {}
+                    except Exception:
+                        existing_snapshots = {}
+
+                def _edge_signature(edge_payload: Dict[str, object]) -> tuple:
+                    return (
+                        int(edge_payload.get("matches_together") or 0),
+                        int(edge_payload.get("wins_together") or 0),
+                        edge_payload.get("first_played"),
+                        edge_payload.get("last_played"),
+                        int(edge_payload.get("total_minutes") or 0),
+                        int(edge_payload.get("same_team_count") or 0),
+                        int(edge_payload.get("opposing_team_count") or 0),
+                        str(edge_payload.get("source_type") or "participants"),
+                        int(bool(edge_payload.get("is_inferred"))),
+                        int(bool(edge_payload.get("is_partial"))),
+                        round(float(edge_payload.get("coverage_ratio") if edge_payload.get("coverage_ratio") is not None else 1.0), 6),
+                        int(bool(edge_payload.get("is_halo_active_pair"))),
+                    )
+
+                changed_edges: List[Dict[str, object]] = []
+                rows_skipped_unchanged = 0
+                for edge in directional_edges:
+                    key = (str(edge.get("src_xuid") or ""), str(edge.get("dst_xuid") or ""))
+                    existing = existing_snapshots.get(key)
+                    if existing and _edge_signature(existing) == _edge_signature(edge):
+                        rows_skipped_unchanged += 1
+                        continue
+                    changed_edges.append(edge)
+
+                progress_state["rows_changed_target"] = len(changed_edges)
+                progress_state["rows_skipped_unchanged"] = rows_skipped_unchanged
+
                 await _emit_progress(
                     "Writing edges",
                     88.0,
-                    f"Writing {len(match_edge_counts)} co-play pairs",
+                    (
+                        f"Writing {len(changed_edges)} changed directional edges "
+                        f"({rows_skipped_unchanged} unchanged skipped)"
+                    ),
                     force=True,
                 )
 
@@ -521,114 +712,142 @@ class CrawlGamesCommandMixin:
                 seed_rows_written = 0
                 write_failures = 0
                 failure_examples: List[str] = []
-                total_pairs = max(1, len(match_edge_counts))
-                for pair_idx, ((src_xuid, dst_xuid), matches_together) in enumerate(match_edge_counts.items(), start=1):
-                    first_ts = first_played.get((src_xuid, dst_xuid))
-                    last_ts = last_played.get((src_xuid, dst_xuid))
-                    is_halo_active_pair = src_xuid in halo_active_xuids and dst_xuid in halo_active_xuids
-                    is_seed_pair = seed_xuid in (src_xuid, dst_xuid)
+                total_directional = len(changed_edges)
 
-                    base_kwargs = {
-                        "matches_together": matches_together,
-                        "wins_together": 0,
-                        "first_played": first_ts,
-                        "last_played": last_ts,
-                        "total_minutes": 0,
-                        "same_team_count": same_team_counts.get((src_xuid, dst_xuid), 0),
-                        "opposing_team_count": opposing_team_counts.get((src_xuid, dst_xuid), 0),
-                        "source_type": "participants-runtime",
-                        "is_halo_active_pair": is_halo_active_pair,
-                    }
-
+                def _write_single_edge(edge_payload: Dict[str, object]) -> bool:
+                    row_payload = {k: v for k, v in edge_payload.items() if not str(k).startswith("_")}
                     try:
-                        wrote_forward = self.db.upsert_coplay_edge(
-                            src_xuid=src_xuid,
-                            dst_xuid=dst_xuid,
-                            suppress_errors=True,
-                            **base_kwargs,
-                        )
+                        return bool(self.db.upsert_coplay_edge(suppress_errors=True, **row_payload))
                     except TypeError:
-                        wrote_forward = self.db.upsert_coplay_edge(
-                            src_xuid=src_xuid,
-                            dst_xuid=dst_xuid,
-                            **base_kwargs,
-                        )
+                        return bool(self.db.upsert_coplay_edge(**row_payload))
 
-                    if wrote_forward:
+                def _record_write_result(edge_payload: Dict[str, object], wrote: bool) -> None:
+                    nonlocal rows_written, seed_rows_written, write_failures
+                    if wrote:
                         rows_written += 1
-                        if is_seed_pair:
+                        if bool(edge_payload.get("_is_seed_pair")):
                             seed_rows_written += 1
-                    else:
-                        write_failures += 1
-                        if len(failure_examples) < 5:
-                            failure_examples.append(f"{src_xuid}->{dst_xuid}")
-
-                    try:
-                        wrote_reverse = self.db.upsert_coplay_edge(
-                            src_xuid=dst_xuid,
-                            dst_xuid=src_xuid,
-                            suppress_errors=True,
-                            **base_kwargs,
-                        )
-                    except TypeError:
-                        wrote_reverse = self.db.upsert_coplay_edge(
-                            src_xuid=dst_xuid,
-                            dst_xuid=src_xuid,
-                            **base_kwargs,
+                        return
+                    write_failures += 1
+                    if len(failure_examples) < 5:
+                        failure_examples.append(
+                            f"{edge_payload.get('src_xuid')}->{edge_payload.get('dst_xuid')}"
                         )
 
-                    if wrote_reverse:
-                        rows_written += 1
-                        if is_seed_pair:
-                            seed_rows_written += 1
-                    else:
-                        write_failures += 1
-                        if len(failure_examples) < 5:
-                            failure_examples.append(f"{dst_xuid}->{src_xuid}")
+                processed_directional = 0
+                batch_size = 300
+                if changed_edges and hasattr(self.db, "upsert_coplay_edges_batch"):
+                    for chunk_start in range(0, total_directional, batch_size):
+                        chunk = changed_edges[chunk_start : chunk_start + batch_size]
+                        db_chunk = [{k: v for k, v in edge.items() if not str(k).startswith("_")} for edge in chunk]
 
-                    progress_state["rows_written"] = rows_written
-                    progress_state["write_failures"] = write_failures
-                    progress_state["seed_rows"] = seed_rows_written
-                    progress_state["failure_examples"] = failure_examples
+                        batch_result: Dict[str, object]
+                        try:
+                            try:
+                                batch_result = self.db.upsert_coplay_edges_batch(db_chunk, suppress_errors=True)
+                            except TypeError:
+                                batch_result = self.db.upsert_coplay_edges_batch(db_chunk)
+                        except Exception as batch_exc:
+                            batch_result = {
+                                "ok": False,
+                                "written": 0,
+                                "failed": len(db_chunk),
+                                "error": str(batch_exc),
+                            }
 
-                    if pair_idx == 1 or pair_idx == total_pairs or pair_idx % 250 == 0:
-                        write_pct = 88.0 + (float(pair_idx) / float(total_pairs)) * 10.0
-                        await _emit_progress(
-                            "Writing edges",
-                            min(98.0, write_pct),
-                            f"Processed {pair_idx}/{total_pairs} pairs",
-                        )
+                        batch_ok = bool(batch_result.get("ok")) if isinstance(batch_result, dict) else False
+                        batch_written = int(batch_result.get("written") or 0) if isinstance(batch_result, dict) else 0
+
+                        if batch_ok and batch_written == len(db_chunk):
+                            rows_written += len(db_chunk)
+                            seed_rows_written += sum(1 for edge in chunk if bool(edge.get("_is_seed_pair")))
+                        else:
+                            if isinstance(batch_result, dict) and batch_result.get("error") and len(failure_examples) < 5:
+                                failure_examples.append(f"batch fallback: {str(batch_result.get('error'))[:96]}")
+                            for edge in chunk:
+                                _record_write_result(edge, _write_single_edge(edge))
+
+                        processed_directional += len(chunk)
+                        progress_state["rows_written"] = rows_written
+                        progress_state["write_failures"] = write_failures
+                        progress_state["seed_rows"] = seed_rows_written
+                        progress_state["failure_examples"] = failure_examples
+
+                        if (
+                            processed_directional == total_directional
+                            or processed_directional == len(chunk)
+                            or processed_directional % 250 == 0
+                        ):
+                            write_pct = 88.0 + (float(processed_directional) / float(max(1, total_directional))) * 10.0
+                            await _emit_progress(
+                                "Writing edges",
+                                min(98.0, write_pct),
+                                (
+                                    f"Processed {processed_directional}/{total_directional} changed rows "
+                                    f"({rows_skipped_unchanged} unchanged skipped)"
+                                ),
+                            )
+                else:
+                    for row_idx, edge in enumerate(changed_edges, start=1):
+                        _record_write_result(edge, _write_single_edge(edge))
+                        processed_directional = row_idx
+                        progress_state["rows_written"] = rows_written
+                        progress_state["write_failures"] = write_failures
+                        progress_state["seed_rows"] = seed_rows_written
+                        progress_state["failure_examples"] = failure_examples
+
+                        if row_idx == 1 or row_idx == total_directional or row_idx % 250 == 0:
+                            write_pct = 88.0 + (float(row_idx) / float(max(1, total_directional))) * 10.0
+                            await _emit_progress(
+                                "Writing edges",
+                                min(98.0, write_pct),
+                                (
+                                    f"Processed {row_idx}/{total_directional} changed rows "
+                                    f"({rows_skipped_unchanged} unchanged skipped)"
+                                ),
+                            )
 
                 progress_state["rows_written"] = rows_written
                 progress_state["write_failures"] = write_failures
                 progress_state["seed_rows"] = seed_rows_written
+                progress_state["rows_skipped_unchanged"] = rows_skipped_unchanged
+                progress_state["rows_changed_target"] = total_directional
                 progress_state["failure_examples"] = failure_examples
 
                 await _emit_progress(
                     "Finalizing",
                     100.0,
-                    f"Co-play crawl complete. Rows written: {rows_written}, failures: {write_failures}",
+                    (
+                        f"Co-play crawl complete. Changed rows written: {rows_written}, "
+                        f"unchanged skipped: {rows_skipped_unchanged}, failures: {write_failures}"
+                    ),
                     force=True,
+                    status="COMPLETED",
                 )
-                await _refresh_progress_embed(status="COMPLETED", force=True)
+                await _refresh_progress_embed(force=True)
                 if progress_view:
                     await progress_view.deactivate()
 
                 return (
                     f"Co-play crawl completed for {gamertag}. "
                     f"{progress_state.get('scope_mode')} mode; analyzed {players_analyzed}, pairs {len(match_edge_counts)}, "
-                    f"rows written {rows_written}, write failures {write_failures}, "
-                    f"seed pairs {seed_pairs_found}, seed rows {seed_rows_written}."
+                    f"rows written {rows_written}, unchanged skipped {rows_skipped_unchanged}, "
+                    f"changed rows targeted {total_directional}, write failures {write_failures}, "
+                    f"seed pairs {seed_pairs_found}, seed rows {seed_rows_written}, "
+                    f"seed participant coverage {int(progress_state.get('seed_complete_after') or 0)}/"
+                    f"{int(progress_state.get('seed_verified_matches') or 0)} complete."
                 )
             except asyncio.CancelledError:
+                progress_state["status"] = "CANCELLED"
                 progress_state["detail"] = "Cancellation requested"
-                await _refresh_progress_embed(status="CANCELLED", force=True)
+                await _refresh_progress_embed(force=True)
                 if progress_view:
                     await progress_view.deactivate()
                 raise
             except Exception as e:
+                progress_state["status"] = "FAILED"
                 progress_state["detail"] = str(e)
-                await _refresh_progress_embed(status="FAILED", force=True)
+                await _refresh_progress_embed(force=True)
                 if progress_view:
                     await progress_view.deactivate()
                 if run_inline:

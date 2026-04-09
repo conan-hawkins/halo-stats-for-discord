@@ -12,6 +12,7 @@ class StatsProfile:
     embed_color: int
     command_help: str
     guide_description: str
+    force_full_fetch: bool = False
 
 
 FULL_STATS_PROFILE = StatsProfile(

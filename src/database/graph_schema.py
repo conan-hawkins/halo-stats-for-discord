@@ -970,6 +970,156 @@ class HaloSocialGraphDB:
 
         return [dict(row) for row in cursor.fetchall()]
 
+    def _normalize_coplay_edge_payload(self, payload: Dict) -> Dict:
+        """Normalize co-play edge payload fields to DB-safe canonical values."""
+        src_xuid = str(payload.get("src_xuid") or "").strip()
+        dst_xuid = str(payload.get("dst_xuid") or "").strip()
+        if not src_xuid or not dst_xuid:
+            raise ValueError("empty src_xuid or dst_xuid")
+
+        return {
+            "src_xuid": src_xuid,
+            "dst_xuid": dst_xuid,
+            "matches_together": int(payload.get("matches_together") or 0),
+            "wins_together": int(payload.get("wins_together") or 0),
+            "last_played": payload.get("last_played"),
+            "first_played": payload.get("first_played"),
+            "total_minutes": int(payload.get("total_minutes") or 0),
+            "same_team_count": int(payload.get("same_team_count") or 0),
+            "opposing_team_count": int(payload.get("opposing_team_count") or 0),
+            "source_type": payload.get("source_type") or "participants",
+            "is_inferred": int(bool(payload.get("is_inferred"))),
+            "is_partial": int(bool(payload.get("is_partial"))),
+            "coverage_ratio": max(
+                0.0,
+                min(1.0, float(payload.get("coverage_ratio") if payload.get("coverage_ratio") is not None else 1.0)),
+            ),
+            "is_halo_active_pair": int(bool(payload.get("is_halo_active_pair"))),
+        }
+
+    def get_coplay_edges_snapshot(
+        self,
+        pairs: List[Tuple[str, str]],
+        chunk_size: int = 400,
+    ) -> Dict[Tuple[str, str], Dict]:
+        """Return normalized snapshots for directional co-play edges keyed by (src_xuid, dst_xuid)."""
+        normalized_pairs: List[Tuple[str, str]] = []
+        seen = set()
+        for src_xuid, dst_xuid in pairs or []:
+            src = str(src_xuid or "").strip()
+            dst = str(dst_xuid or "").strip()
+            if not src or not dst:
+                continue
+            key = (src, dst)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_pairs.append(key)
+
+        if not normalized_pairs:
+            return {}
+
+        effective_chunk_size = max(1, int(chunk_size or 1))
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        snapshots: Dict[Tuple[str, str], Dict] = {}
+
+        for start in range(0, len(normalized_pairs), effective_chunk_size):
+            chunk = normalized_pairs[start : start + effective_chunk_size]
+            placeholders = ",".join(["(?, ?)"] * len(chunk))
+            params = [item for pair in chunk for item in pair]
+            cursor.execute(
+                f"""
+                SELECT
+                    src_xuid,
+                    dst_xuid,
+                    matches_together,
+                    wins_together,
+                    first_played,
+                    last_played,
+                    total_minutes,
+                    same_team_count,
+                    opposing_team_count,
+                    source_type,
+                    is_inferred,
+                    is_partial,
+                    coverage_ratio,
+                    is_halo_active_pair
+                FROM graph_coplay
+                WHERE (src_xuid, dst_xuid) IN ({placeholders})
+                """,
+                params,
+            )
+            for row in cursor.fetchall():
+                normalized_row = self._normalize_coplay_edge_payload(dict(row))
+                snapshots[(normalized_row["src_xuid"], normalized_row["dst_xuid"])] = normalized_row
+
+        return snapshots
+
+    def upsert_coplay_edges_batch(self, edges: List[Dict], suppress_errors: bool = False) -> Dict:
+        """Batch insert or overwrite co-play edges in one transaction with rollback on error."""
+        if not edges:
+            return {"ok": True, "written": 0, "failed": 0}
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        try:
+            normalized_edges = [self._normalize_coplay_edge_payload(edge) for edge in edges]
+
+            for edge in normalized_edges:
+                cursor.execute(
+                    """
+                    INSERT INTO graph_coplay
+                    (src_xuid, dst_xuid, matches_together, wins_together,
+                     last_played, first_played, total_minutes, same_team_count, opposing_team_count,
+                     source_type, is_inferred, is_partial, coverage_ratio, is_halo_active_pair)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(src_xuid, dst_xuid) DO UPDATE SET
+                        matches_together = excluded.matches_together,
+                        wins_together = excluded.wins_together,
+                        last_played = excluded.last_played,
+                        first_played = excluded.first_played,
+                        total_minutes = excluded.total_minutes,
+                        same_team_count = excluded.same_team_count,
+                        opposing_team_count = excluded.opposing_team_count,
+                        source_type = excluded.source_type,
+                        is_inferred = excluded.is_inferred,
+                        is_partial = excluded.is_partial,
+                        coverage_ratio = excluded.coverage_ratio,
+                        is_halo_active_pair = excluded.is_halo_active_pair
+                    """,
+                    (
+                        edge["src_xuid"],
+                        edge["dst_xuid"],
+                        edge["matches_together"],
+                        edge["wins_together"],
+                        edge["last_played"],
+                        edge["first_played"],
+                        edge["total_minutes"],
+                        edge["same_team_count"],
+                        edge["opposing_team_count"],
+                        edge["source_type"],
+                        edge["is_inferred"],
+                        edge["is_partial"],
+                        edge["coverage_ratio"],
+                        edge["is_halo_active_pair"],
+                    ),
+                )
+
+            conn.commit()
+            return {"ok": True, "written": len(normalized_edges), "failed": 0}
+        except Exception as e:
+            conn.rollback()
+            if not suppress_errors:
+                print(f"Error batch upserting coplay edges: {e}")
+            return {
+                "ok": False,
+                "written": 0,
+                "failed": len(edges),
+                "error": str(e),
+            }
+
     def upsert_coplay_edge(
         self,
         src_xuid: str,
@@ -992,9 +1142,26 @@ class HaloSocialGraphDB:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        src_xuid = str(src_xuid or "").strip()
-        dst_xuid = str(dst_xuid or "").strip()
-        if not src_xuid or not dst_xuid:
+        try:
+            edge = self._normalize_coplay_edge_payload(
+                {
+                    "src_xuid": src_xuid,
+                    "dst_xuid": dst_xuid,
+                    "matches_together": matches_together,
+                    "wins_together": wins_together,
+                    "first_played": first_played,
+                    "last_played": last_played,
+                    "total_minutes": total_minutes,
+                    "same_team_count": same_team_count,
+                    "opposing_team_count": opposing_team_count,
+                    "source_type": source_type,
+                    "is_inferred": is_inferred,
+                    "is_partial": is_partial,
+                    "coverage_ratio": coverage_ratio,
+                    "is_halo_active_pair": is_halo_active_pair,
+                }
+            )
+        except ValueError:
             if not suppress_errors:
                 print("Error upserting coplay edge: empty src_xuid or dst_xuid")
             return False
@@ -1020,26 +1187,26 @@ class HaloSocialGraphDB:
                     coverage_ratio = excluded.coverage_ratio,
                     is_halo_active_pair = excluded.is_halo_active_pair
             """, (
-                src_xuid,
-                dst_xuid,
-                int(matches_together or 0),
-                int(wins_together or 0),
-                last_played,
-                first_played,
-                int(total_minutes or 0),
-                int(same_team_count or 0),
-                int(opposing_team_count or 0),
-                source_type or 'participants',
-                int(bool(is_inferred)),
-                int(bool(is_partial)),
-                max(0.0, min(1.0, float(coverage_ratio if coverage_ratio is not None else 1.0))),
-                int(bool(is_halo_active_pair)),
+                edge["src_xuid"],
+                edge["dst_xuid"],
+                edge["matches_together"],
+                edge["wins_together"],
+                edge["last_played"],
+                edge["first_played"],
+                edge["total_minutes"],
+                edge["same_team_count"],
+                edge["opposing_team_count"],
+                edge["source_type"],
+                edge["is_inferred"],
+                edge["is_partial"],
+                edge["coverage_ratio"],
+                edge["is_halo_active_pair"],
             ))
             conn.commit()
             return True
         except Exception as e:
             if not suppress_errors:
-                print(f"Error upserting coplay edge {src_xuid}->{dst_xuid}: {e}")
+                print(f"Error upserting coplay edge {edge['src_xuid']}->{edge['dst_xuid']}: {e}")
             return False
     
     # =========================================================================
@@ -1262,6 +1429,43 @@ class HaloSocialGraphDB:
     # =========================================================================
     # GRAPH ANALYTICS
     # =========================================================================
+
+    def get_coplay_participant_coverage_summary(self) -> Dict:
+        """Summarize participant-derived co-play coverage quality."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_edges,
+                SUM(
+                    CASE
+                        WHEN COALESCE(is_partial, 0) = 0
+                             AND COALESCE(coverage_ratio, 1.0) >= 1.0
+                        THEN 1 ELSE 0
+                    END
+                ) AS complete_edges,
+                SUM(
+                    CASE
+                        WHEN COALESCE(is_partial, 0) = 1
+                             OR COALESCE(coverage_ratio, 1.0) < 1.0
+                        THEN 1 ELSE 0
+                    END
+                ) AS partial_edges,
+                AVG(COALESCE(coverage_ratio, 1.0)) AS avg_coverage_ratio
+            FROM graph_coplay
+            WHERE COALESCE(source_type, 'participants') IN ('participants', 'participants-runtime')
+            """
+        )
+        row = cursor.fetchone() or {}
+
+        return {
+            'total_edges': int(row['total_edges'] or 0),
+            'complete_edges': int(row['complete_edges'] or 0),
+            'partial_edges': int(row['partial_edges'] or 0),
+            'avg_coverage_ratio': float(row['avg_coverage_ratio'] or 0.0),
+        }
     
     def get_graph_stats(self) -> Dict:
         """Get overall graph statistics"""
@@ -1283,6 +1487,8 @@ class HaloSocialGraphDB:
         
         cursor.execute("SELECT COUNT(*) FROM graph_coplay")
         stats['total_coplay_edges'] = cursor.fetchone()[0]
+
+        stats['participant_coverage'] = self.get_coplay_participant_coverage_summary()
         
         # Features
         cursor.execute("SELECT COUNT(*) FROM halo_features WHERE matches_played > 0")

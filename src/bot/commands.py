@@ -7,7 +7,13 @@ from src.bot.embeds import format_error_embed, format_stats_embed
 from src.bot.presentation.embeds.loading import build_stats_loading_embed
 
 
-async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_process=None):
+async def fetch_and_display_stats(
+    ctx,
+    gamertag,
+    stat_type="stats",
+    matches_to_process=None,
+    force_full_fetch: bool = False,
+):
     """
     Fetch and display player statistics
     
@@ -16,6 +22,7 @@ async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_p
         gamertag: Xbox gamertag to fetch
         stat_type: Type of stats to fetch
         matches_to_process: Number of matches to process (None = all)
+        force_full_fetch: If True, bypass cache and fetch full history from API
     """
     print(f"[DEBUG] fetch_and_display_stats CALLED for '{gamertag}' at {datetime.now()}")
     print(f"Discord command received: {stat_type} for '{gamertag}' (matches: {'ALL' if matches_to_process is None else matches_to_process})")
@@ -26,7 +33,12 @@ async def fetch_and_display_stats(ctx, gamertag, stat_type="stats", matches_to_p
     print(f"[DEBUG] Loading embed sent, message ID: {loading_message.id}")
 
     try:
-        await StatsFind1.page_getter(gamertag, stat_type, matches_to_process=matches_to_process)
+        await StatsFind1.page_getter(
+            gamertag,
+            stat_type,
+            matches_to_process=matches_to_process,
+            force_full_fetch=force_full_fetch,
+        )
         print(f"API call completed. Error code: {StatsFind1.error_no}")
         
         if StatsFind1.error_no != 0:

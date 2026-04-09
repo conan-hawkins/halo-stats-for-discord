@@ -58,6 +58,7 @@ class TerminalTaskManager:
         stage: Optional[str] = None,
         percent: Optional[float] = None,
         detail: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> None:
         async with self._lock:
             task = self._tasks.get(task_id)
@@ -73,14 +74,23 @@ class TerminalTaskManager:
             if isinstance(detail, str):
                 task.detail = detail.strip()
 
+            normalized_status = str(status or "").strip().lower()
+            if normalized_status in {"running", "cancelling", "completed", "failed", "cancelled"}:
+                task.status = normalized_status
+                if normalized_status == "completed":
+                    task.stage = "Completed"
+                elif normalized_status == "failed":
+                    task.stage = "Failed"
+                elif normalized_status == "cancelled":
+                    task.stage = "Cancelled"
+
     async def mark_completed(self, task_id: str) -> None:
         async with self._lock:
             task = self._tasks.get(task_id)
             if not task:
                 return
             task.status = "completed"
-            if not task.stage:
-                task.stage = "Completed"
+            task.stage = "Completed"
 
     async def mark_failed(self, task_id: str, error: str) -> None:
         async with self._lock:

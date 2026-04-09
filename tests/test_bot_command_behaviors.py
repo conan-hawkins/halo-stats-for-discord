@@ -9,7 +9,11 @@ from src.bot.cogs.graph import (
     CrawlProgressView,
     GraphCog,
 )
-from src.bot.cogs.graph_commands.display.halonet.ui import HaloNetFilterView, HaloNetRefreshView
+from src.bot.cogs.graph_commands.display.halonet.ui import (
+    HaloNetFilterView,
+    HaloNetNodeInfoView,
+    HaloNetRefreshView,
+)
 from src.bot.cogs.graph_commands.display.network.ui import NetworkFilterView, NetworkRefreshView
 from src.bot.cogs.graph_commands.display.halonet.cog import HaloNetCog
 from src.bot.cogs import graph as graph_module
@@ -77,12 +81,16 @@ class _FakeInteractionResponse:
     def __init__(self):
         self.sent_messages = []
         self.edited_message = None
+        self.deferred = False
 
     async def send_message(self, *args, **kwargs):
         self.sent_messages.append((args, kwargs))
 
     async def edit_message(self, *args, **kwargs):
         self.edited_message = {"args": args, "kwargs": kwargs}
+
+    async def defer(self):
+        self.deferred = True
 
 
 class _FakeInteraction:
@@ -96,8 +104,8 @@ class _FakeInteraction:
 async def test_stats_cog_full_ranked_casual_dispatch(monkeypatch):
     calls = []
 
-    async def fake_fetch(ctx, gamertag, stat_type="stats", matches_to_process=None):
-        calls.append((gamertag, stat_type, matches_to_process))
+    async def fake_fetch(ctx, gamertag, stat_type="stats", matches_to_process=None, force_full_fetch=False):
+        calls.append((gamertag, stat_type, matches_to_process, force_full_fetch))
 
     from src.bot.cogs import stats as stats_module
 
@@ -110,9 +118,9 @@ async def test_stats_cog_full_ranked_casual_dispatch(monkeypatch):
     await StatsCog.ranked.callback(cog, ctx, "A", "B")
     await StatsCog.casual.callback(cog, ctx, "A", "B")
 
-    assert calls[0] == ("A B", "stats", None)
-    assert calls[1] == ("A B", "ranked", None)
-    assert calls[2] == ("A B", "social", None)
+    assert calls[0] == ("A B", "stats", None, False)
+    assert calls[1] == ("A B", "ranked", None, False)
+    assert calls[2] == ("A B", "social", None, False)
 
 
 def test_stats_cog_excludes_removed_server_command():
@@ -571,6 +579,7 @@ async def test_halonet_refresh_button_restores_active_controls_preserving_filter
     source_view.min_node_strength = 5
     source_view.min_edge_weight = 10
     source_view.clustered = True
+    source_view.game_type_filter = "ranked"
     source_view._sync_select_defaults()
 
     refresh_view = HaloNetRefreshView(requester_id=42, source_view=source_view)
@@ -589,7 +598,224 @@ async def test_halonet_refresh_button_restores_active_controls_preserving_filter
     assert restored_view.min_node_strength == 5
     assert restored_view.min_edge_weight == 10
     assert restored_view.clustered is True
+    assert restored_view.game_type_filter == "ranked"
     assert restored_view.message is interaction.message
+
+
+def test_halonet_filter_thresholds_include_200_and_stay_within_select_limit():
+    base_embed = discord.Embed(title="HaloNet", description="Co-play links weighted by shared matches.")
+    view = HaloNetFilterView(
+        cog=object(),
+        requester_id=42,
+        center_xuid="seed-xuid",
+        center_gamertag="Seed",
+        node_map={
+            "seed-xuid": {"xuid": "seed-xuid", "gamertag": "Seed", "is_center": True},
+            "friend-xuid": {"xuid": "friend-xuid", "gamertag": "Friend", "is_center": False},
+        },
+        edges=[{"src_xuid": "seed-xuid", "dst_xuid": "friend-xuid", "matches_together": 5}],
+        base_embed=base_embed,
+    )
+
+    node_select = next(
+        item for item in view.children if isinstance(item, discord.ui.Select) and "Node Filter" in (item.placeholder or "")
+    )
+    edge_select = next(
+        item for item in view.children if isinstance(item, discord.ui.Select) and "Edge Filter" in (item.placeholder or "")
+    )
+    game_type_select = next(
+        item for item in view.children if isinstance(item, discord.ui.Select) and "Game Type Filter" in (item.placeholder or "")
+    )
+
+    node_values = [opt.value for opt in node_select.options]
+    edge_values = [opt.value for opt in edge_select.options]
+    game_type_values = [opt.value for opt in game_type_select.options]
+
+    assert "200" in node_values
+    assert "200" in edge_values
+    assert game_type_values == ["all", "ranked", "social", "custom"]
+    assert len(node_values) <= 25
+    assert len(edge_values) <= 25
+
+
+def _build_halonet_node_fixture(total_nodes):
+    node_map = {
+        "seed-xuid": {
+            "xuid": "seed-xuid",
+            "gamertag": "Seed",
+            "is_center": True,
+            "weighted_degree": 999,
+            "kd_ratio": 1.5,
+            "win_rate": 60.0,
+            "matches_played": 300,
+        }
+    }
+    edges = []
+    for idx in range(1, total_nodes):
+        xuid = f"friend-{idx}"
+        node_map[xuid] = {
+            "xuid": xuid,
+            "gamertag": f"Friend {idx}",
+            "is_center": False,
+            "weighted_degree": max(1, total_nodes - idx),
+            "kd_ratio": 1.0 + (idx / 100.0),
+            "win_rate": 48.0 + (idx / 10.0),
+            "matches_played": 20 + idx,
+        }
+        edges.append(
+            {
+                "src_xuid": "seed-xuid",
+                "dst_xuid": xuid,
+                "matches_together": 3 + idx,
+                "wins_together": 1 + (idx // 2),
+                "total_minutes": 45 + idx,
+                "same_team_count": 1 + (idx % 3),
+                "opposing_team_count": idx % 2,
+            }
+        )
+    return node_map, edges
+
+
+@pytest.mark.asyncio
+async def test_halonet_node_info_view_all_setting_paginates_beyond_25_nodes():
+    node_map, edges = _build_halonet_node_fixture(total_nodes=31)
+    view = HaloNetNodeInfoView(node_map=node_map, edges=edges, requester_id=42)
+    interaction = _FakeInteraction(user_id=42, message=_FakeMessage())
+
+    count_select = next(
+        item for item in view.children if isinstance(item, discord.ui.Select) and "Node Info Count" in (item.placeholder or "")
+    )
+    count_select._values = ["all"]
+    await count_select.callback(interaction)
+
+    assert view.include_count is None
+    assert view._get_page_count() == 2
+    assert interaction.response.edited_message is not None
+    assert "setting: **All**" in interaction.response.edited_message["kwargs"]["content"]
+
+    next_button = next(
+        item for item in view.children if isinstance(item, discord.ui.Button) and item.label == "Next Page"
+    )
+    await next_button.callback(interaction)
+
+    assert view.page_index == 1
+    assert "Page: **2/2**" in interaction.response.edited_message["kwargs"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_halonet_node_info_selector_rejects_non_requester():
+    node_map, edges = _build_halonet_node_fixture(total_nodes=6)
+    view = HaloNetNodeInfoView(node_map=node_map, edges=edges, requester_id=42)
+    interaction = _FakeInteraction(user_id=7, message=_FakeMessage())
+
+    node_select = next(
+        item for item in view.children if isinstance(item, discord.ui.Select) and "Select a HaloNet node" in (item.placeholder or "")
+    )
+    node_select._values = ["friend-1"]
+    await node_select.callback(interaction)
+
+    assert interaction.response.sent_messages
+    message_args, message_kwargs = interaction.response.sent_messages[0]
+    assert "Only the command requester can use this selector." in message_args[0]
+    assert message_kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_halonet_node_info_selector_returns_embed_and_partner_file():
+    node_map, edges = _build_halonet_node_fixture(total_nodes=6)
+    view = HaloNetNodeInfoView(node_map=node_map, edges=edges, requester_id=42)
+    interaction = _FakeInteraction(user_id=42, message=_FakeMessage())
+
+    node_select = next(
+        item for item in view.children if isinstance(item, discord.ui.Select) and "Select a HaloNet node" in (item.placeholder or "")
+    )
+    node_select._values = ["friend-1"]
+    await node_select.callback(interaction)
+
+    assert interaction.response.sent_messages
+    _, message_kwargs = interaction.response.sent_messages[0]
+    embed = message_kwargs["embed"]
+    partner_file = message_kwargs["file"]
+
+    assert embed.title == "Node Details: Friend 1"
+    assert any(field.name == "Co-play Insights" for field in embed.fields)
+    assert partner_file.filename == "node_coplay_partners_friend-1.txt"
+
+
+@pytest.mark.asyncio
+async def test_halonet_command_sends_node_info_view_for_multi_node_graph(monkeypatch):
+    class _FakeHaloNetDB:
+        def get_player(self, xuid):
+            return {"xuid": xuid, "gamertag": "Seed"}
+
+        def get_halo_features(self, xuid):
+            return {"kd_ratio": 1.42, "win_rate": 55.5, "matches_played": 220}
+
+        def get_coplay_neighbors(self, xuid, min_matches=2, limit=59):
+            return [
+                {
+                    "partner_xuid": "friend-1",
+                    "gamertag": "Friend 1",
+                    "matches_together": 8,
+                    "wins_together": 4,
+                    "total_minutes": 120,
+                    "same_team_count": 6,
+                    "opposing_team_count": 2,
+                    "first_played": "2025-01-01T00:00:00Z",
+                    "last_played": "2026-01-01T00:00:00Z",
+                    "kd_ratio": 1.10,
+                    "win_rate": 52.0,
+                    "matches_played": 90,
+                }
+            ]
+
+        def get_coplay_edges_within_set(self, xuids, min_matches=1):
+            return [
+                {
+                    "src_xuid": "seed-xuid",
+                    "dst_xuid": "friend-1",
+                    "matches_together": 8,
+                    "wins_together": 4,
+                    "total_minutes": 120,
+                    "same_team_count": 6,
+                    "opposing_team_count": 2,
+                    "first_played": "2025-01-01T00:00:00Z",
+                    "last_played": "2026-01-01T00:00:00Z",
+                }
+            ]
+
+        def close(self):
+            return None
+
+    class _InlineHaloNetCtx:
+        def __init__(self):
+            self.sent = []
+            self.author = SimpleNamespace(id=42)
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return _FakeMessage()
+
+    async def _fake_resolve_gamertag_to_xuid(gamertag):
+        return "seed-xuid"
+
+    monkeypatch.setattr(
+        halonet_module,
+        "api_client",
+        SimpleNamespace(resolve_gamertag_to_xuid=_fake_resolve_gamertag_to_xuid),
+    )
+
+    cog = HaloNetCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeHaloNetDB()
+    monkeypatch.setattr(cog, "_render_coplay_graph", lambda *args, **kwargs: BytesIO(b"png"))
+
+    ctx = _InlineHaloNetCtx()
+    await HaloNetCog.show_halonet.callback(cog, ctx, "Seed")
+
+    sent_views = [kwargs.get("view") for _, kwargs in ctx.sent if kwargs.get("view") is not None]
+    assert any(isinstance(view, HaloNetFilterView) for view in sent_views)
+    assert any(isinstance(view, HaloNetNodeInfoView) for view in sent_views)
 
 
 @pytest.mark.asyncio
@@ -689,6 +915,365 @@ async def test_crawlgames_run_inline_uses_existing_scope_without_friend_crawl(mo
     assert "seed pairs 1" in result
     assert len(cog.db.upserts) == 2
     assert cog.db.stub_batches
+
+
+@pytest.mark.asyncio
+async def test_crawlgames_non_inline_completion_edit_failure_emits_fallback_message(monkeypatch):
+    class _FakeGraphDB:
+        def __init__(self):
+            self.upserts = []
+            self.stub_batches = []
+
+        def get_friends(self, xuid):
+            if xuid == "seed-xuid":
+                return [{"dst_xuid": "friend-xuid", "halo_active": 1}]
+            return []
+
+        def get_player(self, xuid):
+            return {"gamertag": xuid}
+
+        def _get_connection(self):
+            class _Cursor:
+                def execute(self, *_args, **_kwargs):
+                    return None
+
+                def fetchall(self):
+                    return [{"xuid": "seed-xuid"}, {"xuid": "friend-xuid"}]
+
+            class _Conn:
+                def cursor(self):
+                    return _Cursor()
+
+            return _Conn()
+
+        def upsert_coplay_edge(self, **kwargs):
+            self.upserts.append(kwargs)
+            return True
+
+        def insert_or_update_players_stub_batch(self, xuids):
+            normalized = sorted(str(x).strip() for x in xuids if str(x).strip())
+            self.stub_batches.append(normalized)
+            return len(normalized)
+
+        def close(self):
+            return None
+
+    class _FakeStatsDB:
+        def get_scope_match_participants(self, _scope_xuids):
+            return {
+                "m-1": [
+                    {
+                        "xuid": "seed-xuid",
+                        "team_id": "1",
+                        "inferred_team_id": None,
+                        "start_time": "2026-01-01T00:00:00",
+                    },
+                    {
+                        "xuid": "friend-xuid",
+                        "team_id": "1",
+                        "inferred_team_id": None,
+                        "start_time": "2026-01-01T00:00:00",
+                    },
+                ]
+            }
+
+    class _FlakyProgressMessage(_TrackingMessage):
+        def __init__(self):
+            super().__init__()
+            self.completed_edit_attempts = 0
+
+        async def edit(self, *args, **kwargs):
+            embed = kwargs.get("embed")
+            if embed is not None:
+                status_field = next((field for field in embed.fields if field.name == "Status"), None)
+                if status_field and str(status_field.value) == "COMPLETED":
+                    self.completed_edit_attempts += 1
+                    raise RuntimeError("simulated completed edit failure")
+            return await super().edit(*args, **kwargs)
+
+    class _NonInlineCtx:
+        def __init__(self, progress_message):
+            self.sent = []
+            self.channel = self
+            self.author = SimpleNamespace(id=777)
+            self._progress_message = progress_message
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            if kwargs.get("embed") is not None:
+                return self._progress_message
+            return _TrackingMessage()
+
+    fake_api_client = SimpleNamespace(stats_cache=SimpleNamespace(db=_FakeStatsDB()))
+
+    async def _resolve_gamertag_to_xuid(_gamertag):
+        return "seed-xuid"
+
+    fake_api_client.resolve_gamertag_to_xuid = _resolve_gamertag_to_xuid
+
+    from src.bot.cogs import graph as graph_module
+
+    monkeypatch.setattr(graph_module, "api_client", fake_api_client)
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+    monkeypatch.setattr(cog, "_collect_halo_active_scope", lambda seed_xuid, depth: ["friend-xuid"])
+
+    progress_message = _FlakyProgressMessage()
+    ctx = _NonInlineCtx(progress_message)
+
+    await GraphCog.start_crawl_games.callback(cog, ctx, "SeedTag", "1")
+    assert cog._crawl_task is not None
+    await cog._crawl_task
+
+    assert progress_message.completed_edit_attempts >= 1
+
+    status_values = []
+    for edit in progress_message.edits:
+        embed = edit["kwargs"].get("embed")
+        if embed is None:
+            continue
+        status_field = next((field for field in embed.fields if field.name == "Status"), None)
+        if status_field:
+            status_values.append(str(status_field.value))
+
+    assert status_values
+    assert status_values[-1] == "RUNNING"
+
+    text_messages = [args[0] for args, _kwargs in ctx.sent if args and isinstance(args[0], str)]
+    assert any("Co-play crawl completed for **SeedTag**." in message for message in text_messages)
+
+
+@pytest.mark.asyncio
+async def test_crawlgames_skips_unchanged_edges_with_snapshot(monkeypatch):
+    class _FakeGraphDB:
+        def __init__(self):
+            self.upserts = []
+            self.batch_calls = []
+            self.stub_batches = []
+
+        def get_friends(self, xuid):
+            if xuid == "seed-xuid":
+                return [{"dst_xuid": "friend-xuid", "halo_active": 1}]
+            return []
+
+        def get_player(self, xuid):
+            return {"gamertag": xuid}
+
+        def _get_connection(self):
+            class _Cursor:
+                def execute(self, *_args, **_kwargs):
+                    return None
+
+                def fetchall(self):
+                    return [{"xuid": "seed-xuid"}, {"xuid": "friend-xuid"}]
+
+            class _Conn:
+                def cursor(self):
+                    return _Cursor()
+
+            return _Conn()
+
+        def get_coplay_edges_snapshot(self, _pairs):
+            base = {
+                "matches_together": 1,
+                "wins_together": 0,
+                "first_played": "2026-01-01T00:00:00",
+                "last_played": "2026-01-01T00:00:00",
+                "total_minutes": 0,
+                "same_team_count": 1,
+                "opposing_team_count": 0,
+                "source_type": "participants-runtime",
+                "is_inferred": 0,
+                "is_partial": 0,
+                "coverage_ratio": 1.0,
+                "is_halo_active_pair": 1,
+            }
+            return {
+                ("seed-xuid", "friend-xuid"): {"src_xuid": "seed-xuid", "dst_xuid": "friend-xuid", **base},
+                ("friend-xuid", "seed-xuid"): {"src_xuid": "friend-xuid", "dst_xuid": "seed-xuid", **base},
+            }
+
+        def upsert_coplay_edges_batch(self, edges, suppress_errors=False):
+            self.batch_calls.append((list(edges), suppress_errors))
+            return {"ok": True, "written": len(edges), "failed": 0}
+
+        def upsert_coplay_edge(self, **kwargs):
+            self.upserts.append(kwargs)
+            return True
+
+        def insert_or_update_players_stub_batch(self, xuids):
+            normalized = sorted(str(x).strip() for x in xuids if str(x).strip())
+            self.stub_batches.append(normalized)
+            return len(normalized)
+
+        def close(self):
+            return None
+
+    class _FakeStatsDB:
+        def get_all_match_participants(self):
+            return {
+                "m-1": [
+                    {
+                        "xuid": "seed-xuid",
+                        "team_id": "1",
+                        "inferred_team_id": None,
+                        "start_time": "2026-01-01T00:00:00",
+                    },
+                    {
+                        "xuid": "friend-xuid",
+                        "team_id": "1",
+                        "inferred_team_id": None,
+                        "start_time": "2026-01-01T00:00:00",
+                    },
+                ]
+            }
+
+    fake_api_client = SimpleNamespace(stats_cache=SimpleNamespace(db=_FakeStatsDB()))
+
+    async def _resolve_gamertag_to_xuid(_gamertag):
+        return "seed-xuid"
+
+    fake_api_client.resolve_gamertag_to_xuid = _resolve_gamertag_to_xuid
+
+    from src.bot.cogs import graph as graph_module
+
+    monkeypatch.setattr(graph_module, "api_client", fake_api_client)
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+
+    class _InlineCtx:
+        def __init__(self):
+            self.sent = []
+            self.channel = self
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return _FakeMessage()
+
+    ctx = _InlineCtx()
+    result = await GraphCog.start_crawl_games.callback(
+        cog,
+        ctx,
+        "SeedTag",
+        "1",
+        run_inline=True,
+    )
+
+    assert "rows written 0" in result
+    assert "unchanged skipped 2" in result
+    assert "changed rows targeted 0" in result
+    assert cog.db.batch_calls == []
+    assert cog.db.upserts == []
+
+
+@pytest.mark.asyncio
+async def test_crawlgames_uses_batch_upsert_for_changed_edges(monkeypatch):
+    class _FakeGraphDB:
+        def __init__(self):
+            self.batch_calls = []
+            self.stub_batches = []
+
+        def get_friends(self, xuid):
+            if xuid == "seed-xuid":
+                return [{"dst_xuid": "friend-xuid", "halo_active": 1}]
+            return []
+
+        def get_player(self, xuid):
+            return {"gamertag": xuid}
+
+        def _get_connection(self):
+            class _Cursor:
+                def execute(self, *_args, **_kwargs):
+                    return None
+
+                def fetchall(self):
+                    return [{"xuid": "seed-xuid"}, {"xuid": "friend-xuid"}]
+
+            class _Conn:
+                def cursor(self):
+                    return _Cursor()
+
+            return _Conn()
+
+        def get_coplay_edges_snapshot(self, _pairs):
+            return {}
+
+        def upsert_coplay_edges_batch(self, edges, suppress_errors=False):
+            self.batch_calls.append((list(edges), suppress_errors))
+            return {"ok": True, "written": len(edges), "failed": 0}
+
+        def insert_or_update_players_stub_batch(self, xuids):
+            normalized = sorted(str(x).strip() for x in xuids if str(x).strip())
+            self.stub_batches.append(normalized)
+            return len(normalized)
+
+        def close(self):
+            return None
+
+    class _FakeStatsDB:
+        def get_all_match_participants(self):
+            return {
+                "m-1": [
+                    {
+                        "xuid": "seed-xuid",
+                        "team_id": "1",
+                        "inferred_team_id": None,
+                        "start_time": "2026-01-01T00:00:00",
+                    },
+                    {
+                        "xuid": "friend-xuid",
+                        "team_id": "1",
+                        "inferred_team_id": None,
+                        "start_time": "2026-01-01T00:00:00",
+                    },
+                ]
+            }
+
+    fake_api_client = SimpleNamespace(stats_cache=SimpleNamespace(db=_FakeStatsDB()))
+
+    async def _resolve_gamertag_to_xuid(_gamertag):
+        return "seed-xuid"
+
+    fake_api_client.resolve_gamertag_to_xuid = _resolve_gamertag_to_xuid
+
+    from src.bot.cogs import graph as graph_module
+
+    monkeypatch.setattr(graph_module, "api_client", fake_api_client)
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+
+    class _InlineCtx:
+        def __init__(self):
+            self.sent = []
+            self.channel = self
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+            return _FakeMessage()
+
+    ctx = _InlineCtx()
+    result = await GraphCog.start_crawl_games.callback(
+        cog,
+        ctx,
+        "SeedTag",
+        "1",
+        run_inline=True,
+    )
+
+    assert "rows written 2" in result
+    assert "changed rows targeted 2" in result
+    assert len(cog.db.batch_calls) == 1
+    batch_rows, suppress_errors = cog.db.batch_calls[0]
+    assert suppress_errors is True
+    assert len(batch_rows) == 2
+    assert {row["src_xuid"] for row in batch_rows} == {"seed-xuid", "friend-xuid"}
+    assert {row["dst_xuid"] for row in batch_rows} == {"seed-xuid", "friend-xuid"}
 
 
 @pytest.mark.asyncio
@@ -990,11 +1575,27 @@ async def test_crawlgames_default_mode_hydrates_seed_history_before_scan(monkeyp
 
     fake_stats_db = _FakeStatsDB()
     fake_api_client = SimpleNamespace(stats_cache=SimpleNamespace(db=fake_stats_db))
+    backfill_calls = []
 
     async def _resolve_gamertag_to_xuid(_gamertag):
         return "seed-xuid"
 
+    async def _fake_backfill_seed_match_participants(seed_xuid, seed_gamertag):
+        backfill_calls.append((seed_xuid, seed_gamertag))
+        return {
+            "ok": True,
+            "verified_matches": 12,
+            "complete_matches_before": 10,
+            "incomplete_matches_before": 2,
+            "attempted_backfills": 2,
+            "successful_backfills": 2,
+            "failed_backfills": 0,
+            "complete_matches_after": 12,
+            "incomplete_matches_after": 0,
+        }
+
     fake_api_client.resolve_gamertag_to_xuid = _resolve_gamertag_to_xuid
+    fake_api_client.backfill_seed_match_participants = _fake_backfill_seed_match_participants
 
     from src.bot.cogs import graph as graph_module
 
@@ -1036,9 +1637,288 @@ async def test_crawlgames_default_mode_hydrates_seed_history_before_scan(monkeyp
     )
 
     assert hydrate_calls == [("seed-xuid", "SeedTag")]
+    assert backfill_calls == [("seed-xuid", "SeedTag")]
     assert "Scoped participants" in result
     assert len(cog.db.upserts) == 2
     assert fake_stats_db.scoped_calls
+
+
+@pytest.mark.asyncio
+async def test_crawlgames_seed_hydration_uses_lifetime_db_first(monkeypatch):
+    captured = {}
+
+    async def _fake_calculate_comprehensive_stats(**kwargs):
+        captured.update(kwargs)
+        return {
+            "error": 0,
+            "processed_matches": [
+                {"all_participants": [{"xuid": "seed-xuid"}]},
+                {"all_participants": []},
+            ],
+        }
+
+    monkeypatch.setattr(
+        graph_module,
+        "api_client",
+        SimpleNamespace(calculate_comprehensive_stats=_fake_calculate_comprehensive_stats),
+    )
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+
+    result = await cog._hydrate_seed_match_history("seed-xuid", "SeedTag")
+
+    assert result["ok"] is True
+    assert result["matches_processed"] == 2
+    assert result["matches_with_participants"] == 1
+    assert captured["xuid"] == "seed-xuid"
+    assert captured["stat_type"] == "overall"
+    assert captured["gamertag"] == "SeedTag"
+    assert captured["matches_to_process"] is None
+    assert captured["force_full_fetch"] is False
+
+
+@pytest.mark.asyncio
+async def test_halonet_seed_hydration_uses_lifetime_db_first(monkeypatch):
+    captured = {}
+
+    async def _fake_calculate_comprehensive_stats(**kwargs):
+        captured.update(kwargs)
+        return {
+            "error": 0,
+            "processed_matches": [
+                {"all_participants": [{"xuid": "seed-xuid"}]},
+            ],
+        }
+
+    monkeypatch.setattr(
+        halonet_module,
+        "api_client",
+        SimpleNamespace(calculate_comprehensive_stats=_fake_calculate_comprehensive_stats),
+    )
+
+    cog = HaloNetCog(bot=object())
+    cog.db.close()
+
+    result = await cog._hydrate_seed_match_history("seed-xuid", "SeedTag")
+
+    assert result["ok"] is True
+    assert result["matches_processed"] == 1
+    assert result["matches_with_participants"] == 1
+    assert captured["xuid"] == "seed-xuid"
+    assert captured["stat_type"] == "overall"
+    assert captured["gamertag"] == "SeedTag"
+    assert captured["matches_to_process"] is None
+    assert captured["force_full_fetch"] is False
+
+
+@pytest.mark.asyncio
+async def test_halonet_seed_rebuild_reads_unbounded_seed_participants(monkeypatch):
+    class _FakeStatsDB:
+        def __init__(self):
+            self.seed_calls = []
+
+        def get_seed_match_participants(self, seed_xuid, limit_matches=None):
+            self.seed_calls.append((seed_xuid, limit_matches))
+            return {}
+
+    class _FakeGraphDB:
+        def __init__(self):
+            self.stub_batches = []
+
+        def insert_or_update_players_stub_batch(self, xuids):
+            self.stub_batches.append(sorted(str(x) for x in xuids))
+            return len(xuids)
+
+        def _get_connection(self):
+            class _Cursor:
+                def execute(self, *_args, **_kwargs):
+                    return None
+
+                def fetchall(self):
+                    return []
+
+            class _Conn:
+                def cursor(self):
+                    return _Cursor()
+
+            return _Conn()
+
+        def close(self):
+            return None
+
+    fake_stats_db = _FakeStatsDB()
+    monkeypatch.setattr(
+        halonet_module,
+        "api_client",
+        SimpleNamespace(stats_cache=SimpleNamespace(db=fake_stats_db)),
+    )
+
+    cog = HaloNetCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+
+    result = await cog._rebuild_seed_coplay_edges_from_stats_cache("seed-xuid")
+
+    assert result["ok"] is True
+    assert fake_stats_db.seed_calls == [("seed-xuid", None)]
+    assert cog.db.stub_batches
+
+
+@pytest.mark.asyncio
+async def test_halonet_auto_heal_runs_backfill_before_rebuild(monkeypatch):
+    cog = HaloNetCog(bot=object())
+    call_order = []
+
+    async def _fake_hydrate(seed_xuid, seed_gamertag):
+        call_order.append("hydrate")
+        return {
+            "ok": True,
+            "matches_processed": 5,
+            "matches_with_participants": 3,
+        }
+
+    async def _fake_backfill(seed_xuid, seed_gamertag, limit_matches=None):
+        call_order.append("backfill")
+        return {
+            "ok": True,
+            "verified_matches": 5,
+            "complete_matches_before": 3,
+            "incomplete_matches_before": 2,
+            "attempted_backfills": 2,
+            "successful_backfills": 2,
+            "failed_backfills": 0,
+            "complete_matches_after": 5,
+            "incomplete_matches_after": 0,
+        }
+
+    async def _fake_rebuild(seed_xuid):
+        call_order.append("rebuild")
+        return {
+            "ok": True,
+            "message": "Seed co-play rebuild complete.",
+            "seed_pairs": 1,
+            "rows_written": 2,
+            "write_failures": 0,
+        }
+
+    monkeypatch.setattr(cog, "_hydrate_seed_match_history", _fake_hydrate)
+    monkeypatch.setattr(cog, "_rebuild_seed_coplay_edges_from_stats_cache", _fake_rebuild)
+    monkeypatch.setattr(
+        halonet_module,
+        "api_client",
+        SimpleNamespace(backfill_seed_match_participants=_fake_backfill),
+    )
+
+    result = await cog._run_halonet_auto_heal("seed-xuid", "Seed")
+
+    assert call_order == ["hydrate", "backfill", "rebuild"]
+    assert result["ok"] is True
+    assert result["backfill"]["complete_matches_after"] == 5
+    assert "Participant coverage 5/5; repaired 2/2." in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_halonet_attempt_cooldown_uses_rebuild_outcome_even_with_backfill_payload(monkeypatch):
+    cog = HaloNetCog(bot=object())
+
+    async def _fake_run(seed_xuid, seed_gamertag):
+        return {
+            "ok": False,
+            "message": "Auto-refresh completed, but no seed co-play pairs were found in persisted match participants.",
+            "backfill": {
+                "ok": True,
+                "verified_matches": 6,
+                "complete_matches_before": 3,
+                "complete_matches_after": 6,
+            },
+        }
+
+    monkeypatch.setattr(cog, "_run_halonet_auto_heal", _fake_run)
+
+    attempt = await cog._attempt_halonet_auto_heal("seed-xuid", "Seed")
+
+    assert attempt["attempted"] is True
+    assert attempt["ok"] is False
+
+    allowed_now, reason_now = cog._is_halonet_repair_allowed("seed-xuid")
+    assert allowed_now is False
+    assert reason_now is not None
+    assert "retry in" in reason_now
+    assert "retry in 23h" not in reason_now
+
+
+@pytest.mark.asyncio
+async def test_graphstats_embed_includes_participant_coverage_field():
+    class _FakeGraphDB:
+        def get_graph_stats(self):
+            return {
+                "total_players": 125,
+                "halo_active_players": 75,
+                "total_friend_edges": 410,
+                "total_coplay_edges": 222,
+                "players_with_stats": 66,
+                "avg_friend_degree": 3.28,
+                "avg_halo_friend_degree": 2.14,
+                "depth_distribution": {0: 1, 1: 14},
+                "db_size_mb": 42.42,
+                "participant_coverage": {
+                    "total_edges": 13,
+                    "complete_edges": 10,
+                    "partial_edges": 3,
+                    "avg_coverage_ratio": 0.875,
+                },
+            }
+
+        def close(self):
+            return None
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+
+    ctx = _FakeCtx()
+    await GraphCog.graph_stats.callback(cog, ctx)
+
+    assert ctx.sent
+    embed = ctx.sent[-1][1]["embed"]
+    coverage_field = next((field for field in embed.fields if field.name == "Participant Coverage"), None)
+
+    assert coverage_field is not None
+    assert coverage_field.value == "**10** complete | **3** partial | Avg: **87.5%**"
+
+
+@pytest.mark.asyncio
+async def test_graphstats_embed_defaults_participant_coverage_when_missing():
+    class _FakeGraphDB:
+        def get_graph_stats(self):
+            return {
+                "total_players": 5,
+                "halo_active_players": 3,
+                "total_friend_edges": 4,
+                "total_coplay_edges": 2,
+                "players_with_stats": 1,
+                "avg_friend_degree": 0.8,
+                "avg_halo_friend_degree": 0.6,
+                "depth_distribution": {},
+                "db_size_mb": 1.23,
+            }
+
+        def close(self):
+            return None
+
+    cog = GraphCog(bot=object())
+    cog.db.close()
+    cog.db = _FakeGraphDB()
+
+    ctx = _FakeCtx()
+    await GraphCog.graph_stats.callback(cog, ctx)
+
+    embed = ctx.sent[-1][1]["embed"]
+    coverage_field = next((field for field in embed.fields if field.name == "Participant Coverage"), None)
+
+    assert coverage_field is not None
+    assert coverage_field.value == "**0** complete | **0** partial | Avg: **0.0%**"
 
 
 @pytest.mark.asyncio
@@ -1163,8 +2043,8 @@ async def test_halonet_falls_back_to_single_match_threshold(monkeypatch):
 
     # First send is loading embed, second is final graph embed+file.
     assert len(ctx.sent) >= 2
-    final_kwargs = ctx.sent[-1][1]
-    assert "embed" in final_kwargs
+    final_kwargs = next((kwargs for _, kwargs in reversed(ctx.sent) if "embed" in kwargs), None)
+    assert final_kwargs is not None
     final_embed = final_kwargs["embed"]
     summary_field = next((f for f in final_embed.fields if f.name == "Summary"), None)
     assert summary_field is not None
@@ -1253,7 +2133,8 @@ async def test_halonet_auto_heals_missing_seed_edges(monkeypatch):
     assert auto_heal_calls["count"] == 1
     assert len(ctx.sent) >= 2
 
-    final_kwargs = ctx.sent[-1][1]
+    final_kwargs = next((kwargs for _, kwargs in reversed(ctx.sent) if "embed" in kwargs), None)
+    assert final_kwargs is not None
     final_embed = final_kwargs["embed"]
     auto_field = next((f for f in final_embed.fields if f.name == "Auto-refresh"), None)
     assert auto_field is not None

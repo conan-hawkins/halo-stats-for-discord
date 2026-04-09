@@ -10,8 +10,11 @@ import discord
 from discord.ext import commands
 
 from src.api import api_client
-from src.bot.cogs.graph_commands.display.halonet.ui import HaloNetFilterView
+from src.bot.cogs.graph_commands.display.halonet.ui import HaloNetFilterView, HaloNetNodeInfoView
 from src.database.graph_schema import get_graph_db
+
+
+HALONET_GAME_TYPE_VALUES = {"all", "ranked", "social", "custom"}
 
 
 class HaloNetCog(commands.Cog, name="HaloNet"):
@@ -25,8 +28,59 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
         self._halonet_repair_cooldown_window = timedelta(hours=24)
         self._halonet_repair_failure_cooldown_window = timedelta(minutes=15)
         self._halonet_repair_timeout_seconds = 300
-        self._halonet_repair_matches_to_process = 300
-        self._halonet_repair_seed_match_limit = 750
+        self._halonet_repair_matches_to_process = None
+        self._halonet_repair_seed_match_limit = None
+
+    @staticmethod
+    def _normalize_game_type_filter(game_type_filter: Optional[str]) -> str:
+        normalized = str(game_type_filter or "all").strip().lower()
+        return normalized if normalized in HALONET_GAME_TYPE_VALUES else "all"
+
+    @staticmethod
+    def _normalize_category_counts(raw_counts: Optional[Dict[str, object]]) -> Dict[str, int]:
+        if not isinstance(raw_counts, dict):
+            raw_counts = {}
+        return {
+            "ranked": int(raw_counts.get("ranked") or 0),
+            "social": int(raw_counts.get("social") or 0),
+            "custom": int(raw_counts.get("custom") or 0),
+            "unknown": int(raw_counts.get("unknown") or 0),
+        }
+
+    def _get_effective_edge_weight(self, edge: Dict[str, object], game_type_filter: Optional[str]) -> int:
+        active_mode = self._normalize_game_type_filter(game_type_filter)
+        if active_mode == "all":
+            return int(edge.get("matches_together") or 0)
+
+        category_counts = self._normalize_category_counts(edge.get("category_counts"))
+        return int(category_counts.get(active_mode) or 0)
+
+    def _get_pair_match_category_counts(self, scope_xuids: List[str]) -> Dict[Tuple[str, str], Dict[str, int]]:
+        stats_db = getattr(getattr(api_client, "stats_cache", None), "db", None)
+        if not stats_db:
+            return {}
+
+        getter = getattr(stats_db, "get_pair_match_category_counts", None)
+        if not callable(getter):
+            return {}
+
+        try:
+            raw_counts = getter(scope_xuids) or {}
+        except Exception:
+            return {}
+
+        normalized_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
+        for key, counts in raw_counts.items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            src_xuid = str(key[0] or "").strip()
+            dst_xuid = str(key[1] or "").strip()
+            if not src_xuid or not dst_xuid or src_xuid == dst_xuid:
+                continue
+            ordered_key = tuple(sorted((src_xuid, dst_xuid)))
+            normalized_counts[ordered_key] = self._normalize_category_counts(counts)
+
+        return normalized_counts
 
     @staticmethod
     def _format_duration_brief(delta: timedelta) -> str:
@@ -123,7 +177,7 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                 stat_type="overall",
                 gamertag=seed_gamertag,
                 matches_to_process=self._halonet_repair_matches_to_process,
-                force_full_fetch=True,
+                force_full_fetch=False,
             )
         except Exception as exc:
             return {"ok": False, "message": f"Stats refresh failed: {exc}"}
@@ -313,6 +367,27 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
 
     async def _run_halonet_auto_heal(self, seed_xuid: str, seed_gamertag: str) -> Dict[str, object]:
         hydrate_result = await self._hydrate_seed_match_history(seed_xuid, seed_gamertag)
+        backfill_result: Optional[Dict[str, object]] = None
+
+        if hydrate_result.get("ok") and hasattr(api_client, "backfill_seed_match_participants"):
+            try:
+                backfill_result = await api_client.backfill_seed_match_participants(
+                    seed_xuid,
+                    seed_gamertag,
+                    limit_matches=self._halonet_repair_seed_match_limit,
+                )
+            except Exception as exc:
+                backfill_result = {
+                    "ok": False,
+                    "message": f"Participant repair failed: {exc}",
+                    "verified_matches": 0,
+                    "complete_matches_before": 0,
+                    "complete_matches_after": 0,
+                    "attempted_backfills": 0,
+                    "successful_backfills": 0,
+                    "failed_backfills": 0,
+                }
+
         rebuild_result = await self._rebuild_seed_coplay_edges_from_stats_cache(seed_xuid)
 
         seed_pairs = int(rebuild_result.get("seed_pairs") or 0)
@@ -332,11 +407,26 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                 f"Auto-refresh wrote {rows_written} co-play rows across {seed_pairs} seed pairs."
             )
 
+        if backfill_result and int(backfill_result.get("verified_matches") or 0) > 0:
+            verified_matches = int(backfill_result.get("verified_matches") or 0)
+            complete_after = int(backfill_result.get("complete_matches_after") or 0)
+            attempted_backfills = int(backfill_result.get("attempted_backfills") or 0)
+            successful_backfills = int(backfill_result.get("successful_backfills") or 0)
+            failed_backfills = int(backfill_result.get("failed_backfills") or 0)
+            coverage_suffix = (
+                f"Participant coverage {complete_after}/{verified_matches}; "
+                f"repaired {successful_backfills}/{attempted_backfills}"
+            )
+            if failed_backfills > 0:
+                coverage_suffix = f"{coverage_suffix}, failed {failed_backfills}"
+            message = f"{message} {coverage_suffix}."
+
         ok = seed_pairs > 0 and write_failures == 0
         return {
             "ok": ok,
             "message": message,
             "hydrate": hydrate_result,
+            "backfill": backfill_result,
             "rebuild": rebuild_result,
         }
 
@@ -487,6 +577,13 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                     "kd_ratio": row.get("kd_ratio"),
                     "win_rate": row.get("win_rate"),
                     "matches_played": row.get("matches_played"),
+                    "matches_together": int(row.get("matches_together") or 0),
+                    "wins_together": int(row.get("wins_together") or 0),
+                    "total_minutes": int(row.get("total_minutes") or 0),
+                    "same_team_count": int(row.get("same_team_count") or 0),
+                    "opposing_team_count": int(row.get("opposing_team_count") or 0),
+                    "first_played": row.get("first_played"),
+                    "last_played": row.get("last_played"),
                 }
 
             all_xuids = list(node_map.keys())
@@ -507,11 +604,23 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                         "matches_together": 0,
                         "wins_together": 0,
                         "total_minutes": 0,
+                        "same_team_count": 0,
+                        "opposing_team_count": 0,
+                        "first_played": None,
+                        "last_played": None,
                     },
                 )
                 bucket["matches_together"] += int(edge.get("matches_together") or 0)
                 bucket["wins_together"] += int(edge.get("wins_together") or 0)
                 bucket["total_minutes"] += int(edge.get("total_minutes") or 0)
+                bucket["same_team_count"] += int(edge.get("same_team_count") or 0)
+                bucket["opposing_team_count"] += int(edge.get("opposing_team_count") or 0)
+                first_played = edge.get("first_played")
+                last_played = edge.get("last_played")
+                if first_played and (bucket["first_played"] is None or first_played < bucket["first_played"]):
+                    bucket["first_played"] = first_played
+                if last_played and (bucket["last_played"] is None or last_played > bucket["last_played"]):
+                    bucket["last_played"] = last_played
 
             if not aggregated_edges:
                 for row in neighbors:
@@ -525,6 +634,10 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                         "matches_together": int(row.get("matches_together") or 0),
                         "wins_together": int(row.get("wins_together") or 0),
                         "total_minutes": int(row.get("total_minutes") or 0),
+                        "same_team_count": int(row.get("same_team_count") or 0),
+                        "opposing_team_count": int(row.get("opposing_team_count") or 0),
+                        "first_played": row.get("first_played"),
+                        "last_played": row.get("last_played"),
                     }
 
             edges = [
@@ -532,6 +645,16 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                 for edge in aggregated_edges.values()
                 if int(edge.get("matches_together") or 0) >= active_min_matches
             ]
+
+            pair_category_counts = self._get_pair_match_category_counts(all_xuids)
+            for edge in edges:
+                src = str(edge.get("src_xuid") or "").strip()
+                dst = str(edge.get("dst_xuid") or "").strip()
+                if not src or not dst or src == dst:
+                    edge["category_counts"] = self._normalize_category_counts(None)
+                    continue
+                key = tuple(sorted((src, dst)))
+                edge["category_counts"] = self._normalize_category_counts(pair_category_counts.get(key))
 
             if not edges:
                 await loading_msg.delete()
@@ -599,6 +722,23 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                     lines.append(f"**{partner_name}**: {matches_together} shared matches ({same_team} same-team)")
                 embed.add_field(name="Top Co-play Partners", value="\n".join(lines), inline=False)
 
+            weighted_degree_map: Dict[str, float] = defaultdict(float)
+            partner_sets: Dict[str, Set[str]] = defaultdict(set)
+            for edge in edges:
+                src = str(edge.get("src_xuid") or "").strip()
+                dst = str(edge.get("dst_xuid") or "").strip()
+                if not src or not dst or src == dst:
+                    continue
+                matches_together = float(self._get_effective_edge_weight(edge, "all"))
+                weighted_degree_map[src] += matches_together
+                weighted_degree_map[dst] += matches_together
+                partner_sets[src].add(dst)
+                partner_sets[dst].add(src)
+
+            for node_xuid, data in node_map.items():
+                data["weighted_degree"] = float(weighted_degree_map.get(node_xuid, 0.0))
+                data["coplay_partner_count"] = len(partner_sets.get(node_xuid, set()))
+
             await loading_msg.delete()
 
             loop = asyncio.get_event_loop()
@@ -628,9 +768,14 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
             filter_view._sync_select_defaults()
             embed.description = filter_view._build_description(controls_active=True)
             embed.set_image(url="attachment://halonet.png")
-            embed.set_footer(text=f"XUID: {xuid} | Gold=center | Edge width/color=shared matches | Node size=weighted degree")
+            embed.set_footer(text=f"XUID: {xuid} | Gold=center | Edge width/color=shared matches | Node color=weighted degree")
             graph_message = await ctx.send(embed=embed, file=file, view=filter_view)
             filter_view.message = graph_message
+
+            if len(node_map) > 1:
+                node_info_view = HaloNetNodeInfoView(node_map=node_map, edges=edges, requester_id=requester_id)
+                node_info_message = await ctx.send(node_info_view.build_status_text(), view=node_info_view)
+                node_info_view.message = node_info_message
 
         except Exception as e:
             try:
@@ -649,6 +794,7 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
         clustered: bool = False,
         min_node_strength: int = 0,
         min_edge_weight: int = 1,
+        game_type_filter: str = "all",
     ) -> io.BytesIO:
         """Render a weighted co-play graph as a PNG and return a BytesIO buffer."""
         import matplotlib
@@ -675,11 +821,12 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
                 is_center=bool(data.get("is_center")),
             )
 
+        active_game_type = self._normalize_game_type_filter(game_type_filter)
         active_min_edge_weight = max(1, int(min_edge_weight or 1))
         for edge in edges:
             src = edge.get("src_xuid")
             dst = edge.get("dst_xuid")
-            matches = int(edge.get("matches_together") or 0)
+            matches = self._get_effective_edge_weight(edge, active_game_type)
             if not src or not dst or src == dst or matches < active_min_edge_weight:
                 continue
             if not G.has_node(src) or not G.has_node(dst):
@@ -808,7 +955,7 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
             else:
                 strength = weighted_degree.get(node, 0.0)
                 node_colors.append(node_cmap(node_norm(strength)))
-                node_sizes.append(180 + 22 * strength)
+                node_sizes.append(280)
 
         edge_colors = []
         edge_widths = []
@@ -856,7 +1003,7 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
         node_sm = cm.ScalarMappable(cmap=node_cmap, norm=node_norm)
         node_sm.set_array([])
         node_cbar = fig.colorbar(node_sm, cax=node_cax, orientation="horizontal")
-        node_cbar.set_label("Node Weighted Degree (Blues: low -> high)", color="white", fontsize=8)
+        node_cbar.set_label("Node Weighted Degree (color only, Blues: low -> high)", color="white", fontsize=8)
         node_cbar.ax.xaxis.set_tick_params(color="white", labelsize=7)
         plt.setp(node_cbar.ax.xaxis.get_ticklabels(), color="white")
         node_cbar.outline.set_edgecolor("white")
@@ -864,7 +1011,8 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
         edge_sm = cm.ScalarMappable(cmap=edge_cmap, norm=edge_norm)
         edge_sm.set_array([])
         edge_cbar = fig.colorbar(edge_sm, cax=edge_cax, orientation="horizontal")
-        edge_cbar.set_label("Shared Matches per Edge (Greens: low -> high)", color="white", fontsize=9)
+        edge_label_prefix = "Shared Matches" if active_game_type == "all" else f"{active_game_type.title()} Matches"
+        edge_cbar.set_label(f"{edge_label_prefix} per Edge (Greens: low -> high)", color="white", fontsize=9)
         edge_cbar.ax.xaxis.set_tick_params(color="white", labelsize=7)
         plt.setp(edge_cbar.ax.xaxis.get_ticklabels(), color="white")
         edge_cbar.outline.set_edgecolor("white")
@@ -872,12 +1020,12 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
         legend_handles = [
             Line2D([0], [0], marker="o", color="none", label="Center Player", markerfacecolor="#FFD700",
                    markeredgecolor="white", markeredgewidth=1.0, markersize=9),
+             Line2D([0], [0], marker="o", color="none", label="Lower Weighted Degree", markerfacecolor=node_cmap(0.2),
+                 markeredgecolor="white", markeredgewidth=0.6, markersize=7),
+             Line2D([0], [0], marker="o", color="none", label="Higher Weighted Degree", markerfacecolor=node_cmap(0.85),
+                 markeredgecolor="white", markeredgewidth=0.6, markersize=7),
             Line2D([0], [0], color=edge_cmap(0.25), linewidth=1.2, label="Weaker Link Strength"),
             Line2D([0], [0], color=edge_cmap(0.85), linewidth=2.6, label="Stronger Link Strength"),
-            Line2D([0], [0], marker="o", color="none", label="Smaller Node (Lower Weighted Degree)", markerfacecolor="#cccccc",
-                   markeredgecolor="white", markeredgewidth=0.6, markersize=5),
-            Line2D([0], [0], marker="o", color="none", label="Larger Node (Higher Weighted Degree)", markerfacecolor="#cccccc",
-                   markeredgecolor="white", markeredgewidth=0.6, markersize=10),
         ]
         legend = ax.legend(
             handles=legend_handles,
@@ -896,6 +1044,8 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
         )
         if min_node_strength > 0 or active_min_edge_weight > 1:
             title += f"  |  Filter N>={int(min_node_strength)}, E>={int(active_min_edge_weight)}"
+        if active_game_type != "all":
+            title += f"  |  Game Type: {active_game_type.title()}"
         if clustered:
             title += "  |  Layout: Clustered"
         fig.text(0.5, 0.015, title, color="white", fontsize=12, ha="center", va="bottom")

@@ -132,6 +132,19 @@ Running `pytest` generates:
 | `#crawlstop` | Stop the current crawl |
 | `#graphstats` | Show graph database statistics |
 
+### Graph CLI Migration
+
+`run_graph_crawler.py` has been removed in favor of Discord-first graph workflows.
+
+Use these Discord replacements:
+
+- `#crawlfriends <gamertag> [depth]` instead of CLI seed/resume crawl workflows
+- `#crawlgames <gamertag> [depth] [--global]` for co-play edge backfill
+- `#graphstats` for graph health and totals
+- `#crawlstop` to cancel active background crawl jobs
+
+If you still depend on CLI-only maintenance operations (CSV export, missing-stats backfill), add equivalent admin Discord commands.
+
 ## Match Categories
 
 Matches now store category metadata in the stats DB:

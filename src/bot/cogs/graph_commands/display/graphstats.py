@@ -40,6 +40,19 @@ class GraphStatsCommandMixin:
             inline=True,
         )
 
+        participant_coverage = stats.get("participant_coverage") or {}
+        complete_edges = int(participant_coverage.get("complete_edges") or 0)
+        partial_edges = int(participant_coverage.get("partial_edges") or 0)
+        avg_coverage_ratio = float(participant_coverage.get("avg_coverage_ratio") or 0.0)
+        embed.add_field(
+            name="Participant Coverage",
+            value=(
+                f"**{complete_edges:,}** complete | **{partial_edges:,}** partial | "
+                f"Avg: **{(avg_coverage_ratio * 100.0):.1f}%**"
+            ),
+            inline=True,
+        )
+
         embed.add_field(
             name="Graph Metrics",
             value=(

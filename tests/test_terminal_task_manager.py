@@ -80,3 +80,33 @@ async def test_task_manager_cancel_all_respects_role_scope():
 
     await manager.mark_cancelled(user_task_id)
     await manager.mark_cancelled(other_task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_manager_progress_completion_status_removes_task_from_running():
+    manager = TerminalTaskManager()
+
+    task = asyncio.create_task(asyncio.sleep(5))
+    task_id = await manager.register_task("BUILD CO-PLAY EDGES", 11, "Crawler", task)
+
+    await manager.update_progress(
+        task_id,
+        stage="Finalizing",
+        percent=100.0,
+        detail="Co-play crawl complete",
+        status="completed",
+    )
+
+    tasks = await manager.list_tasks(requester_id=11, is_admin=True)
+    row = next(item for item in tasks if item.task_id == task_id)
+    assert row.status == "completed"
+    assert row.stage == "Completed"
+    assert row.progress_percent == pytest.approx(100.0)
+    assert row.detail == "Co-play crawl complete"
+
+    running = await manager.list_running_tasks(requester_id=11, is_admin=True)
+    assert all(item.task_id != task_id for item in running)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

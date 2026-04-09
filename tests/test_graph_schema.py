@@ -45,6 +45,143 @@ def test_upsert_coplay_edge_rejects_empty_xuid(tmp_path):
     db.close()
 
 
+def test_get_coplay_edges_snapshot_returns_normalized_rows(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    db.insert_or_update_player("x1", gamertag="Alpha")
+    db.insert_or_update_player("x2", gamertag="Bravo")
+
+    assert db.upsert_coplay_edge(
+        src_xuid="x1",
+        dst_xuid="x2",
+        matches_together=3,
+        wins_together=1,
+        first_played="2026-01-01T00:00:00",
+        last_played="2026-01-02T00:00:00",
+        same_team_count=2,
+        opposing_team_count=1,
+        source_type="participants-runtime",
+        is_inferred=True,
+        is_partial=False,
+        coverage_ratio=1.2,
+        is_halo_active_pair=True,
+    )
+
+    snapshots = db.get_coplay_edges_snapshot(
+        [("x1", "x2"), ("x1", "x2"), ("", "x2"), ("missing", "x9")],
+        chunk_size=1,
+    )
+
+    assert len(snapshots) == 1
+    row = snapshots[("x1", "x2")]
+    assert row["matches_together"] == 3
+    assert row["wins_together"] == 1
+    assert row["same_team_count"] == 2
+    assert row["opposing_team_count"] == 1
+    assert row["source_type"] == "participants-runtime"
+    assert row["is_inferred"] == 1
+    assert row["is_partial"] == 0
+    assert row["coverage_ratio"] == 1.0
+    assert row["is_halo_active_pair"] == 1
+
+    db.close()
+
+
+def test_upsert_coplay_edges_batch_writes_and_overwrites(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    db.insert_or_update_player("x1", gamertag="Alpha")
+    db.insert_or_update_player("x2", gamertag="Bravo")
+
+    first = db.upsert_coplay_edges_batch(
+        [
+            {
+                "src_xuid": "x1",
+                "dst_xuid": "x2",
+                "matches_together": 2,
+                "wins_together": 1,
+                "first_played": "2026-01-01T00:00:00",
+                "last_played": "2026-01-01T00:00:00",
+                "same_team_count": 2,
+                "opposing_team_count": 0,
+                "source_type": "participants-runtime",
+                "coverage_ratio": 0.75,
+            }
+        ]
+    )
+    assert first == {"ok": True, "written": 1, "failed": 0}
+
+    second = db.upsert_coplay_edges_batch(
+        [
+            {
+                "src_xuid": "x1",
+                "dst_xuid": "x2",
+                "matches_together": 5,
+                "wins_together": 2,
+                "first_played": "2026-01-01T00:00:00",
+                "last_played": "2026-01-03T00:00:00",
+                "same_team_count": 3,
+                "opposing_team_count": 2,
+                "source_type": "participants-runtime",
+                "is_partial": True,
+                "coverage_ratio": 2.0,
+            }
+        ]
+    )
+    assert second == {"ok": True, "written": 1, "failed": 0}
+
+    snapshots = db.get_coplay_edges_snapshot([("x1", "x2")])
+    row = snapshots[("x1", "x2")]
+    assert row["matches_together"] == 5
+    assert row["wins_together"] == 2
+    assert row["same_team_count"] == 3
+    assert row["opposing_team_count"] == 2
+    assert row["is_partial"] == 1
+    assert row["coverage_ratio"] == 1.0
+
+    db.close()
+
+
+def test_upsert_coplay_edges_batch_fk_violation_rolls_back(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+    db.insert_or_update_player("x1", gamertag="Alpha")
+    db.insert_or_update_player("x2", gamertag="Bravo")
+
+    assert db.upsert_coplay_edge(src_xuid="x1", dst_xuid="x2", matches_together=1)
+
+    conn = db._get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) AS row_count FROM graph_coplay")
+    row_count_before = cursor.fetchone()["row_count"]
+
+    result = db.upsert_coplay_edges_batch(
+        [
+            {
+                "src_xuid": "x2",
+                "dst_xuid": "x1",
+                "matches_together": 2,
+            },
+            {
+                "src_xuid": "x1",
+                "dst_xuid": "missing-xuid",
+                "matches_together": 2,
+            },
+        ],
+        suppress_errors=True,
+    )
+
+    assert result["ok"] is False
+    assert result["written"] == 0
+    assert result["failed"] == 2
+
+    cursor.execute("SELECT COUNT(*) AS row_count FROM graph_coplay")
+    row_count_after = cursor.fetchone()["row_count"]
+    assert row_count_after == row_count_before
+
+    reverse_snapshot = db.get_coplay_edges_snapshot([("x2", "x1")])
+    assert reverse_snapshot == {}
+
+    db.close()
+
+
 def test_friend_edges_and_counts(tmp_path):
     db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
     db.insert_or_update_player("x1", gamertag="Alpha")
@@ -419,3 +556,84 @@ def test_coplay_backfill_rerun_idempotency(tmp_path, monkeypatch):
 
     stats_db.close()
     graph_db.close()
+
+
+def test_get_coplay_participant_coverage_summary_filters_sources_and_uses_defaults(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+
+    for xuid in ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"]:
+        db.insert_or_update_player(xuid)
+
+    assert db.upsert_coplay_edge(
+        src_xuid="x1",
+        dst_xuid="x2",
+        matches_together=5,
+        source_type="participants",
+        is_partial=False,
+        coverage_ratio=1.0,
+    )
+    assert db.upsert_coplay_edge(
+        src_xuid="x3",
+        dst_xuid="x4",
+        matches_together=4,
+        source_type="participants-runtime",
+        is_partial=True,
+        coverage_ratio=0.5,
+    )
+    assert db.upsert_coplay_edge(
+        src_xuid="x5",
+        dst_xuid="x6",
+        matches_together=3,
+        source_type="participants",
+        is_partial=False,
+        coverage_ratio=1.0,
+    )
+    assert db.upsert_coplay_edge(
+        src_xuid="x7",
+        dst_xuid="x8",
+        matches_together=2,
+        source_type="legacy",
+        is_partial=True,
+        coverage_ratio=0.2,
+    )
+
+    conn = db._get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE graph_coplay
+        SET coverage_ratio = NULL
+        WHERE src_xuid = ? AND dst_xuid = ?
+        """,
+        ("x5", "x6"),
+    )
+    conn.commit()
+
+    summary = db.get_coplay_participant_coverage_summary()
+
+    assert summary["total_edges"] == 3
+    assert summary["complete_edges"] == 2
+    assert summary["partial_edges"] == 1
+    assert abs(float(summary["avg_coverage_ratio"]) - ((1.0 + 0.5 + 1.0) / 3.0)) < 1e-9
+
+    db.close()
+
+
+def test_get_coplay_participant_coverage_summary_empty_returns_zeros(tmp_path):
+    db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
+
+    summary = db.get_coplay_participant_coverage_summary()
+    stats = db.get_graph_stats()
+
+    assert summary == {
+        "total_edges": 0,
+        "complete_edges": 0,
+        "partial_edges": 0,
+        "avg_coverage_ratio": 0.0,
+    }
+    assert stats["participant_coverage"]["total_edges"] == 0
+    assert stats["participant_coverage"]["complete_edges"] == 0
+    assert stats["participant_coverage"]["partial_edges"] == 0
+    assert stats["participant_coverage"]["avg_coverage_ratio"] == 0.0
+
+    db.close()

@@ -572,6 +572,114 @@ class HaloStatsDBv2:
 
         return grouped
 
+    def get_pair_match_category_counts(self, scope_xuids: List[str]) -> Dict[Tuple[str, str], Dict[str, int]]:
+        """Get per-pair match-category counts for players inside a supplied scope set."""
+        normalized_scope: List[str] = []
+        seen_scope = set()
+        for raw_xuid in scope_xuids or []:
+            normalized_xuid = str(raw_xuid or "").strip()
+            if not normalized_xuid or normalized_xuid in seen_scope:
+                continue
+            seen_scope.add(normalized_xuid)
+            normalized_scope.append(normalized_xuid)
+
+        if len(normalized_scope) < 2:
+            return {}
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS temp_pair_scope_xuids (
+                xuid TEXT PRIMARY KEY
+            )
+            """
+        )
+        cursor.execute("DELETE FROM temp_pair_scope_xuids")
+
+        try:
+            ranked_playlist_ids = (
+                "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b",
+                "edfef3ac-9cbe-4fa2-b949-8f29deafd483",
+            )
+            ranked_playlist_sql = ", ".join(f"'{playlist_id}'" for playlist_id in ranked_playlist_ids)
+
+            ranked_expr = (
+                "(raw_match_category = 'ranked' "
+                f"OR (raw_match_category = 'unknown' AND playlist_id_lower IN ({ranked_playlist_sql})))"
+            )
+            custom_expr = (
+                "(raw_match_category = 'custom' "
+                "OR (raw_match_category = 'unknown' AND "
+                "(playlist_id_lower = '' OR playlist_id_lower LIKE '%custom%')))"
+            )
+            social_expr = (
+                "(raw_match_category = 'social' "
+                "OR (raw_match_category = 'unknown' AND playlist_id_lower <> '' "
+                f"AND playlist_id_lower NOT IN ({ranked_playlist_sql}) "
+                "AND playlist_id_lower NOT LIKE '%custom%'))"
+            )
+
+            cursor.executemany(
+                "INSERT OR IGNORE INTO temp_pair_scope_xuids (xuid) VALUES (?)",
+                [(xuid,) for xuid in normalized_scope],
+            )
+
+            cursor.execute(
+                f"""
+                WITH scope_matches AS (
+                    SELECT DISTINCT mp.match_id
+                    FROM match_participants mp
+                    JOIN temp_pair_scope_xuids scope ON scope.xuid = mp.xuid
+                ),
+                scoped_participants AS (
+                    SELECT DISTINCT mp.match_id, mp.xuid
+                    FROM match_participants mp
+                    JOIN scope_matches sm ON sm.match_id = mp.match_id
+                    JOIN temp_pair_scope_xuids scope ON scope.xuid = mp.xuid
+                ),
+                pair_rows AS (
+                    SELECT
+                        CASE WHEN sp1.xuid < sp2.xuid THEN sp1.xuid ELSE sp2.xuid END AS src_xuid,
+                        CASE WHEN sp1.xuid < sp2.xuid THEN sp2.xuid ELSE sp1.xuid END AS dst_xuid,
+                        LOWER(COALESCE(m.match_category, 'unknown')) AS raw_match_category,
+                        LOWER(COALESCE(m.playlist_id, '')) AS playlist_id_lower
+                    FROM scoped_participants sp1
+                    JOIN scoped_participants sp2
+                      ON sp1.match_id = sp2.match_id
+                     AND sp1.xuid < sp2.xuid
+                    LEFT JOIN matches m ON m.match_id = sp1.match_id
+                )
+                SELECT
+                    src_xuid,
+                    dst_xuid,
+                    SUM(CASE WHEN {ranked_expr} THEN 1 ELSE 0 END) AS ranked_count,
+                    SUM(CASE WHEN {social_expr} THEN 1 ELSE 0 END) AS social_count,
+                    SUM(CASE WHEN {custom_expr} THEN 1 ELSE 0 END) AS custom_count,
+                    SUM(CASE WHEN NOT ({ranked_expr} OR {social_expr} OR {custom_expr}) THEN 1 ELSE 0 END) AS unknown_count
+                FROM pair_rows
+                GROUP BY src_xuid, dst_xuid
+                """
+            )
+
+            pair_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
+            for row in cursor.fetchall():
+                src_xuid = str(row['src_xuid'] or '').strip()
+                dst_xuid = str(row['dst_xuid'] or '').strip()
+                if not src_xuid or not dst_xuid or src_xuid == dst_xuid:
+                    continue
+                pair_counts[(src_xuid, dst_xuid)] = {
+                    'ranked': int(row['ranked_count'] or 0),
+                    'social': int(row['social_count'] or 0),
+                    'custom': int(row['custom_count'] or 0),
+                    'unknown': int(row['unknown_count'] or 0),
+                }
+
+            return pair_counts
+        finally:
+            cursor.execute("DELETE FROM temp_pair_scope_xuids")
+
     def get_seed_match_participants(self, seed_xuid: str, limit_matches: Optional[int] = None) -> Dict[str, List[Dict]]:
         """Get full match rosters for matches where the seed player participated."""
         normalized_seed = str(seed_xuid or '').strip()
@@ -625,6 +733,97 @@ class HaloStatsDBv2:
             grouped.setdefault(row_dict['match_id'], []).append(row_dict)
 
         return grouped
+
+    def get_seed_verified_match_ids(self, seed_xuid: str, limit_matches: Optional[int] = None) -> List[str]:
+        """Get match IDs from verified seed history in player_match/matches."""
+        normalized_seed = str(seed_xuid or '').strip()
+        if not normalized_seed:
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        limit_clause = ""
+        params: List[object] = [normalized_seed]
+        if limit_matches is not None and int(limit_matches) > 0:
+            limit_clause = "LIMIT ?"
+            params.append(int(limit_matches))
+
+        cursor.execute(
+            f"""
+            SELECT m.match_id
+            FROM player_match pm
+            JOIN matches m ON m.match_id = pm.match_id
+            WHERE pm.xuid = ?
+            ORDER BY COALESCE(m.start_time, '') DESC, m.match_id ASC
+            {limit_clause}
+            """,
+            params,
+        )
+
+        return [str(row['match_id']) for row in cursor.fetchall() if row['match_id']]
+
+    def get_participant_coverage_for_matches(self, match_ids: List[str], seed_xuid: str) -> Dict[str, Dict[str, object]]:
+        """Get participant count and seed presence for each supplied match ID."""
+        normalized_seed = str(seed_xuid or '').strip()
+        if not normalized_seed:
+            return {}
+
+        normalized_match_ids: List[str] = []
+        seen_match_ids = set()
+        for match_id in match_ids or []:
+            normalized_match_id = str(match_id or '').strip()
+            if not normalized_match_id or normalized_match_id in seen_match_ids:
+                continue
+            seen_match_ids.add(normalized_match_id)
+            normalized_match_ids.append(normalized_match_id)
+
+        if not normalized_match_ids:
+            return {}
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Use a temp table instead of a massive IN(...) list to avoid SQL variable limits.
+        cursor.execute(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS temp_match_scope (
+                match_id TEXT PRIMARY KEY
+            )
+            """
+        )
+        cursor.execute("DELETE FROM temp_match_scope")
+
+        try:
+            cursor.executemany(
+                "INSERT OR IGNORE INTO temp_match_scope (match_id) VALUES (?)",
+                [(match_id,) for match_id in normalized_match_ids],
+            )
+
+            cursor.execute(
+                """
+                SELECT
+                    scope.match_id,
+                    COUNT(mp.xuid) AS participant_count,
+                    MAX(CASE WHEN mp.xuid = ? THEN 1 ELSE 0 END) AS seed_present
+                FROM temp_match_scope scope
+                LEFT JOIN match_participants mp ON mp.match_id = scope.match_id
+                GROUP BY scope.match_id
+                ORDER BY scope.match_id
+                """,
+                (normalized_seed,),
+            )
+
+            coverage: Dict[str, Dict[str, object]] = {}
+            for row in cursor.fetchall():
+                match_id = str(row['match_id'])
+                coverage[match_id] = {
+                    'participant_count': int(row['participant_count'] or 0),
+                    'seed_present': bool(row['seed_present'] or 0),
+                }
+            return coverage
+        finally:
+            cursor.execute("DELETE FROM temp_match_scope")
 
     def get_all_match_participants(self, limit_matches: Optional[int] = None) -> Dict[str, List[Dict]]:
         """Get participants for all matches, optionally limited by newest match start_time."""

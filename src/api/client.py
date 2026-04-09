@@ -55,6 +55,10 @@ from src.api.utils import (
     safe_write_json,
     is_token_valid,
 )
+from src.api.history_sync import (
+    build_boundary_probe_plan,
+    decide_full_history_sync,
+)
 from src.api.xuid_cache import (
     _normalize_gamertag_alias_key,
     _normalize_gamertag_for_lookup,
@@ -94,6 +98,30 @@ class HaloAPIClient:
     RANKED_PLAYLIST_IDS = {
         "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b",  # Ranked Arena
         "edfef3ac-9cbe-4fa2-b949-8f29deafd483",  # Ranked Slayer
+    }
+    EXPLICIT_CUSTOM_FLAG_KEYS = {
+        "iscustom",
+        "iscustommatch",
+        "customgame",
+        "custommatch",
+    }
+    CUSTOM_MATCH_TEXT_HINTS = {
+        "custom",
+        "customgame",
+        "custom game",
+        "forge",
+        "ugc",
+        "private match",
+        "private_match",
+    }
+    CUSTOM_GAME_VARIANT_CATEGORIES = {6}
+    CUSTOM_LIFECYCLE_MODES = {1}
+    SOCIAL_MATCH_TEXT_HINTS = {
+        "social",
+        "quick play",
+        "quickplay",
+        "matchmade",
+        "matchmaking",
     }
     
     def __init__(self):
@@ -1203,7 +1231,8 @@ class HaloAPIClient:
         self,
         gamertag: str,
         stat_type: str = "overall",
-        matches_to_process: int = 10
+        matches_to_process: int = 10,
+        force_full_fetch: bool = False,
     ) -> Dict:
         """
         Get comprehensive player statistics from Halo API.
@@ -1212,6 +1241,7 @@ class HaloAPIClient:
             gamertag: Player's Xbox gamertag
             stat_type: Type of stats ("overall", "ranked", "social")
             matches_to_process: Number of matches to analyze
+            force_full_fetch: If True, bypass cache and fetch full history from API
         
         Returns:
             Dictionary containing stats or error information
@@ -1266,7 +1296,8 @@ class HaloAPIClient:
             # Calculate stats from match history with caching
             stats_result = await self.calculate_comprehensive_stats(
                 xuid, stat_type, gamertag=gamertag,
-                matches_to_process=matches_to_process
+                matches_to_process=matches_to_process,
+                force_full_fetch=force_full_fetch,
             )
             
             if stats_result.get('error') == 0:
@@ -1378,6 +1409,176 @@ class HaloAPIClient:
         except Exception as e:
             print(f"Error saving cache: {e}")
             traceback.print_exc()
+
+    async def backfill_seed_match_participants(
+        self,
+        seed_xuid: str,
+        seed_gamertag: str = None,
+        limit_matches: int = None,
+        min_participants: int = 2,
+    ) -> Dict:
+        """Repair missing participant rosters for verified seed matches."""
+        normalized_seed = str(seed_xuid or "").strip()
+        result = {
+            'ok': False,
+            'verified_matches': 0,
+            'complete_matches_before': 0,
+            'incomplete_matches_before': 0,
+            'attempted_backfills': 0,
+            'successful_backfills': 0,
+            'failed_backfills': 0,
+            'complete_matches_after': 0,
+            'incomplete_matches_after': 0,
+            'failed_match_ids': [],
+            'message': '',
+        }
+
+        if not normalized_seed:
+            result['message'] = "Seed XUID is required for participant backfill."
+            return result
+
+        stats_cache = getattr(self, 'stats_cache', None)
+        stats_db = getattr(stats_cache, 'db', None)
+        if not stats_db:
+            result['message'] = "Participant database is unavailable."
+            return result
+
+        def get_verified_seed_match_ids() -> List[str]:
+            if stats_cache and hasattr(stats_cache, 'get_seed_verified_match_ids'):
+                return stats_cache.get_seed_verified_match_ids(normalized_seed, limit_matches=limit_matches) or []
+            if hasattr(stats_db, 'get_seed_verified_match_ids'):
+                return stats_db.get_seed_verified_match_ids(normalized_seed, limit_matches=limit_matches) or []
+            return []
+
+        def get_participant_coverage(match_ids: List[str]) -> Dict[str, Dict]:
+            if not match_ids:
+                return {}
+            if stats_cache and hasattr(stats_cache, 'get_participant_coverage_for_matches'):
+                return stats_cache.get_participant_coverage_for_matches(match_ids, normalized_seed) or {}
+            if hasattr(stats_db, 'get_participant_coverage_for_matches'):
+                return stats_db.get_participant_coverage_for_matches(match_ids, normalized_seed) or {}
+            return {}
+
+        try:
+            verified_match_ids = get_verified_seed_match_ids()
+            result['verified_matches'] = len(verified_match_ids)
+            if not verified_match_ids:
+                result['ok'] = True
+                result['message'] = "No verified seed matches found for participant backfill."
+                return result
+
+            min_required_participants = max(2, int(min_participants or 2))
+            coverage_before = get_participant_coverage(verified_match_ids)
+
+            incomplete_match_ids: List[str] = []
+            complete_before = 0
+            for match_id in verified_match_ids:
+                coverage_row = coverage_before.get(match_id) or {}
+                participant_count = int(coverage_row.get('participant_count') or 0)
+                seed_present = bool(coverage_row.get('seed_present'))
+                if seed_present and participant_count >= min_required_participants:
+                    complete_before += 1
+                else:
+                    incomplete_match_ids.append(match_id)
+
+            result['complete_matches_before'] = complete_before
+            result['incomplete_matches_before'] = len(incomplete_match_ids)
+            result['attempted_backfills'] = len(incomplete_match_ids)
+
+            if not incomplete_match_ids:
+                result['ok'] = True
+                result['complete_matches_after'] = complete_before
+                result['incomplete_matches_after'] = 0
+                result['message'] = "Seed participant coverage already complete."
+                return result
+
+            connector = aiohttp.TCPConnector(
+                limit=30,
+                limit_per_host=20,
+                ttl_dns_cache=300,
+                force_close=False,
+                enable_cleanup_closed=True,
+            )
+            timeout = aiohttp.ClientTimeout(total=180, connect=30, sock_connect=30, sock_read=120)
+
+            successful_backfills = 0
+            failed_match_ids: List[str] = []
+
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                num_accounts = len(self.spartan_accounts) if self.spartan_accounts else 1
+                max_in_flight = min(max(5, num_accounts * 4), 20)
+
+                async def fetch_match_detail(match_id: str):
+                    match_data = await self.get_match_stats_for_match(match_id, normalized_seed, session)
+                    return match_id, match_data
+
+                pending = set()
+                match_iter = iter(incomplete_match_ids)
+
+                for _ in range(min(max_in_flight, len(incomplete_match_ids))):
+                    try:
+                        match_id = next(match_iter)
+                    except StopIteration:
+                        break
+                    pending.add(asyncio.create_task(fetch_match_detail(match_id)))
+
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        try:
+                            match_id, match_data = task.result()
+                        except Exception:
+                            failed_match_ids.append('unknown')
+                            continue
+
+                        participants = (match_data or {}).get('all_participants') or []
+                        if not match_data or not participants:
+                            failed_match_ids.append(match_id)
+                        else:
+                            wrote_match = bool(stats_db.insert_match(match_data))
+                            wrote_participants = bool(stats_db.insert_match_participants(match_id, participants))
+                            if wrote_match and wrote_participants:
+                                successful_backfills += 1
+                            else:
+                                failed_match_ids.append(match_id)
+
+                        try:
+                            next_match_id = next(match_iter)
+                        except StopIteration:
+                            continue
+                        pending.add(asyncio.create_task(fetch_match_detail(next_match_id)))
+
+            coverage_after = get_participant_coverage(verified_match_ids)
+            complete_after = 0
+            for match_id in verified_match_ids:
+                coverage_row = coverage_after.get(match_id) or {}
+                participant_count = int(coverage_row.get('participant_count') or 0)
+                seed_present = bool(coverage_row.get('seed_present'))
+                if seed_present and participant_count >= min_required_participants:
+                    complete_after += 1
+
+            result['ok'] = True
+            result['successful_backfills'] = successful_backfills
+            result['failed_backfills'] = len(failed_match_ids)
+            result['failed_match_ids'] = failed_match_ids[:50]
+            result['complete_matches_after'] = complete_after
+            result['incomplete_matches_after'] = max(0, len(verified_match_ids) - complete_after)
+
+            if failed_match_ids:
+                result['message'] = (
+                    f"Backfilled {successful_backfills}/{len(incomplete_match_ids)} incomplete seed matches "
+                    f"for {seed_gamertag or normalized_seed}; {len(failed_match_ids)} failed."
+                )
+            else:
+                result['message'] = (
+                    f"Backfilled all {len(incomplete_match_ids)} incomplete seed matches "
+                    f"for {seed_gamertag or normalized_seed}."
+                )
+            return result
+
+        except Exception as exc:
+            result['message'] = f"Seed participant backfill failed: {exc}"
+            return result
     
     def _calculate_stats_from_matches(self, matches: List[Dict], stat_type: str) -> Dict:
         """
@@ -1471,6 +1672,64 @@ class HaloAPIClient:
         walk(player_payload)
         return csr_value, tier_value
 
+    @staticmethod
+    def _coerce_boolish(value: object) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y"}:
+                return True
+            if normalized in {"false", "0", "no", "n"}:
+                return False
+        return None
+
+    @staticmethod
+    def _coerce_intish(value: object) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and float(value).is_integer():
+            return int(value)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized and normalized.lstrip("-").isdigit():
+                try:
+                    return int(normalized)
+                except ValueError:
+                    return None
+        return None
+
+    @classmethod
+    def _extract_explicit_custom_flag(cls, match_info: Optional[Dict]) -> Optional[bool]:
+        if not isinstance(match_info, dict):
+            return None
+
+        stack: List[object] = [match_info]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for raw_key, raw_value in current.items():
+                    key = str(raw_key).strip().lower().replace("_", "")
+                    if key in cls.EXPLICIT_CUSTOM_FLAG_KEYS:
+                        parsed = cls._coerce_boolish(raw_value)
+                        if parsed is not None:
+                            return parsed
+                    if isinstance(raw_value, (dict, list)):
+                        stack.append(raw_value)
+            elif isinstance(current, list):
+                for item in current:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
+
+        return None
+
     def _classify_match_category(
         self,
         playlist_asset_id: Optional[str],
@@ -1482,7 +1741,7 @@ class HaloAPIClient:
         playlist_id = (playlist_asset_id or "").strip()
         playlist_id_lower = playlist_id.lower()
 
-        if playlist_id in self.RANKED_PLAYLIST_IDS:
+        if playlist_id_lower in self.RANKED_PLAYLIST_IDS:
             return "ranked", True, "playlist_map"
 
         playlist_name = ""
@@ -1494,34 +1753,76 @@ class HaloAPIClient:
                 or ""
             ).strip()
 
-        match_type_hint = ""
+        explicit_custom_flag = self._extract_explicit_custom_flag(match_info)
+        if explicit_custom_flag is True:
+            return "custom", False, "explicit_custom_flag"
+
+        game_variant_category = None
+        lifecycle_mode = None
+        playlist_experience = None
+        playlist_map_mode_pair = None
+
+        signal_components: List[str] = []
         if isinstance(match_info, dict):
-            match_type_hint = str(
-                match_info.get('MatchType')
-                or match_info.get('Category')
-                or match_info.get('Mode')
-                or ""
-            ).strip()
+            game_variant_category = self._coerce_intish(match_info.get('GameVariantCategory'))
+            lifecycle_mode = self._coerce_intish(match_info.get('LifecycleMode'))
+            playlist_experience = match_info.get('PlaylistExperience')
+            playlist_map_mode_pair = match_info.get('PlaylistMapModePair')
+
+            for field in (
+                'MatchType',
+                'Category',
+                'Mode',
+                'GameMode',
+                'Experience',
+                'QueueType',
+                'PlaylistCategory',
+                'Activity',
+                'GameVariantCategory',
+                'LifecycleMode',
+                'PlaylistExperience',
+                'GameplayInteraction',
+            ):
+                value = str(match_info.get(field) or "").strip()
+                if value:
+                    signal_components.append(value)
+
+            game_variant = match_info.get('GameVariant')
+            if isinstance(game_variant, dict):
+                for field in ('Name', 'AssetId', 'VersionId'):
+                    value = str(game_variant.get(field) or "").strip()
+                    if value:
+                        signal_components.append(value)
 
         signal_text = " ".join(
             [
                 playlist_id_lower,
                 str(playlist_version_id or "").lower(),
                 playlist_name.lower(),
-                match_type_hint.lower(),
+                " ".join(component.lower() for component in signal_components),
             ]
         )
+
+        if not playlist_id and game_variant_category in self.CUSTOM_GAME_VARIANT_CATEGORIES:
+            if lifecycle_mode in self.CUSTOM_LIFECYCLE_MODES:
+                return "custom", False, "matchinfo_structural"
+
+            if playlist_experience is None and not playlist_map_mode_pair:
+                return "custom", False, "matchinfo_structural"
 
         if "ranked" in signal_text:
             return "ranked", True, "text_heuristic"
 
-        if "custom" in signal_text:
+        if any(token in signal_text for token in self.CUSTOM_MATCH_TEXT_HINTS):
             return "custom", False, "text_heuristic"
 
         if playlist_id:
             return "social", False, "default_non_ranked"
 
-        return "unknown", False, "missing_playlist"
+        if any(token in signal_text for token in self.SOCIAL_MATCH_TEXT_HINTS):
+            return "social", False, "missing_playlist_text"
+
+        return "custom", False, "missing_playlist_fallback"
     
     async def get_match_stats_for_match(
         self,
@@ -1971,17 +2272,20 @@ class HaloAPIClient:
         """
         if matches_to_process is None:
             matches_to_process = 999999  # Process all matches
+        full_history_requested = matches_to_process >= 999999
         try:
             # Check cache first
             cached_data = self.load_cached_stats(xuid, stat_type, gamertag)
             last_update = None
             existing_matches = {}
+            cache_marked_incomplete = False
             
             # Check if cache is sufficient for the request
             cache_is_sufficient = False
             if cached_data:
                 last_update = cached_data.get('last_update')
                 existing_matches = {m['match_id']: m for m in cached_data.get('processed_matches', [])}
+                cache_marked_incomplete = bool(cached_data.get('incomplete_data')) or int(cached_data.get('failed_match_count') or 0) > 0
                 cached_games = len(existing_matches)
                 print(f"Last cache update: {last_update}")
                 print(f"Cache contains {cached_games} matches")
@@ -1990,9 +2294,12 @@ class HaloAPIClient:
                 # we should check if there are more matches available
                 # For now, if cache has at least 25 matches and we want all matches,
                 # we'll do an incremental fetch to check for new ones
-                if matches_to_process >= 999999:
+                if full_history_requested:
                     # Requesting all matches - always check for new matches
                     print(f"Full match history requested, will check for updates...")
+                    cache_is_sufficient = False
+                elif cache_marked_incomplete:
+                    print("Cache is marked incomplete, fetching additional match history...")
                     cache_is_sufficient = False
                 elif cached_games >= matches_to_process:
                     # Cache has enough matches
@@ -2004,7 +2311,7 @@ class HaloAPIClient:
                     cache_is_sufficient = False
             
             # If cache is sufficient and we're not requesting ALL matches, return cached data immediately
-            if cache_is_sufficient and matches_to_process < 999999:
+            if cache_is_sufficient and not full_history_requested:
                 print(f"Using cached data ({len(existing_matches)} matches)")
                 # Calculate stats from cached matches (stats are not stored, only raw match data)
                 cached_matches = cached_data.get('processed_matches', [])
@@ -2034,13 +2341,22 @@ class HaloAPIClient:
                     "Accept": "application/json"
                 }
 
-            def extract_total_matches_count(payload: Dict) -> Optional[int]:
-                """Best-effort total match count extraction from API page payload."""
-                for key in ("TotalCount", "TotalResults", "ResultCount", "Count", "totalCount", "totalResults"):
+            def extract_total_matches_count(payload: Dict) -> Tuple[Optional[int], Optional[str], bool]:
+                """Best-effort lifetime total extraction with reliability metadata."""
+                reliable_keys = ("TotalCount", "totalCount", "TotalResults", "totalResults")
+                ambiguous_keys = ("ResultCount", "Count", "count")
+
+                for key in reliable_keys:
                     value = payload.get(key)
                     if isinstance(value, int) and value >= 0:
-                        return value
-                return None
+                        return value, key, True
+
+                for key in ambiguous_keys:
+                    value = payload.get(key)
+                    if isinstance(value, int) and value >= 0:
+                        return value, key, False
+
+                return None, None, False
             
             async def fetch_match_page(session, start_pos, page_size=25, retry_count=0, account_retry=0, error_retry=0, rate_limit_retry=0, force_account=None):
                 """Fetch a single page of matches with retry logic for socket errors, account rotation, 500 and 429 errors"""
@@ -2176,6 +2492,8 @@ class HaloAPIClient:
                 # Otherwise use incremental fetch if cache exists
                 print(f"Fetch params: force_full_fetch={force_full_fetch}, cached_data={'exists' if cached_data else 'none'}, matches_to_process={matches_to_process}")
                 total_matches_hint = None
+                total_matches_hint_source = None
+                total_matches_hint_reliable = False
                 
                 if force_full_fetch:
                     print(f"Force full fetch enabled - ignoring cache and fetching all matches...")
@@ -2228,10 +2546,21 @@ class HaloAPIClient:
                                 async with session.get(first_page_url, headers=first_headers) as first_response:
                                     if first_response.status == 200:
                                         first_payload = await first_response.json()
-                                        total_matches_hint = extract_total_matches_count(first_payload)
+                                        extracted_hint, hint_source, hint_reliable = extract_total_matches_count(first_payload)
+                                        total_matches_hint_source = hint_source
+                                        total_matches_hint_reliable = hint_reliable
+                                        total_matches_hint = extracted_hint if hint_reliable else None
+                                        if hint_source:
+                                            print(
+                                                f"Total-count hint key={hint_source}, value={extracted_hint}, reliable={hint_reliable}"
+                                            )
+                                        else:
+                                            print("Total-count hint unavailable in first-page payload")
                             except Exception:
                                 # Total-count hint is optional; ignore extraction failures.
                                 total_matches_hint = None
+                                total_matches_hint_source = None
+                                total_matches_hint_reliable = False
                         
                         # Check each match in this page
                         found_cached_match = False
@@ -2244,28 +2573,81 @@ class HaloAPIClient:
                                 found_cached_match = True
                                 break
                         
-                        # Stop if we hit a cached match or empty page
-                        if found_cached_match or len(page) < PAGE_SIZE:
-                            found_cached_boundary = found_cached_match
-                            reached_history_end = len(page) < PAGE_SIZE
+                        # Stop at first cached boundary, or when API indicates end-of-history.
+                        if found_cached_match:
+                            found_cached_boundary = True
+                            break
+
+                        if len(page) < PAGE_SIZE:
+                            reached_history_end = True
                             break
                         
                         page_num += 1
 
-                    if (
-                        matches_to_process >= 999999
-                        and total_matches_hint is not None
-                        and (len(existing_matches) + len(new_matches_found)) < total_matches_hint
-                        and (found_cached_boundary or reached_history_end or page_num >= max_pages_to_check - 1)
-                    ):
+                    probe_plan = build_boundary_probe_plan(
+                        full_history_requested=full_history_requested,
+                        has_cached_matches=bool(existing_matches),
+                        reached_history_end=reached_history_end,
+                        total_matches_hint=total_matches_hint,
+                        cached_match_count=len(existing_matches),
+                        new_match_count=len(new_matches_found),
+                        cache_marked_incomplete=cache_marked_incomplete,
+                    )
+
+                    probe_checked = False
+                    probe_found_uncached = False
+                    if probe_plan.required:
+                        probe_page = await fetch_match_page(session, probe_plan.start, probe_plan.count)
+                        if probe_page is None:
+                            got_401_error = True
+                        else:
+                            probe_checked = True
+                            probe_match_id = probe_page[0].get('MatchId') if probe_page else None
+                            known_match_ids = set(existing_matches.keys())
+                            known_match_ids.update(
+                                match.get('MatchId')
+                                for match in new_matches_found
+                                if match.get('MatchId')
+                            )
+                            if probe_match_id and probe_match_id not in known_match_ids:
+                                probe_found_uncached = True
+
+                    reached_search_cap = (
+                        page_num >= max_pages_to_check - 1
+                        and not found_cached_boundary
+                        and not reached_history_end
+                    )
+                    sync_decision = decide_full_history_sync(
+                        full_history_requested=full_history_requested,
+                        total_matches_hint=total_matches_hint,
+                        cached_match_count=len(existing_matches),
+                        new_match_count=len(new_matches_found),
+                        found_cached_boundary=found_cached_boundary,
+                        reached_history_end=reached_history_end,
+                        reached_search_cap=reached_search_cap,
+                        probe_required=probe_plan.required,
+                        probe_checked=probe_checked,
+                        probe_found_uncached=probe_found_uncached,
+                        probe_start=probe_plan.start,
+                        cache_marked_incomplete=cache_marked_incomplete,
+                    )
+
+                    if full_history_requested:
                         print(
-                            "Incremental top-up did not converge to API total count "
-                            f"(cache+new={len(existing_matches) + len(new_matches_found)}, api={total_matches_hint}); "
-                            "falling back to full fetch."
+                            "History sync check: "
+                            f"boundary_found={sync_decision.boundary_found}, "
+                            f"probe_checked={sync_decision.probe_checked}, "
+                            f"completeness_proven={sync_decision.completeness_proven}, "
+                            f"cache_plus_new={sync_decision.cache_plus_new}, "
+                            f"cache_marked_incomplete={cache_marked_incomplete}, "
+                            f"total_hint_source={total_matches_hint_source or 'none'}, "
+                            f"total_hint_reliable={total_matches_hint_reliable}, "
+                            f"fallback_reason={sync_decision.fallback_reason or 'none'}"
                         )
+
+                    if not got_401_error and sync_decision.fallback_reason:
+                        print(sync_decision.fallback_reason)
                         use_incremental = False
-                        existing_matches = {}
-                        cached_data = None
                     
                     # NOTE: Cache completeness check removed - we don't need complete history
                     # for regular stats lookups. If the user wants complete history, they use
@@ -2279,25 +2661,32 @@ class HaloAPIClient:
                         print(f"Got 401 error, will attempt token refresh...")
                         # Don't return cached data yet, let it fall through to 401 handling below
                     elif not new_matches_found:
-                        print(f"No new matches found, using cache ({len(existing_matches)} matches)")
-                        # Calculate stats from cached matches (stats are not stored, only raw match data)
-                        cached_matches = cached_data.get('processed_matches', [])
-                        stats = self._calculate_stats_from_matches(cached_matches, stat_type)
-                        return {
-                            'error': 0,
-                            'stats': stats,
-                            'matches_processed': len(existing_matches),
-                            'new_matches': 0,
-                            'processed_matches': cached_matches
-                        }
+                        if full_history_requested and not sync_decision.completeness_proven:
+                            print(
+                                "No new matches found but completeness is unproven; "
+                                "switching to full fetch."
+                            )
+                            use_incremental = False
+                        else:
+                            print(f"No new matches found, using cache ({len(existing_matches)} matches)")
+                            # Calculate stats from cached matches (stats are not stored, only raw match data)
+                            cached_matches = cached_data.get('processed_matches', [])
+                            stats = self._calculate_stats_from_matches(cached_matches, stat_type)
+                            return {
+                                'error': 0,
+                                'stats': stats,
+                                'matches_processed': len(existing_matches),
+                                'new_matches': 0,
+                                'processed_matches': cached_matches
+                            }
                     else:
                         print(f"🆕 Found {len(new_matches_found)} new matches across {page_num + 1} page(s)")
                         all_matches = new_matches_found
                 
                 # Full fetch (no cache exists or force_full_fetch was requested)
                 if not use_incremental:
-                    # No cache exists, fetch all matches
-                    print(f"No cache found, fetching full match history with rolling queue...")
+                    # Fetch all matches from the list endpoint, then merge with cached details.
+                    print(f"Running full match-history fetch with rolling queue...")
                     
                     # Rolling queue approach - keep N requests in flight at all times
                     # Conservative concurrency to respect API rate limits and avoid bans
@@ -2305,7 +2694,7 @@ class HaloAPIClient:
                     num_accounts = len(self.spartan_accounts) if self.spartan_accounts else 1
                     max_in_flight = min(num_accounts * 5, 25)  # 5 per account, max 25 total
                     current_page = 0
-                    bounded_fetch = matches_to_process < 999999
+                    bounded_fetch = not full_history_requested
                     if bounded_fetch:
                         max_pages = max(0, math.ceil(matches_to_process / PAGE_SIZE))
                         print(f"Bounded fetch enabled: request={matches_to_process} matches, max_pages={max_pages}")
@@ -2384,9 +2773,13 @@ class HaloAPIClient:
                         return {"error": 4, "message": "Authentication failed - unable to refresh tokens"}
                 
                 if cached_data and existing_matches:
-                    # Incremental update: only process new matches
-                    print(f"Processing {len(all_matches)} new matches")
-                    matches_to_fetch = [(match.get('MatchId'), xuid) for match in all_matches if match.get('MatchId')]
+                    # Reuse cached rows and only fetch details for uncached match IDs.
+                    uncached_match_ids = [
+                        match.get('MatchId') for match in all_matches
+                        if match.get('MatchId') and match.get('MatchId') not in existing_matches
+                    ]
+                    print(f"Processing {len(uncached_match_ids)} uncached matches from {len(all_matches)} listed matches")
+                    matches_to_fetch = [(match_id, xuid) for match_id in uncached_match_ids]
                     all_processed_matches = list(existing_matches.values())
                 else:
                     # Full fetch: process all matches
@@ -3116,7 +3509,8 @@ class StatsFind:
         self,
         gamertag: str,
         stat_type: str,
-        matches_to_process: int = 10
+        matches_to_process: int = 10,
+        force_full_fetch: bool = False,
     ) -> 'StatsFind':
         """
         Get player stats using Halo API.
@@ -3125,6 +3519,7 @@ class StatsFind:
             gamertag: Player's Xbox gamertag
             stat_type: "stats" (all), "ranked", or "social"
             matches_to_process: Number of matches to process
+            force_full_fetch: If True, bypass cache and fetch full history from API
         
         Returns:
             Self with populated stats
@@ -3142,7 +3537,10 @@ class StatsFind:
         
         try:
             result = await api_client.get_player_stats(
-                gamertag, api_stat_type, matches_to_process=matches_to_process
+                gamertag,
+                api_stat_type,
+                matches_to_process=matches_to_process,
+                force_full_fetch=force_full_fetch,
             )
             
             if result.get("error", 0) != 0:

@@ -50,6 +50,7 @@ class StatsCog(commands.Cog, name="Stats"):
             gamertag,
             stat_type=profile.fetch_stat_type,
             matches_to_process=None,
+            force_full_fetch=profile.force_full_fetch,
         )
 
     async def _run_profile_from_inputs(self, ctx: commands.Context, profile: StatsProfile, inputs: tuple[str, ...]) -> None:

@@ -4,11 +4,9 @@ Uses normalized schema from schema.py
 Replaces JSON file caching with direct database operations
 """
 
-import sqlite3
 import os
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime
-import threading
 
 from src.database.schema import HaloStatsDBv2, MEDAL_NAME_MAPPING
 from src.config import DATABASE_FILE
@@ -248,6 +246,18 @@ class PlayerStatsCacheV2:
         """, (xuid,))
         
         return {row['match_id'] for row in cursor.fetchall()}
+
+    def get_seed_verified_match_ids(self, seed_xuid: str, limit_matches: int = None) -> List[str]:
+        """Get verified seed match IDs from normalized match history tables."""
+        return self.db.get_seed_verified_match_ids(seed_xuid, limit_matches=limit_matches)
+
+    def get_participant_coverage_for_matches(self, match_ids: List[str], seed_xuid: str) -> Dict[str, Dict]:
+        """Get participant-count coverage for a supplied set of match IDs."""
+        return self.db.get_participant_coverage_for_matches(match_ids, seed_xuid)
+
+    def get_pair_match_category_counts(self, scope_xuids: List[str]) -> Dict[Tuple[str, str], Dict[str, int]]:
+        """Get ranked/social/custom/unknown match counts for each scoped player pair."""
+        return self.db.get_pair_match_category_counts(scope_xuids)
     
     def check_player_cached(self, xuid: str, stat_type: str = "overall", gamertag: str = None) -> bool:
         """

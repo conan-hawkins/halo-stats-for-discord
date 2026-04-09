@@ -226,6 +226,158 @@ async def test_get_match_stats_classifies_custom_from_playlist_hint(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_get_match_stats_classifies_custom_from_explicit_flag(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 7, "Deaths": 4, "Assists": 5, "Medals": []}}}],
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT10M",
+            "IsCustom": True,
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-custom-flag", "123", session)
+
+    assert result is not None
+    assert result["is_ranked"] is False
+    assert result["match_category"] == "custom"
+    assert result["category_source"] == "explicit_custom_flag"
+
+
+@pytest.mark.asyncio
+async def test_get_match_stats_classifies_missing_playlist_as_custom_fallback(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 9, "Deaths": 2, "Assists": 1, "Medals": []}}}],
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT10M",
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-custom-fallback", "123", session)
+
+    assert result is not None
+    assert result["is_ranked"] is False
+    assert result["match_category"] == "custom"
+    assert result["category_source"] == "missing_playlist_fallback"
+
+
+@pytest.mark.asyncio
+async def test_get_match_stats_classifies_custom_from_structural_matchinfo(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 9, "Deaths": 2, "Assists": 1, "Medals": []}}}],
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT10M",
+            "LifecycleMode": 1,
+            "GameVariantCategory": 6,
+            "Playlist": None,
+            "PlaylistExperience": None,
+            "PlaylistMapModePair": None,
+            "UgcGameVariant": {"AssetKind": 6, "AssetId": "ugc-a", "VersionId": "ugc-v"},
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-custom-struct", "123", session)
+
+    assert result is not None
+    assert result["is_ranked"] is False
+    assert result["match_category"] == "custom"
+    assert result["category_source"] == "matchinfo_structural"
+
+
+@pytest.mark.asyncio
+async def test_get_match_stats_classifies_ranked_playlist_case_insensitively(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    async def fake_wait_if_needed(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
+    monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: "tok-0")
+
+    stats_payload = {
+        "Players": [
+            {
+                "PlayerId": "xuid(123)",
+                "Outcome": 2,
+                "PlayerTeamStats": [{"Stats": {"CoreStats": {"Kills": 10, "Deaths": 5, "Assists": 0, "Medals": []}}}],
+            }
+        ],
+        "MatchInfo": {
+            "StartTime": "2026-01-01T00:00:00",
+            "Duration": "PT10M",
+            "Playlist": {"AssetId": "6E4E9372-5D49-4F87-B0A7-4489B5E96A0B", "VersionId": "v1"},
+            "MapVariant": {"AssetId": "m1", "VersionId": "mv1"},
+        },
+    }
+
+    session = _FakeSession([_FakeResponse(200, json_data=stats_payload)])
+    result = await client.get_match_stats_for_match("match-ranked-upper", "123", session)
+
+    assert result is not None
+    assert result["is_ranked"] is True
+    assert result["match_category"] == "ranked"
+    assert result["category_source"] == "playlist_map"
+
+
+@pytest.mark.asyncio
 async def test_get_friends_list_429_then_success(monkeypatch):
     client = HaloAPIClient()
     client.xbox_accounts = [{"token": "xtok", "uhs": "u1"}]

@@ -215,6 +215,144 @@ def test_get_seed_match_participants_returns_full_rosters_with_limit(tmp_path):
     db.close()
 
 
+def test_seed_verified_match_ids_and_participant_coverage(tmp_path):
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    db.insert_or_update_player("seed", "SeedPlayer")
+    db.insert_or_update_player("xuid-a", "Alpha")
+
+    match_old = _match("cov-old", ranked=False, start_time="2026-01-01T00:00:00")
+    match_mid = _match("cov-mid", ranked=False, start_time="2026-01-02T00:00:00")
+    match_new = _match("cov-new", ranked=False, start_time="2026-01-03T00:00:00")
+
+    for match in [match_old, match_mid, match_new]:
+        db.insert_match(match)
+        db.insert_player_match("seed", match)
+
+    db.insert_match_participants(
+        "cov-old",
+        [
+            {"xuid": "seed", "team_id": "1", "outcome": 2},
+            {"xuid": "xuid-a", "team_id": "1", "outcome": 2},
+        ],
+    )
+
+    # Participant row exists but seed row is missing.
+    db.insert_match_participants(
+        "cov-mid",
+        [
+            {"xuid": "xuid-a", "team_id": "1", "outcome": 2},
+        ],
+    )
+
+    verified_ids = db.get_seed_verified_match_ids("seed")
+    assert verified_ids == ["cov-new", "cov-mid", "cov-old"]
+
+    limited_ids = db.get_seed_verified_match_ids("seed", limit_matches=2)
+    assert limited_ids == ["cov-new", "cov-mid"]
+
+    coverage = db.get_participant_coverage_for_matches(verified_ids, "seed")
+    assert coverage["cov-old"]["participant_count"] == 2
+    assert coverage["cov-old"]["seed_present"] is True
+    assert coverage["cov-mid"]["participant_count"] == 1
+    assert coverage["cov-mid"]["seed_present"] is False
+    assert coverage["cov-new"]["participant_count"] == 0
+    assert coverage["cov-new"]["seed_present"] is False
+
+    db.close()
+
+
+def test_get_pair_match_category_counts_by_scope(tmp_path):
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    for xuid, gamertag in [("seed", "Seed"), ("xuid-a", "Alpha"), ("xuid-b", "Bravo"), ("xuid-c", "Charlie")]:
+        db.insert_or_update_player(xuid, gamertag)
+
+    match_rows = [
+        ("pair-ranked-1", "2026-01-01T00:00:00", "ranked", ["seed", "xuid-a", "xuid-b"]),
+        ("pair-ranked-2", "2026-01-02T00:00:00", "ranked", ["seed", "xuid-a"]),
+        ("pair-social-1", "2026-01-03T00:00:00", "social", ["seed", "xuid-a", "xuid-b"]),
+        ("pair-custom-1", "2026-01-04T00:00:00", "custom", ["seed", "xuid-b"]),
+        ("pair-unknown-1", "2026-01-05T00:00:00", "unknown", ["seed", "xuid-a"]),
+    ]
+
+    for match_id, start_time, category, participants in match_rows:
+        match = _match(match_id, ranked=(category == "ranked"), start_time=start_time)
+        match["match_category"] = category
+        match["category_source"] = "test"
+        db.insert_match(match)
+        db.insert_match_participants(
+            match_id,
+            [{"xuid": xuid, "team_id": "1", "outcome": 2} for xuid in participants],
+        )
+
+    counts = db.get_pair_match_category_counts(["seed", "xuid-a", "xuid-b", "xuid-c"])
+
+    assert counts[("seed", "xuid-a")] == {
+        "ranked": 2,
+        "social": 2,
+        "custom": 0,
+        "unknown": 0,
+    }
+    assert counts[("seed", "xuid-b")] == {
+        "ranked": 1,
+        "social": 1,
+        "custom": 1,
+        "unknown": 0,
+    }
+    assert counts[("xuid-a", "xuid-b")] == {
+        "ranked": 1,
+        "social": 1,
+        "custom": 0,
+        "unknown": 0,
+    }
+    assert all("xuid-c" not in pair for pair in counts)
+
+    db.close()
+
+
+def test_get_pair_match_category_counts_infers_legacy_unknown_categories(tmp_path):
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    for xuid, gamertag in [("seed", "Seed"), ("xuid-a", "Alpha"), ("xuid-b", "Bravo")]:
+        db.insert_or_update_player(xuid, gamertag)
+
+    legacy_rows = [
+        ("legacy-ranked", "2026-01-01T00:00:00", "unknown", "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b", ["seed", "xuid-a"]),
+        ("legacy-social", "2026-01-02T00:00:00", "unknown", "playlist-social-legacy", ["seed", "xuid-b"]),
+        ("legacy-custom-missing-playlist", "2026-01-03T00:00:00", "unknown", None, ["seed", "xuid-a"]),
+        ("legacy-custom-token", "2026-01-04T00:00:00", "unknown", "custom-playlist-token", ["seed", "xuid-b"]),
+    ]
+
+    for match_id, start_time, category, playlist_id, participants in legacy_rows:
+        match = _match(match_id, ranked=False, start_time=start_time)
+        match["match_category"] = category
+        match["category_source"] = None
+        match["playlist_id"] = playlist_id
+        db.insert_match(match)
+        db.insert_match_participants(
+            match_id,
+            [{"xuid": xuid, "team_id": "1", "outcome": 2} for xuid in participants],
+        )
+
+    counts = db.get_pair_match_category_counts(["seed", "xuid-a", "xuid-b"])
+
+    assert counts[("seed", "xuid-a")] == {
+        "ranked": 1,
+        "social": 0,
+        "custom": 1,
+        "unknown": 0,
+    }
+    assert counts[("seed", "xuid-b")] == {
+        "ranked": 0,
+        "social": 1,
+        "custom": 1,
+        "unknown": 0,
+    }
+
+    db.close()
+
+
 def test_insert_match_persists_category_fields(tmp_path):
     db = HaloStatsDBv2(str(tmp_path / "stats.db"))
 
