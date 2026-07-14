@@ -35,6 +35,7 @@ TOKEN_CACHE_ACCOUNT2 = TOKEN_CACHE_DIR / "token_cache_account2.json"
 TOKEN_CACHE_ACCOUNT3 = TOKEN_CACHE_DIR / "token_cache_account3.json"
 TOKEN_CACHE_ACCOUNT4 = TOKEN_CACHE_DIR / "token_cache_account4.json"
 TOKEN_CACHE_ACCOUNT5 = TOKEN_CACHE_DIR / "token_cache_account5.json"
+TOKEN_SWAP_MARKER_FILE = TOKEN_CACHE_DIR / "token_refresh_swap.json"
 
 
 def get_token_cache_path(account_num: int = 1) -> Path:

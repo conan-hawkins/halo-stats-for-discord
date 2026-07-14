@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import time
 
@@ -59,6 +60,39 @@ async def test_ensure_valid_tokens_returns_false_when_refresh_already_in_progres
     client._refresh_in_progress = True
 
     assert await client.ensure_valid_tokens() is False
+
+
+def test_ensure_valid_tokens_invokes_swap_recovery_and_clears_refresh_flag_on_error(monkeypatch):
+    client = HaloAPIClient()
+
+    from src.api import client as client_module
+
+    cache = _invalid_bundle("acc1", with_refresh=True)
+
+    monkeypatch.setattr(
+        client_module,
+        "safe_read_json",
+        lambda path, default=None: copy.deepcopy(cache) if str(path) == str(client_module.TOKEN_CACHE_FILE) else {},
+    )
+    monkeypatch.setattr(client_module, "is_token_valid", lambda info: False)
+
+    called = {"recover": 0}
+
+    def fake_recover():
+        called["recover"] += 1
+        return False
+
+    async def fail_auth(*args, **kwargs):
+        raise RuntimeError("refresh fail")
+
+    monkeypatch.setattr(client_module, "recover_token_swap_marker", fake_recover)
+    monkeypatch.setattr(client_module, "run_auth_flow", fail_auth)
+
+    ok = asyncio.run(client.ensure_valid_tokens())
+
+    assert ok is False
+    assert called["recover"] == 1
+    assert client._refresh_in_progress is False
 
 
 @pytest.mark.asyncio

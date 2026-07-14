@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.api import StatsFind1
+from src.api.utils import recover_token_swap_marker
 from src.bot.tasks import auto_refresh_tokens, auto_cache_all_players, proactive_token_refresh
 
 
@@ -130,6 +131,9 @@ async def run_bot():
     print("Made by Conan Hawkins")
     print("=" * 50)
     print()
+
+    # Recover any interrupted token swap before validation or refresh begins.
+    recover_token_swap_marker()
     
     # Validate authentication tokens
     print("Validating Halo authentication tokens...")

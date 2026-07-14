@@ -1,5 +1,6 @@
 import time
 
+from src.api import utils as utils_module
 from src.api.utils import is_token_valid, safe_read_json, safe_write_json
 
 
@@ -40,3 +41,32 @@ def test_is_token_valid_with_expired_and_future_token():
 
     assert is_token_valid(expired) is False
     assert is_token_valid(valid) is True
+
+
+def test_recover_token_swap_marker_restores_primary_cache(tmp_path, monkeypatch):
+    token_cache = tmp_path / "token_cache.json"
+    marker_file = tmp_path / "token_refresh_swap.json"
+    backup_cache = {
+        "oauth": {"refresh_token": "rt-1"},
+        "spartan": {"token": "s1", "expires_at": 1234567899},
+        "xsts": {"token": "x1", "expires_at": 1234567899},
+        "xsts_xbox": {"token": "xx1", "uhs": "u1", "expires_at": 1234567899},
+    }
+
+    monkeypatch.setattr(utils_module, "TOKEN_CACHE_FILE", token_cache)
+    monkeypatch.setattr(utils_module, "TOKEN_SWAP_MARKER_FILE", marker_file)
+
+    safe_write_json(str(token_cache), {"spartan": {"token": "swapped"}})
+    safe_write_json(
+        str(marker_file),
+        {
+            "source_cache_file": str(token_cache),
+            "target_cache_file": str(tmp_path / "token_cache_account2.json"),
+            "backup_cache": backup_cache,
+            "created_at": time.time(),
+        },
+    )
+
+    assert utils_module.recover_token_swap_marker() is True
+    assert safe_read_json(str(token_cache), default={}) == backup_cache
+    assert not marker_file.exists()

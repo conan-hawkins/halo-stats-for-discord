@@ -1,3 +1,4 @@
+import asyncio
 import copy
 
 import pytest
@@ -33,6 +34,25 @@ async def test_auto_refresh_tokens_handles_failed_validation(monkeypatch):
 
     await bot_tasks.auto_refresh_tokens.coro()
     assert called["count"] == 1
+
+
+def test_proactive_refresh_invokes_swap_recovery(monkeypatch):
+    from src.api import utils as utils_module
+
+    called = {"recover": 0}
+
+    def fake_recover():
+        called["recover"] += 1
+        return False
+
+    monkeypatch.setattr(utils_module, "recover_token_swap_marker", fake_recover)
+    monkeypatch.setattr(utils_module, "safe_read_json", lambda *args, **kwargs: {})
+
+    monkeypatch.setattr(bot_tasks, "api_client", type("FakeClient", (), {"client_id": "cid", "client_secret": "secret"})())
+
+    asyncio.run(bot_tasks.proactive_token_refresh.coro())
+
+    assert called["recover"] == 1
 
 
 @pytest.mark.asyncio

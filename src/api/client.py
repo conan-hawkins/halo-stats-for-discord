@@ -54,6 +54,10 @@ from src.api.utils import (
     safe_read_json,
     safe_write_json,
     is_token_valid,
+    get_token_swap_lock,
+    recover_token_swap_marker,
+    write_token_swap_marker,
+    clear_token_swap_marker,
 )
 from src.api.history_sync import (
     build_boundary_probe_plan,
@@ -152,6 +156,54 @@ class HaloAPIClient:
         # Track token refresh attempts (prevent infinite loops)
         self._refresh_in_progress = False
         self._last_refresh_time = 0.0
+
+    async def _refresh_account_via_swap(self, account_num: int, account_cache: Dict) -> bool:
+        """Refresh a secondary account by swapping its cache into the primary slot."""
+        cache_file = get_token_cache_path(account_num)
+        async with get_token_swap_lock():
+            account1_backup = safe_read_json(TOKEN_CACHE_FILE, default={})
+            if not account1_backup:
+                return False
+
+            refresh_succeeded = False
+            restore_succeeded = False
+            try:
+                write_token_swap_marker(account1_backup, cache_file)
+                safe_write_json(TOKEN_CACHE_FILE, account_cache)
+
+                await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+
+                refreshed_cache = safe_read_json(TOKEN_CACHE_FILE, default={})
+                if refreshed_cache:
+                    safe_write_json(cache_file, refreshed_cache)
+
+                new_spartan = refreshed_cache.get("spartan") if refreshed_cache else None
+                new_xsts = refreshed_cache.get("xsts") if refreshed_cache else None
+                new_xbox = refreshed_cache.get("xsts_xbox") if refreshed_cache else None
+                refresh_succeeded = bool(
+                    new_spartan and is_token_valid(new_spartan) and
+                    new_xsts and is_token_valid(new_xsts) and
+                    new_xbox and is_token_valid(new_xbox)
+                )
+            finally:
+                restore_attempts = 3
+                for attempt in range(restore_attempts):
+                    try:
+                        safe_write_json(TOKEN_CACHE_FILE, account1_backup)
+                        restore_succeeded = True
+                        break
+                    except Exception as restore_error:
+                        print(f"Restore attempt {attempt + 1}/{restore_attempts} failed for Account {account_num}: {restore_error}")
+                        if attempt < restore_attempts - 1:
+                            await asyncio.sleep(0.25 * (attempt + 1))
+
+                if restore_succeeded:
+                    clear_token_swap_marker()
+
+            if not restore_succeeded:
+                return False
+
+            return refresh_succeeded
     
     # =========================================================================
     # AUTHENTICATION METHODS
@@ -167,6 +219,8 @@ class HaloAPIClient:
         Returns:
             True if at least account 1 has valid tokens, False otherwise
         """
+        recover_token_swap_marker()
+
         # Prevent concurrent refresh attempts
         if self._refresh_in_progress:
             print("Token refresh already in progress, waiting...")
@@ -238,49 +292,20 @@ class HaloAPIClient:
                 
                 if oauth_info and oauth_info.get("refresh_token"):
                     print(f"Refreshing expired Account {i} tokens...")
-                    
                     try:
-                        # Swap cache files so run_auth_flow uses this account's tokens
-                        # 1. Backup Account 1's cache
-                        account1_backup = safe_read_json(TOKEN_CACHE_FILE, default={})
-                        
-                        # 2. Copy this account's cache to token_cache.json
-                        safe_write_json(TOKEN_CACHE_FILE, account_cache)
-                        
-                        # 3. Run auth flow
-                        await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
-                        
-                        # 4. Save the refreshed tokens to this account's file
-                        refreshed_cache = safe_read_json(TOKEN_CACHE_FILE, default={})
-                        if refreshed_cache:
-                            safe_write_json(cache_file, refreshed_cache)
-                            
-                            # Check if refresh succeeded
-                            new_spartan = refreshed_cache.get("spartan")
-                            new_xsts = refreshed_cache.get("xsts")
-                            new_xbox = refreshed_cache.get("xsts_xbox")
-                            if (new_spartan and is_token_valid(new_spartan) and
-                                new_xsts and is_token_valid(new_xsts) and
-                                new_xbox and is_token_valid(new_xbox)):
-                                additional_accounts.append({
-                                    'id': f'account{i}',
-                                    'token': new_spartan.get("token"),
-                                    'name': f'Account {i}',
-                                    'cache_file': cache_file
-                                })
-                                print(f"Account {i} tokens refreshed successfully")
-                                refresh_success = True
-                        
-                        # 5. Restore Account 1's original cache
-                        safe_write_json(TOKEN_CACHE_FILE, account1_backup)
-                        
+                        refresh_success = await self._refresh_account_via_swap(i, account_cache)
+                        if refresh_success:
+                            refreshed_cache = safe_read_json(cache_file, default={})
+                            new_spartan = refreshed_cache.get("spartan") if refreshed_cache else None
+                            additional_accounts.append({
+                                'id': f'account{i}',
+                                'token': new_spartan.get("token") if new_spartan else None,
+                                'name': f'Account {i}',
+                                'cache_file': cache_file
+                            })
+                            print(f"Account {i} tokens refreshed successfully")
                     except Exception as e:
                         print(f"Error refreshing Account {i}: {e}")
-                        # Restore Account 1's cache on error
-                        try:
-                            safe_write_json(TOKEN_CACHE_FILE, account1_backup)
-                        except:
-                            pass
 
                 if not refresh_success:
                     print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
@@ -321,40 +346,41 @@ class HaloAPIClient:
         try:
             # Refresh Account 1
             if not account1_valid:
-                oauth_info = cache.get("oauth")
-                if not oauth_info or not oauth_info.get("refresh_token"):
-                    print("No OAuth refresh token available for Account 1")
-                    print("Run: python get_auth_tokens.py")
-                    return False
-                
-                print("Refreshing Account 1 tokens...")
-                
-                # Force expiry of all tokens for Account 1
-                for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
-                    if key in cache:
-                        cache[key]["expires_at"] = 0
-                safe_write_json(TOKEN_CACHE_FILE, cache)
-                
-                # Run auth flow for Account 1
-                await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
-                
-                # Reload and validate Account 1
-                cache = safe_read_json(TOKEN_CACHE_FILE, default={})
-                spartan_info = cache.get("spartan")
-                xsts_info = cache.get("xsts")
-                xsts_xbox_info = cache.get("xsts_xbox")
-                
-                spartan_valid = spartan_info and is_token_valid(spartan_info)
-                xsts_valid = xsts_info and is_token_valid(xsts_info)
-                xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
-                account1_valid = spartan_valid and xsts_valid and xbox_valid
-                account1_spartan_info = spartan_info
-                
-                if account1_valid:
-                    print("Account 1 tokens refreshed successfully")
-                else:
-                    print("Account 1 token refresh failed - tokens still invalid")
-                    return False
+                async with get_token_swap_lock():
+                    oauth_info = cache.get("oauth")
+                    if not oauth_info or not oauth_info.get("refresh_token"):
+                        print("No OAuth refresh token available for Account 1")
+                        print("Run: python get_auth_tokens.py")
+                        return False
+
+                    print("Refreshing Account 1 tokens...")
+
+                    # Force expiry of all tokens for Account 1
+                    for key in ["spartan", "clearance", "xsts", "xsts_xbox"]:
+                        if key in cache:
+                            cache[key]["expires_at"] = 0
+                    safe_write_json(TOKEN_CACHE_FILE, cache)
+
+                    # Run auth flow for Account 1
+                    await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+
+                    # Reload and validate Account 1
+                    cache = safe_read_json(TOKEN_CACHE_FILE, default={})
+                    spartan_info = cache.get("spartan")
+                    xsts_info = cache.get("xsts")
+                    xsts_xbox_info = cache.get("xsts_xbox")
+
+                    spartan_valid = spartan_info and is_token_valid(spartan_info)
+                    xsts_valid = xsts_info and is_token_valid(xsts_info)
+                    xbox_valid = xsts_xbox_info and is_token_valid(xsts_xbox_info)
+                    account1_valid = spartan_valid and xsts_valid and xbox_valid
+                    account1_spartan_info = spartan_info
+
+                    if account1_valid:
+                        print("Account 1 tokens refreshed successfully")
+                    else:
+                        print("Account 1 token refresh failed - tokens still invalid")
+                        return False
             
             # Refresh additional accounts (2-5) if needed
             refreshed_account_attempts = set()
@@ -380,24 +406,10 @@ class HaloAPIClient:
                     if oauth_info and oauth_info.get("refresh_token"):
                         refreshed_account_attempts.add(i)
                         print(f"Refreshing Account {i} tokens...")
-                        
-                        # CRITICAL FIX: Swap cache files so run_auth_flow uses this account's tokens
-                        # 1. Backup Account 1's cache
-                        account1_backup = safe_read_json(TOKEN_CACHE_FILE, default={})
-                        
-                        # 2. Copy this account's cache to token_cache.json (so run_auth_flow uses it)
-                        safe_write_json(TOKEN_CACHE_FILE, account_cache)
-                        
-                        # 3. Run auth flow (now uses this account's OAuth token)
-                        await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
-                        
-                        # 4. Save the refreshed tokens to this account's file
-                        refreshed_cache = safe_read_json(TOKEN_CACHE_FILE, default={})
-                        if refreshed_cache:
-                            safe_write_json(cache_file, refreshed_cache)
-                        
-                        # 5. Restore Account 1's original cache
-                        safe_write_json(TOKEN_CACHE_FILE, account1_backup)
+                        try:
+                            await self._refresh_account_via_swap(i, account_cache)
+                        except Exception as e:
+                            print(f"Error refreshing Account {i}: {e}")
                     else:
                         print(f"No OAuth refresh token for Account {i}")
                         print(f"Run: python setup_account{i}.py")

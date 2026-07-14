@@ -6,8 +6,11 @@ Provides thread-safe JSON file operations and token validation utilities.
 
 import json
 import os
+import asyncio
 import time
 from typing import Dict, Optional
+
+from src.config import TOKEN_CACHE_FILE, TOKEN_SWAP_MARKER_FILE
 
 # =============================================================================
 # FILE LOCKING SETUP
@@ -28,6 +31,17 @@ except ImportError:
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+
+
+_TOKEN_SWAP_LOCK: Optional[asyncio.Lock] = None
+
+
+def get_token_swap_lock() -> asyncio.Lock:
+    """Return the shared lock that serializes token-cache swap refreshes."""
+    global _TOKEN_SWAP_LOCK
+    if _TOKEN_SWAP_LOCK is None:
+        _TOKEN_SWAP_LOCK = asyncio.Lock()
+    return _TOKEN_SWAP_LOCK
 
 
 def safe_read_json(filepath: str, default=None) -> Optional[Dict]:
@@ -127,3 +141,41 @@ def safe_write_json(filepath: str, data: Dict, indent: int = 2) -> None:
                 os.remove(temp_filepath)
             except:
                 pass
+
+
+def write_token_swap_marker(backup_cache: Dict, target_cache_file: str) -> None:
+    """Persist a swap marker so interrupted refreshes can be recovered on startup."""
+    marker = {
+        "source_cache_file": str(TOKEN_CACHE_FILE),
+        "target_cache_file": str(target_cache_file),
+        "backup_cache": backup_cache,
+        "created_at": time.time(),
+    }
+    safe_write_json(TOKEN_SWAP_MARKER_FILE, marker)
+
+
+def clear_token_swap_marker() -> None:
+    """Remove any persisted refresh swap marker."""
+    try:
+        os.remove(str(TOKEN_SWAP_MARKER_FILE))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"Error clearing token swap marker: {e}")
+
+
+def recover_token_swap_marker() -> bool:
+    """Restore Account 1 cache if a previous refresh died mid-swap."""
+    marker = safe_read_json(TOKEN_SWAP_MARKER_FILE, default={})
+    if not marker:
+        return False
+
+    backup_cache = marker.get("backup_cache")
+    if not isinstance(backup_cache, dict) or not backup_cache:
+        clear_token_swap_marker()
+        return False
+
+    safe_write_json(TOKEN_CACHE_FILE, backup_cache)
+    clear_token_swap_marker()
+    print("Recovered token cache from interrupted refresh swap")
+    return True
