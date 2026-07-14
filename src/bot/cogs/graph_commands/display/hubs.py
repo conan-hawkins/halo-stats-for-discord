@@ -5,9 +5,12 @@ from datetime import datetime
 import discord
 from discord.ext import commands
 
+from src.bot.checks import admin_only
+
 
 class HubsCommandMixin:
-    @commands.command(name="hubs", help="Find highly connected hub players. Usage: #hubs [min_friends]")
+    @commands.command(name="hubs", help="Find highly connected hub players. Usage: #hubs [min_friends]. Admin only.")
+    @admin_only()
     async def find_hubs(self, ctx: commands.Context, min_friends: int = 30):
         """Find players with the most Halo-active connections."""
         try:

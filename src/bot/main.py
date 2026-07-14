@@ -100,7 +100,11 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.BadArgument):
         await ctx.send(f"Invalid argument: {error}")
         return
-    
+
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("🚫 This command is admin-only.")
+        return
+
     # Log unexpected errors
     print(f"Command error in {ctx.command}: {error}")
     await ctx.send(f"An error occurred: {error}")

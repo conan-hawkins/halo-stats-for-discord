@@ -9,6 +9,8 @@ from typing import Awaitable, Callable, Dict, List, Optional
 import discord
 from discord.ext import commands
 
+from src.bot.checks import admin_only
+
 
 NETWORK_CONTROLS_TIMEOUT_SECONDS = 900
 
@@ -145,7 +147,7 @@ class CrawlGamesCommandMixin:
         name="crawlgames",
         help="Build co-play edges from shared match history (default scoped; use --global for full sweep). Admin only.",
     )
-    @commands.has_permissions(administrator=True)
+    @admin_only()
     async def start_crawl_games(
         self,
         ctx: commands.Context,

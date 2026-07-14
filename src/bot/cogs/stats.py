@@ -26,6 +26,7 @@ from src.bot.presentation.embeds.friends import (
     build_xboxfriends_progress_embed,
     build_xboxfriends_result_embed,
 )
+from src.bot.checks import PUBLIC_COMMANDS, admin_only, is_admin
 from src.bot.presentation.embeds.help import build_command_help_embed, build_stats_help_guide_embed
 from src.bot.stats_profiles import (
     CASUAL_STATS_PROFILE,
@@ -60,9 +61,11 @@ class StatsCog(commands.Cog, name="Stats"):
     @commands.command(name='help', help='Show detailed instructions for all commands or a single command (example: #help network).')
     async def help_command(self, ctx: commands.Context, command_name: str = None):
         """Custom help with practical command-by-command usage guidance."""
+        admin = is_admin(ctx)
+
         if command_name:
             cmd = self.bot.get_command(command_name.lower())
-            if not cmd:
+            if not cmd or (cmd.name not in PUBLIC_COMMANDS and not admin):
                 await ctx.send(f"Unknown command: {command_name}. Use `#help` to see all commands.")
                 return
 
@@ -70,7 +73,7 @@ class StatsCog(commands.Cog, name="Stats"):
             await ctx.send(embed=embed)
             return
 
-        embed = build_stats_help_guide_embed(STATS_PROFILES)
+        embed = build_stats_help_guide_embed(STATS_PROFILES, admin)
         await ctx.send(embed=embed)
     
     @commands.command(name='full', help=FULL_STATS_PROFILE.command_help)
@@ -88,7 +91,8 @@ class StatsCog(commands.Cog, name="Stats"):
         """Get stats from casual/social matches only"""
         await self._run_profile_from_inputs(ctx, CASUAL_STATS_PROFILE, inputs)
     
-    @commands.command(name='cachestatus', help='Show progress and estimates for background player caching.')
+    @commands.command(name='cachestatus', help='Show progress and estimates for background player caching. Admin only.')
+    @admin_only()
     async def cache_status(self, ctx: commands.Context):
         """Display the current status of background stats caching"""
         try:
@@ -104,7 +108,8 @@ class StatsCog(commands.Cog, name="Stats"):
             await ctx.send(f"Error checking cache status: {e}")
             print(f"Error in cache_status: {e}")
     
-    @commands.command(name='xboxfriends', help='Fetch Xbox friends and friends-of-friends, then apply blacklist checks. Usage: #xboxfriends <gamertag>')
+    @commands.command(name='xboxfriends', help='Fetch Xbox friends and friends-of-friends, then apply blacklist checks. Usage: #xboxfriends <gamertag>. Admin only.')
+    @admin_only()
     async def friends_list(self, ctx: commands.Context, *inputs):
         """Get a player's Xbox friends list and friends-of-friends, checking against blacklist"""
         if not inputs:

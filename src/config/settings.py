@@ -83,6 +83,15 @@ def get_terminal_admin_password() -> str:
 # Leave unset/empty to disable admin terminal login.
 TERMINAL_ADMIN_PASSWORD = get_terminal_admin_password()
 
+
+def get_admin_user_ids() -> set[int]:
+    """Return the set of Discord user IDs allowed to run admin-only commands."""
+    raw = os.getenv("ADMIN_USER_IDS", "")
+    return {int(part) for part in raw.split(",") if part.strip().isdigit()}
+
+# Discord user IDs allowed to run admin-only bot commands.
+ADMIN_USER_IDS = get_admin_user_ids()
+
 # =============================================================================
 # INITIALIZATION
 # =============================================================================

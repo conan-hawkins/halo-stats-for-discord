@@ -8,9 +8,12 @@ from typing import Dict
 import discord
 from discord.ext import commands
 
+from src.bot.checks import admin_only
+
 
 class HaloGroupsCommandMixin:
-    @commands.command(name="halogroups", help="Show co-play communities and overlap matrix. Usage: #halogroups <gamertag>")
+    @commands.command(name="halogroups", help="Show co-play communities and overlap matrix. Usage: #halogroups <gamertag>. Admin only.")
+    @admin_only()
     async def show_halogroups(self, ctx: commands.Context, *inputs):
         """Show detected co-play communities around a player and export overlap CSVs."""
         if not inputs:

@@ -12,6 +12,7 @@ from typing import Optional
 from discord.ext import commands
 
 from src.api import api_client
+from src.bot.checks import admin_only
 from src.bot.cogs.graph_commands import (
     CrawlFriendsCommandMixin,
     CrawlGamesCommandMixin,
@@ -74,7 +75,7 @@ class GraphCog(
         )
 
     @commands.command(name="crawlstop", help="Stop the current background crawl. Admin only.")
-    @commands.has_permissions(administrator=True)
+    @admin_only()
     async def stop_crawl(self, ctx: commands.Context):
         """Stop the current background crawl."""
         if self._crawl_task and not self._crawl_task.done():

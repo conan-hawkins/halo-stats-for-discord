@@ -7,10 +7,12 @@ from typing import Awaitable, Callable, Optional
 import discord
 from discord.ext import commands
 
+from src.bot.checks import admin_only
+
 
 class CrawlFriendsCommandMixin:
     @commands.command(name="crawlfriends", help="Start a background Halo-friends crawl from a seed player. Admin only.")
-    @commands.has_permissions(administrator=True)
+    @admin_only()
     async def start_crawl(
         self,
         ctx: commands.Context,

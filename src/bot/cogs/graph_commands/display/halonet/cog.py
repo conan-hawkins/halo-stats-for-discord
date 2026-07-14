@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 
 from src.api import api_client
+from src.bot.checks import admin_only
 from src.bot.cogs.graph_commands.display.halonet.ui import HaloNetFilterView, HaloNetNodeInfoView
 from src.database.graph_schema import get_graph_db
 
@@ -483,8 +484,9 @@ class HaloNetCog(commands.Cog, name="HaloNet"):
 
     @commands.command(
         name="halonet",
-        help="Show a co-play network visualization from graph DB data with seed auto-refresh. Usage: #halonet <gamertag>",
+        help="Show a co-play network visualization from graph DB data with seed auto-refresh. Usage: #halonet <gamertag>. Admin only.",
     )
+    @admin_only()
     async def show_halonet(self, ctx: commands.Context, *inputs):
         """Show a player's local co-play network from stored graph_coplay data."""
         if not inputs:

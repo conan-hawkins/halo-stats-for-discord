@@ -5,9 +5,12 @@ from datetime import datetime
 import discord
 from discord.ext import commands
 
+from src.bot.checks import admin_only
+
 
 class GraphStatsCommandMixin:
-    @commands.command(name="graphstats", help="Show current social graph database totals, depth distribution, and size.")
+    @commands.command(name="graphstats", help="Show current social graph database totals, depth distribution, and size. Admin only.")
+    @admin_only()
     async def graph_stats(self, ctx: commands.Context):
         """Display statistics about the social graph database."""
         stats = self.db.get_graph_stats()

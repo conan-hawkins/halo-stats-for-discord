@@ -27,6 +27,7 @@ import os
 import time
 import traceback
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
@@ -156,6 +157,15 @@ class HaloAPIClient:
         # Track token refresh attempts (prevent infinite loops)
         self._refresh_in_progress = False
         self._last_refresh_time = 0.0
+
+        # Dedicated single-worker executor for blocking SQLite writes, so they
+        # never stall the asyncio event loop / gateway heartbeat (critical on
+        # HDD-backed storage where a commit can take tens of ms). One worker =>
+        # one writer connection => no write-lock contention, and writes are
+        # naturally serialized, which spinning disks strongly prefer.
+        self._db_write_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="halo-db-writer"
+        )
 
     async def _refresh_account_via_swap(self, account_num: int, account_cache: Dict) -> bool:
         """Refresh a secondary account by swapping its cache into the primary slot."""
@@ -1269,9 +1279,26 @@ class HaloAPIClient:
             
             if not xuid:
                 return {"error": 2, "message": f"Could not resolve gamertag '{gamertag}' to XUID"}
-            
+
             print(f"Using XUID: {xuid}")
-            
+
+            # Fast path: read precomputed per-mode stats instead of pulling
+            # full match history (with its per-match medal lookups) and
+            # recomputing aggregates on demand. Skipped for forced/full-history
+            # fetches, which need calculate_comprehensive_stats' live-fetch logic.
+            full_history_requested = matches_to_process is None or matches_to_process >= 999999
+            if not force_full_fetch and not full_history_requested:
+                summary = self.stats_cache.get_player_mode_summary(xuid, stat_type)
+                if summary is not None:
+                    print(f"Using precomputed player_mode_stats summary for {gamertag}")
+                    stats_result = {
+                        'error': 0,
+                        'stats': summary,
+                        'matches_processed': summary['games_played'],
+                        'new_matches': 0,
+                    }
+                    return self.parse_stats(stats_result, stat_type, gamertag)
+
             # Set up headers with whatever token we have
             headers = {
                 "User-Agent": self.user_agent,
@@ -1422,6 +1449,16 @@ class HaloAPIClient:
             print(f"Error saving cache: {e}")
             traceback.print_exc()
 
+    def _persist_match_with_participants(self, stats_db, match_id, match_data, participants) -> bool:
+        """Blocking helper: write one match + its participants. Runs on the
+        dedicated DB-writer thread via run_in_executor so it never blocks the
+        event loop. Each write self-commits (this seed-backfill path is not the
+        hot write path - the per-player crawl save in save_player_stats is, and
+        that one is batched into a single transaction)."""
+        wrote_match = bool(stats_db.insert_match(match_data))
+        wrote_participants = bool(stats_db.insert_match_participants(match_id, participants))
+        return wrote_match and wrote_participants
+
     async def backfill_seed_match_participants(
         self,
         seed_xuid: str,
@@ -1547,9 +1584,12 @@ class HaloAPIClient:
                         if not match_data or not participants:
                             failed_match_ids.append(match_id)
                         else:
-                            wrote_match = bool(stats_db.insert_match(match_data))
-                            wrote_participants = bool(stats_db.insert_match_participants(match_id, participants))
-                            if wrote_match and wrote_participants:
+                            wrote = await asyncio.get_running_loop().run_in_executor(
+                                self._db_write_executor,
+                                self._persist_match_with_participants,
+                                stats_db, match_id, match_data, participants,
+                            )
+                            if wrote:
                                 successful_backfills += 1
                             else:
                                 failed_match_ids.append(match_id)
@@ -2955,8 +2995,12 @@ class HaloAPIClient:
                     }
                 }
                 
-                # Save to cache
-                self.save_stats_cache(xuid, stat_type, cache_data, gamertag)
+                # Save to cache off the event loop, so the blocking SQLite write
+                # batch can't stall the gateway heartbeat or other commands.
+                await asyncio.get_running_loop().run_in_executor(
+                    self._db_write_executor,
+                    self.save_stats_cache, xuid, stat_type, cache_data, gamertag,
+                )
                 
                 # Return the appropriate stats based on stat_type
                 if stat_type == "ranked":

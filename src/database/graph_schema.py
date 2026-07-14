@@ -56,6 +56,16 @@ class HaloSocialGraphDB:
             self.local.conn.execute("PRAGMA journal_mode=WAL")
             # Enable foreign keys
             self.local.conn.execute("PRAGMA foreign_keys=ON")
+            # Block-and-retry instead of failing immediately under write contention
+            self.local.conn.execute("PRAGMA busy_timeout=5000")
+            # Safe with WAL: skips the per-commit fsync (see HaloStatsDBv2).
+            self.local.conn.execute("PRAGMA synchronous=NORMAL")
+            # Keep sort/temp b-trees in RAM, off the HDD.
+            self.local.conn.execute("PRAGMA temp_store=MEMORY")
+            # Modest 16MB page cache: graph rendering runs in executor threads,
+            # each with its own thread-local connection, so this multiplies -
+            # keep it small to stay within the 8GB budget alongside matplotlib.
+            self.local.conn.execute("PRAGMA cache_size=-16000")
         return self.local.conn
     
     def _init_db(self):

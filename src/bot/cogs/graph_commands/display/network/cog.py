@@ -7,6 +7,7 @@ friend-graph concerns isolated.
 import discord
 from discord.ext import commands
 
+from src.bot.checks import admin_only
 from src.bot.cogs.graph_commands.display.network.runtime import execute_show_network, render_network_graph
 from src.database.graph_schema import get_graph_db
 
@@ -41,8 +42,9 @@ class NetworkCog(commands.Cog, name="Network"):
 
     @commands.command(
         name="network",
-        help="Show a player network visualization from graph DB data. Usage: #network <gamertag>",
+        help="Show a player network visualization from graph DB data. Usage: #network <gamertag>. Admin only.",
     )
+    @admin_only()
     async def show_network(self, ctx: commands.Context, *inputs):
         await execute_show_network(self, ctx, self.db, inputs)
 

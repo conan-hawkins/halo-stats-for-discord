@@ -35,37 +35,79 @@ class PlayerStatsCacheV2:
         Returns:
             True if successful, False otherwise
         """
+        conn = self.db._get_connection()
         try:
-            # Insert/update player
+            # The whole per-player batch is written under ONE transaction and
+            # committed once at the end (one fsync-class write instead of ~4 per
+            # match - the dominant cost on HDD-backed storage; composes with
+            # synchronous=NORMAL). To keep atomicity per-match despite the single
+            # commit, each match is wrapped in its own SAVEPOINT: a single bad
+            # match rolls back only itself and the batch continues ("114 of 115",
+            # never "0 of 115"), and no partial player_mode_stats delta or
+            # ALTER TABLE from a failed match survives the commit.
             last_update = stats_data.get('last_update', datetime.now().isoformat())
-            self.db.insert_or_update_player(xuid, gamertag, last_update)
-            
+            self.db.insert_or_update_player(xuid, gamertag, last_update, commit=False)
+
             # Process each match
             matches_to_save = stats_data.get('processed_matches', [])
             print(f"[CACHE] Saving {len(matches_to_save)} matches for {gamertag or xuid}")
-            
+
             matches_saved = 0
             for match_data in matches_to_save:
                 match_id = match_data.get('match_id')
                 if not match_id:
                     continue
-                
-                # Insert match metadata
-                self.db.insert_match(match_data)
 
-                # Persist full roster when participant payload is available.
+                # Primary unit: match metadata + this player's performance, kept
+                # atomic so the player_mode_stats summary can never desync from
+                # player_match (insert_player_match applies the summary delta).
+                conn.execute("SAVEPOINT player_match_write")
+                try:
+                    saved_ok = self.db.insert_match(match_data, commit=False)
+                    if saved_ok:
+                        saved_ok = self.db.insert_player_match(xuid, match_data, commit=False)
+                except Exception as match_err:
+                    saved_ok = False
+                    print(f"[CACHE] Skipping match {match_id}: {match_err}")
+
+                if saved_ok:
+                    conn.execute("RELEASE SAVEPOINT player_match_write")
+                    matches_saved += 1
+                else:
+                    conn.execute("ROLLBACK TO SAVEPOINT player_match_write")
+                    conn.execute("RELEASE SAVEPOINT player_match_write")
+                    # A rolled-back ALTER TABLE may have removed a medal column
+                    # we recorded in the in-memory cache.
+                    self.db._reset_medal_set_columns_cache()
+                    continue
+
+                # Supplementary roster data: best-effort and isolated in its own
+                # savepoint, so a participants failure never rolls back the
+                # player's own match stats saved above.
                 participants = match_data.get('all_participants') or []
                 if participants:
-                    self.db.insert_match_participants(match_id, participants)
-                
-                # Insert player's performance in this match
-                if self.db.insert_player_match(xuid, match_data):
-                    matches_saved += 1
-            
+                    conn.execute("SAVEPOINT participants_write")
+                    try:
+                        part_ok = self.db.insert_match_participants(match_id, participants, commit=False)
+                    except Exception as part_err:
+                        part_ok = False
+                        print(f"[CACHE] Participants for {match_id} failed: {part_err}")
+                    if part_ok:
+                        conn.execute("RELEASE SAVEPOINT participants_write")
+                    else:
+                        conn.execute("ROLLBACK TO SAVEPOINT participants_write")
+                        conn.execute("RELEASE SAVEPOINT participants_write")
+
+            conn.commit()
             print(f"[CACHE] Successfully saved {matches_saved}/{len(matches_to_save)} matches for {gamertag or xuid}")
             return True
-            
+
         except Exception as e:
+            # Batch-level failure (e.g. the player upsert or the final commit).
+            # Undo everything and drop the medal-column cache, since a rolled-back
+            # ALTER TABLE may have removed a column we recorded.
+            conn.rollback()
+            self.db._reset_medal_set_columns_cache()
             print(f"Error saving stats for {xuid}: {e}")
             return False
     
@@ -199,6 +241,53 @@ class PlayerStatsCacheV2:
         
         return matches
     
+    def get_player_mode_summary(self, xuid: str, stat_type: str = "overall") -> Optional[Dict]:
+        """
+        Get precomputed per-player, per-game-mode stats from player_mode_stats.
+
+        Returns None if no summary row exists yet (e.g. player added before
+        the table was backfilled, or before their first match was inserted) -
+        callers should fall back to on-demand calculation in that case.
+        """
+        conn = self.db._get_connection()
+        cursor = conn.cursor()
+
+        game_mode = stat_type if stat_type in ("ranked", "social") else "overall"
+
+        cursor.execute(
+            "SELECT * FROM player_mode_stats WHERE xuid = ? AND game_mode = ?",
+            (xuid, game_mode)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        total_kills = row['total_kills']
+        total_deaths = row['total_deaths']
+        total_assists = row['total_assists']
+        games_played = row['games_played']
+        wins = row['wins']
+
+        kd_ratio = round(total_kills / total_deaths if total_deaths > 0 else total_kills, 2)
+        kda = round((total_kills + (total_assists / 3)) - total_deaths, 2)
+        avg_kda = round(kda / games_played if games_played > 0 else 0, 2)
+        win_rate = f"{round(wins / games_played * 100 if games_played > 0 else 0, 1)}%"
+
+        return {
+            'total_kills': total_kills,
+            'total_deaths': total_deaths,
+            'total_assists': total_assists,
+            'wins': wins,
+            'losses': row['losses'],
+            'ties': row['draws'],
+            'dnf': row['dnf'],
+            'games_played': games_played,
+            'kd_ratio': kd_ratio,
+            'kda': kda,
+            'avg_kda': avg_kda,
+            'win_rate': win_rate
+        }
+
     def _get_medals_for_set(self, medal_set_id: int) -> List[Dict]:
         """Get medal list from medal_set_id"""
         conn = self.db._get_connection()

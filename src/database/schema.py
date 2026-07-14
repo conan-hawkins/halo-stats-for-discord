@@ -78,6 +78,9 @@ class HaloStatsDBv2:
     def __init__(self, db_path: str = None):
         self.db_path = db_path or str(DATABASE_FILE)
         self.local = threading.local()
+        # Cache of medal_sets column names, populated lazily from the live
+        # schema. Avoids re-running PRAGMA table_info on the hot insert path.
+        self._medal_set_columns: Optional[set] = None
         self._init_db()
     
     def _get_connection(self) -> sqlite3.Connection:
@@ -89,6 +92,18 @@ class HaloStatsDBv2:
             self.local.conn.execute("PRAGMA journal_mode=WAL")
             # Enable foreign keys
             self.local.conn.execute("PRAGMA foreign_keys=ON")
+            # Block-and-retry instead of failing immediately under write contention
+            self.local.conn.execute("PRAGMA busy_timeout=5000")
+            # Safe with WAL: skips the per-commit fsync (only a checkpoint fsync
+            # could be lost on an OS/power crash, never on a process crash, and
+            # never corruption). Biggest single write-latency win on an HDD.
+            self.local.conn.execute("PRAGMA synchronous=NORMAL")
+            # Keep ORDER BY / GROUP BY / DISTINCT spill b-trees in RAM, off the HDD.
+            self.local.conn.execute("PRAGMA temp_store=MEMORY")
+            # ~128MB page cache. Access to this (large, HDD-backed) DB is
+            # concentrated on the asyncio event-loop thread, so connection count
+            # is low and this does not multiply badly across threads.
+            self.local.conn.execute("PRAGMA cache_size=-131072")
         return self.local.conn
     
     def _init_db(self):
@@ -196,6 +211,29 @@ class HaloStatsDBv2:
         """)
         
         # ============================================================
+        # Table 7: Player Mode Stats - Precomputed per-player, per-game-mode
+        # aggregates, maintained incrementally by insert_player_match to
+        # avoid on-demand full match-history scans.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_mode_stats (
+                xuid TEXT NOT NULL,
+                game_mode TEXT NOT NULL,
+                games_played INTEGER NOT NULL DEFAULT 0,
+                total_kills INTEGER NOT NULL DEFAULT 0,
+                total_deaths INTEGER NOT NULL DEFAULT 0,
+                total_assists INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                draws INTEGER NOT NULL DEFAULT 0,
+                dnf INTEGER NOT NULL DEFAULT 0,
+                last_updated TEXT,
+                PRIMARY KEY (xuid, game_mode),
+                FOREIGN KEY (xuid) REFERENCES players(xuid)
+            )
+        """)
+
+        # ============================================================
         # Indexes for performance
         # ============================================================
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_start_time ON matches(start_time)")
@@ -278,60 +316,84 @@ class HaloStatsDBv2:
         medal_str = json.dumps(sorted_medals, sort_keys=True)
         return hashlib.md5(medal_str.encode()).hexdigest()
     
-    def get_or_create_medal_set(self, medals: List[Dict]) -> Optional[int]:
-        """Get existing medal_set_id or create new one for the medal combination"""
+    def _load_medal_set_columns(self, cursor: sqlite3.Cursor) -> set:
+        """Return the (cached) set of medal_sets column names, populating it
+        from the live schema on first use. Cheap once warm - avoids running
+        PRAGMA table_info on every medal insert."""
+        if self._medal_set_columns is None:
+            cursor.execute("PRAGMA table_info(medal_sets)")
+            self._medal_set_columns = {row['name'] for row in cursor.fetchall()}
+        return self._medal_set_columns
+
+    def _reset_medal_set_columns_cache(self) -> None:
+        """Drop the cached medal_sets column set. Call after a rolled-back
+        transaction that may have undone an ALTER TABLE ADD COLUMN, so the next
+        call re-reads the real schema instead of trusting a stale cache."""
+        self._medal_set_columns = None
+
+    def get_or_create_medal_set(self, medals: List[Dict], commit: bool = True) -> Optional[int]:
+        """Get existing medal_set_id or create new one for the medal combination.
+
+        Pass commit=False to take part in a caller-managed transaction (the row
+        is still written, just not committed here)."""
         if not medals:
             return None
-        
+
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         # Generate hash for this medal combination
         medal_hash = self._generate_medal_hash(medals)
-        
+
         # Check if this combination already exists
         cursor.execute("SELECT medal_set_id FROM medal_sets WHERE medal_hash = ?", (medal_hash,))
         row = cursor.fetchone()
-        
+
         if row:
             return row['medal_set_id']
-        
-        # Create new medal set
-        # Build column names and values
+
+        # New combination. Resolve the current column set once (cached across
+        # calls), instead of re-scanning PRAGMA table_info once per medal.
+        existing_cols = self._load_medal_set_columns(cursor)
+
+        # Create new medal set - build column names and values
         columns = ["medal_hash"]
         values = [medal_hash]
         placeholders = ["?"]
-        
+
         for medal in medals:
             name_id = medal.get('NameId')
             count = medal.get('Count', 0)
             if name_id and count > 0:
                 col_name = f"medal_{name_id}"
-                # Check if column exists (for unknown medals)
-                cursor.execute(f"PRAGMA table_info(medal_sets)")
-                existing_cols = {row['name'] for row in cursor.fetchall()}
-                
                 if col_name not in existing_cols:
-                    # Add column for new medal type
-                    cursor.execute(f"ALTER TABLE medal_sets ADD COLUMN {col_name} INTEGER NOT NULL DEFAULT 0")
+                    # Add column for new medal type. Guard against the race
+                    # where a concurrent writer already added it (the ALTER
+                    # then raises "duplicate column name", which is benign).
+                    try:
+                        cursor.execute(f"ALTER TABLE medal_sets ADD COLUMN {col_name} INTEGER NOT NULL DEFAULT 0")
+                    except sqlite3.OperationalError:
+                        pass
+                    existing_cols.add(col_name)
                     # Also add to medal_types if not exists
                     cursor.execute("""
                         INSERT OR IGNORE INTO medal_types (medal_name_id, medal_name, medal_category)
                         VALUES (?, ?, ?)
                     """, (name_id, f"Unknown Medal {name_id}", "Unknown"))
-                
+
                 columns.append(col_name)
                 values.append(count)
                 placeholders.append("?")
-        
+
         # Insert new medal set
         sql = f"INSERT INTO medal_sets ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
         cursor.execute(sql, values)
-        conn.commit()
-        
+        if commit:
+            conn.commit()
+
         return cursor.lastrowid
     
-    def insert_match(self, match_data: Dict) -> bool:
+    def insert_match(self, match_data: Dict, commit: bool = True) -> bool:
         """Insert match metadata"""
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -367,14 +429,15 @@ class HaloStatsDBv2:
                     match_data.get('match_id'),
                 ),
             )
-            conn.commit()
+            if commit:
+                conn.commit()
             return True
         except Exception as e:
             print(f"Error inserting match: {e}")
             return False
     
-    def insert_or_update_player(self, xuid: str, gamertag: str = None, 
-                                 last_processed_at: str = None) -> bool:
+    def insert_or_update_player(self, xuid: str, gamertag: str = None,
+                                 last_processed_at: str = None, commit: bool = True) -> bool:
         """Insert or update player information"""
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -407,42 +470,112 @@ class HaloStatsDBv2:
                     VALUES (?, ?, ?, ?)
                 """, (xuid, gamertag, last_processed_at, datetime.now().isoformat()))
             
-            conn.commit()
+            if commit:
+                conn.commit()
             return True
         except Exception as e:
             print(f"Error inserting/updating player: {e}")
             return False
     
-    def insert_player_match(self, xuid: str, match_data: Dict) -> bool:
+    @staticmethod
+    def _outcome_bucket(outcome: int) -> Optional[str]:
+        """Map a player_match outcome code to its player_mode_stats column."""
+        return {1: 'draws', 2: 'wins', 3: 'losses', 4: 'dnf'}.get(outcome)
+
+    def _apply_player_mode_stats_delta(self, cursor: sqlite3.Cursor, xuid: str,
+                                        match_id: str, match_data: Dict) -> None:
+        """Update the precomputed player_mode_stats row(s) for xuid to reflect
+        this match insert/replace, using a signed delta so reprocessing an
+        already-seen match (INSERT OR REPLACE) doesn't double-count."""
+        cursor.execute(
+            "SELECT kills, deaths, assists, outcome FROM player_match WHERE xuid = ? AND match_id = ?",
+            (xuid, match_id)
+        )
+        old_row = cursor.fetchone()
+
+        new_kills = match_data.get('kills', 0)
+        new_deaths = match_data.get('deaths', 0)
+        new_assists = match_data.get('assists', 0)
+        new_outcome = match_data.get('outcome', 0)
+
+        kills_delta = new_kills - (old_row['kills'] if old_row else 0)
+        deaths_delta = new_deaths - (old_row['deaths'] if old_row else 0)
+        assists_delta = new_assists - (old_row['assists'] if old_row else 0)
+        games_delta = 0 if old_row else 1
+
+        old_bucket = self._outcome_bucket(old_row['outcome']) if old_row else None
+        new_bucket = self._outcome_bucket(new_outcome)
+        bucket_deltas = {'wins': 0, 'losses': 0, 'draws': 0, 'dnf': 0}
+        if old_bucket:
+            bucket_deltas[old_bucket] -= 1
+        if new_bucket:
+            bucket_deltas[new_bucket] += 1
+
+        # Buckets mirror HaloClient._calculate_stats_from_matches' stat_type
+        # filter, which splits on is_ranked (not match_category) - e.g.
+        # stat_type="social" includes custom/unknown matches too, as long as
+        # they aren't ranked.
+        game_mode = 'ranked' if match_data.get('is_ranked') else 'social'
+        now = datetime.now().isoformat()
+
+        for mode in {game_mode, 'overall'}:
+            cursor.execute(
+                "INSERT OR IGNORE INTO player_mode_stats (xuid, game_mode) VALUES (?, ?)",
+                (xuid, mode)
+            )
+            cursor.execute("""
+                UPDATE player_mode_stats
+                SET games_played = games_played + ?,
+                    total_kills = total_kills + ?,
+                    total_deaths = total_deaths + ?,
+                    total_assists = total_assists + ?,
+                    wins = wins + ?,
+                    losses = losses + ?,
+                    draws = draws + ?,
+                    dnf = dnf + ?,
+                    last_updated = ?
+                WHERE xuid = ? AND game_mode = ?
+            """, (
+                games_delta, kills_delta, deaths_delta, assists_delta,
+                bucket_deltas['wins'], bucket_deltas['losses'],
+                bucket_deltas['draws'], bucket_deltas['dnf'],
+                now, xuid, mode
+            ))
+
+    def insert_player_match(self, xuid: str, match_data: Dict, commit: bool = True) -> bool:
         """Insert player's performance for a specific match"""
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         try:
             # Get or create medal set
             medals = match_data.get('medals', [])
-            medal_set_id = self.get_or_create_medal_set(medals) if medals else None
-            
+            medal_set_id = self.get_or_create_medal_set(medals, commit=commit) if medals else None
+
+            match_id = match_data.get('match_id')
+            self._apply_player_mode_stats_delta(cursor, xuid, match_id, match_data)
+
             cursor.execute("""
-                INSERT OR REPLACE INTO player_match 
+                INSERT OR REPLACE INTO player_match
                 (xuid, match_id, kills, deaths, assists, outcome, medal_set_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 xuid,
-                match_data.get('match_id'),
+                match_id,
                 match_data.get('kills', 0),
                 match_data.get('deaths', 0),
                 match_data.get('assists', 0),
                 match_data.get('outcome', 0),
                 medal_set_id
             ))
-            conn.commit()
+            if commit:
+                conn.commit()
             return True
         except Exception as e:
             print(f"Error inserting player_match: {e}")
             return False
 
-    def insert_match_participants(self, match_id: str, participants: List[Dict]) -> bool:
+    def insert_match_participants(self, match_id: str, participants: List[Dict], commit: bool = True) -> bool:
         """Insert or update all participants for a match."""
         if not match_id or not participants:
             return True
@@ -495,7 +628,8 @@ class HaloStatsDBv2:
                     ),
                 )
 
-            conn.commit()
+            if commit:
+                conn.commit()
             return True
         except Exception as e:
             print(f"Error inserting match participants for {match_id}: {e}")
