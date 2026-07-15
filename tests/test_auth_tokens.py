@@ -1,8 +1,9 @@
 import asyncio
+import time
 
 import pytest
 
-from src.auth.tokens import HaloAuth
+from src.auth.tokens import AuthenticationManager, HaloAuth, TokenCache
 
 
 class _CancelledRequestContext:
@@ -48,6 +49,42 @@ async def test_request_clearance_returns_placeholder_on_cancelled(monkeypatch):
     assert result is not None
     assert result["token"] == "skip"
     assert result["FlightConfigurationId"] == "skip"
+
+
+def test_token_cache_get_accepts_default(tmp_path):
+    cache_file = tmp_path / "cache.json"
+    cache = TokenCache(str(cache_file))
+
+    assert cache.get("missing_key") is None
+    assert cache.get("missing_key", {}) == {}
+    assert cache.get("missing_key", {}).get("xuid") is None
+
+
+@pytest.mark.asyncio
+async def test_get_clearance_token_falls_back_to_cached_spartan(monkeypatch, tmp_path):
+    """Spartan valid but clearance/xsts stale should hit the cached-Spartan cascade
+    branch (tokens.py get_clearance_token) without raising TypeError from
+    TokenCache.get(key, default)."""
+    from src.auth import tokens as tokens_module
+
+    cache_file = tmp_path / "cache.json"
+    manager = AuthenticationManager("client-id", "client-secret", cache_file=str(cache_file))
+    manager.cache.update({
+        "spartan": {"token": "spartan-token", "expires_at": time.time() + 3600},
+        "xsts": {"token": "xsts-token", "expires_at": time.time() + 3600, "xuid": "12345"},
+    })
+
+    async def fake_request_clearance(spartan_token, xuid):
+        assert spartan_token == "spartan-token"
+        assert xuid == "12345"
+        return {"token": "clearance-token", "FlightConfigurationId": "clearance-token", "expires_at": time.time() + 86400}
+
+    monkeypatch.setattr(tokens_module.HaloAuth, "request_clearance", staticmethod(fake_request_clearance))
+
+    result = await manager.get_clearance_token()
+
+    assert result == "clearance-token"
+    assert manager.cache.get("clearance")["token"] == "clearance-token"
 
 
 @pytest.mark.asyncio

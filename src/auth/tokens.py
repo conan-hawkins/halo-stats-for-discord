@@ -53,9 +53,9 @@ class TokenCache:
         """Check if a token is valid (not expired)"""
         return token_info and token_info.get("expires_at", 0) > time.time()
     
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
+    def get(self, key: str, default: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Get a token from cache"""
-        return self.cache.get(key)
+        return self.cache.get(key, default)
     
     def set(self, key: str, value: Dict[str, Any]):
         """Set a token in cache and save"""
