@@ -58,4 +58,3 @@ data/token_cache*.json
 *.json
 bot_docs/
 analysis_results/
-auth/
