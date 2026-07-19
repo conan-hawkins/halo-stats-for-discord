@@ -24,12 +24,13 @@ import aiohttp
 import asyncio
 import json
 import os
+import re
 import time
 import traceback
 import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from dotenv import load_dotenv
 
 # Load environment variables before module initialization
@@ -38,10 +39,11 @@ load_dotenv()
 from src.auth.tokens import run_auth_flow
 from src.database.cache import get_cache
 from src.config import (
-    TOKEN_CACHE_FILE, 
+    TOKEN_CACHE_FILE,
     get_token_cache_path,
     XUID_CACHE_FILE,
-    REQUESTS_PER_SECOND_PER_ACCOUNT
+    REQUESTS_PER_SECOND_PER_ACCOUNT,
+    CORE_RANKED_PLAYLIST_IDS,
 )
 
 # Import from refactored modules
@@ -99,11 +101,30 @@ class HaloAPIClient:
     SETTINGS_URL = "https://settings.svc.halowaypoint.com"
     STATS_URL = "https://halostats.svc.halowaypoint.com"
     PROFILE_URL = "https://profile.svc.halowaypoint.com/users/by-gamertag"
+    DISCOVERY_UGC_URL = "https://discovery-infiniteugc.svc.halowaypoint.com"
     USER_AGENT = "HaloWaypoint/2021.01.10.01"
+    # Zero-network fast path for known ranked playlist asset IDs. Asset IDs
+    # rotate across seasons, so this static set is only a best-effort
+    # accelerator - playlist_metadata name-matching (_lookup_or_resolve_playlist_ranked)
+    # is the durable mechanism, and e.g. Ranked Slayer
+    # (dcb2e24e-05fb-4390-8076-32a0cdb4326e) is already caught that way. IDs
+    # cross-checked against Den Delimarsky's confirmed playlist list
+    # (den.dev/blog/halo-infinite-playlist-weights).
     RANKED_PLAYLIST_IDS = {
-        "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b",  # Ranked Arena
-        "edfef3ac-9cbe-4fa2-b949-8f29deafd483",  # Ranked Slayer
+        "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b",  # Ranked Arena (older-season asset id)
+        "edfef3ac-9cbe-4fa2-b949-8f29deafd483",  # Ranked Arena
     }
+    # Word-boundary match so a hypothetical "Unranked ..." playlist name can
+    # never classify as ranked; still matches "RANKED 1V1 SHOWDOWN" and
+    # "Squad Battle: Ranked" style names. Run against lowercased text.
+    RANKED_NAME_RE = re.compile(r"\branked\b")
+    # Substrings that mark a playlist's PublicName as PvE (co-op vs AI), which
+    # should be excluded from PvP "overall"/"social" aggregates the same way
+    # private/forge customs are. All known Firefight playlists (Gruntpocalypse,
+    # King of the Hill, Battle for Reach, Classic/Heroic/Legendary, ...) carry
+    # "firefight" in their name. Deliberately NOT "bot bootcamp" - that is
+    # PvP-vs-AI matchmaking, a separate call left counted as social for now.
+    PVE_PLAYLIST_NAME_HINTS = {"firefight"}
     EXPLICIT_CUSTOM_FLAG_KEYS = {
         "iscustom",
         "iscustommatch",
@@ -166,6 +187,11 @@ class HaloAPIClient:
         self._db_write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="halo-db-writer"
         )
+
+        # In-flight background full-history collections, keyed by xuid, so a
+        # second request for the same brand-new player doesn't start a
+        # duplicate collect. Different players collect concurrently.
+        self._full_collect_tasks: Dict[str, asyncio.Task] = {}
 
     async def _refresh_account_via_swap(self, account_num: int, account_cache: Dict) -> bool:
         """Refresh a secondary account by swapping its cache into the primary slot."""
@@ -578,28 +604,33 @@ class HaloAPIClient:
         """
         try:
             cache_file = TOKEN_CACHE_FILE
-            
+
             if not os.path.exists(cache_file):
                 print(f"ERROR: Token cache file '{cache_file}' not found")
                 print("Run: python get_auth_tokens.py")
                 return False
-            
-            cache = safe_read_json(cache_file, default={})
-            if not cache:
-                print("ERROR: Failed to parse token cache")
-                return False
-            
-            # Validate spartan and Xbox XSTS tokens
-            spartan_info = cache.get("spartan")
-            xsts_xbox_info = cache.get("xsts_xbox")
-            
-            if is_token_valid(spartan_info) and is_token_valid(xsts_xbox_info):
-                self.spartan_token = spartan_info.get("token")
-                if self.spartan_token:
-                    expires = time.ctime(spartan_info.get('expires_at', 0))
-                    print(f"Loaded valid Spartan token (expires: {expires})")
-                    return True
-            
+
+            # Hold the swap lock while reading so this can't observe another
+            # account's cache mid-swap (see _refresh_account_via_swap /
+            # proactive_token_refresh, which temporarily overwrite
+            # TOKEN_CACHE_FILE with account 2-5's data while refreshing it).
+            async with get_token_swap_lock():
+                cache = safe_read_json(cache_file, default={})
+                if not cache:
+                    print("ERROR: Failed to parse token cache")
+                    return False
+
+                # Validate spartan and Xbox XSTS tokens
+                spartan_info = cache.get("spartan")
+                xsts_xbox_info = cache.get("xsts_xbox")
+
+                if is_token_valid(spartan_info) and is_token_valid(xsts_xbox_info):
+                    self.spartan_token = spartan_info.get("token")
+                    if self.spartan_token:
+                        expires = time.ctime(spartan_info.get('expires_at', 0))
+                        print(f"Loaded valid Spartan token (expires: {expires})")
+                        return True
+
             print("Tokens expired or invalid - need refresh")
             return False
             
@@ -1255,28 +1286,33 @@ class HaloAPIClient:
         stat_type: str = "overall",
         matches_to_process: int = 10,
         force_full_fetch: bool = False,
+        xuid: Optional[str] = None,
     ) -> Dict:
         """
         Get comprehensive player statistics from Halo API.
-        
+
         Args:
             gamertag: Player's Xbox gamertag
-            stat_type: Type of stats ("overall", "ranked", "social")
+            stat_type: Type of stats ("overall", "ranked", "core_ranked",
+                "rotational_ranked", "social")
             matches_to_process: Number of matches to analyze
             force_full_fetch: If True, bypass cache and fetch full history from API
-        
+            xuid: Pre-resolved XUID, if the caller already has one (skips the
+                gamertag->XUID lookup, e.g. when it already checked
+                check_player_cached for the same player just before this call)
+
         Returns:
             Dictionary containing stats or error information
         """
         if not self.clearance_token:
             if not await self.get_clearance_token():
                 return {"error": 4, "message": "Failed to authenticate with Halo API"}
-        
+
         try:
-            # First, resolve gamertag to XUID
-            print(f"Resolving gamertag '{gamertag}' to XUID...")
-            xuid = await self.resolve_gamertag_to_xuid(gamertag)
-            
+            if not xuid:
+                print(f"Resolving gamertag '{gamertag}' to XUID...")
+                xuid = await self.resolve_gamertag_to_xuid(gamertag)
+
             if not xuid:
                 return {"error": 2, "message": f"Could not resolve gamertag '{gamertag}' to XUID"}
 
@@ -1310,8 +1346,10 @@ class HaloAPIClient:
                 try:
                     cache_file = TOKEN_CACHE_FILE
                     if os.path.exists(cache_file):
-                        with open(cache_file, 'r') as f:
-                            cache = json.loads(f.read())
+                        # Same swap-lock protection as get_clearance_token() above,
+                        # so this can't read another account's cache mid-swap either.
+                        async with get_token_swap_lock():
+                            cache = safe_read_json(cache_file, default={})
                         clearance = cache.get('clearance', {})
                         if isinstance(clearance, dict) and clearance.get('FlightConfigurationId'):
                             self.clearance_token = clearance['FlightConfigurationId']
@@ -1350,7 +1388,43 @@ class HaloAPIClient:
             print(f"EXCEPTION in get_player_stats: {e}")
             traceback.print_exc()
             return {"error": 4, "message": f"API request failed: {str(e)}"}
-    
+
+    def start_background_full_collect(
+        self,
+        xuid: str,
+        gamertag: str,
+        on_complete: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    ) -> None:
+        """
+        Kick off a background full-history collect for a brand-new player.
+
+        Deduped per-xuid: a second call for the same xuid while a collect is
+        still running is a no-op. Different players' collects run
+        concurrently. `on_complete`, if given, is awaited with the raw
+        calculate_comprehensive_stats result dict once the collect finishes
+        (or a {"error": ...} dict on failure) - kept caller-supplied so this
+        API-layer class stays free of any Discord-specific embed building.
+        """
+        existing = self._full_collect_tasks.get(xuid)
+        if existing and not existing.done():
+            return
+
+        async def _run():
+            try:
+                result = await self.calculate_comprehensive_stats(
+                    xuid, "overall", gamertag=gamertag,
+                    matches_to_process=None, force_full_fetch=False,
+                )
+            except Exception as e:
+                print(f"Background full collect failed for {gamertag or xuid}: {e}")
+                result = {"error": 4, "message": str(e)}
+            finally:
+                self._full_collect_tasks.pop(xuid, None)
+            if on_complete:
+                await on_complete(result)
+
+        self._full_collect_tasks[xuid] = asyncio.create_task(_run())
+
     # =========================================================================
     # CACHE MANAGEMENT
     # =========================================================================
@@ -1640,18 +1714,39 @@ class HaloAPIClient:
         
         Args:
             matches: List of match dictionaries with kills, deaths, assists, outcome, is_ranked
-            stat_type: "overall", "ranked", or "social" to filter matches
-        
+            stat_type: "overall", "ranked", "core_ranked", "rotational_ranked",
+                or "social" to filter matches
+
         Returns:
             Dictionary containing calculated stats (kd_ratio, avg_kda, win_rate, etc.)
         """
-        # Filter matches based on stat_type
+        # Filter matches based on stat_type. Custom/private matches
+        # (match_category == 'custom') are excluded from "social" and
+        # "overall" - they stay in the DB but never count toward aggregates.
+        # "core_ranked"/"rotational_ranked" split "ranked" by playlist:
+        # core = permanent playlists in CORE_RANKED_PLAYLIST_IDS (halotracker
+        # parity), rotational = every other CSR playlist.
         if stat_type == "ranked":
             filtered_matches = [m for m in matches if m.get('is_ranked', False)]
+        elif stat_type == "core_ranked":
+            filtered_matches = [
+                m for m in matches
+                if m.get('is_ranked', False)
+                and (m.get('playlist_id') or '').strip().lower() in CORE_RANKED_PLAYLIST_IDS
+            ]
+        elif stat_type == "rotational_ranked":
+            filtered_matches = [
+                m for m in matches
+                if m.get('is_ranked', False)
+                and (m.get('playlist_id') or '').strip().lower() not in CORE_RANKED_PLAYLIST_IDS
+            ]
         elif stat_type == "social":
-            filtered_matches = [m for m in matches if not m.get('is_ranked', False)]
+            filtered_matches = [
+                m for m in matches
+                if not m.get('is_ranked', False) and m.get('match_category') != 'custom'
+            ]
         else:
-            filtered_matches = matches
+            filtered_matches = [m for m in matches if m.get('match_category') != 'custom']
         
         # Calculate aggregate stats
         total_kills = sum(m.get('kills', 0) for m in filtered_matches)
@@ -1782,19 +1877,58 @@ class HaloAPIClient:
 
         return None
 
+    @classmethod
+    def _public_name_is_pve(cls, public_name: Optional[str]) -> bool:
+        """True if a playlist's PublicName marks it as PvE (see
+        PVE_PLAYLIST_NAME_HINTS). Case-insensitive substring test, mirroring
+        resolve_playlist_metadata's 'ranked' name check."""
+        if not public_name:
+            return False
+        lowered = public_name.lower()
+        return any(hint in lowered for hint in cls.PVE_PLAYLIST_NAME_HINTS)
+
     def _classify_match_category(
         self,
         playlist_asset_id: Optional[str],
         playlist_version_id: Optional[str],
         playlist_info: Optional[Dict],
         match_info: Optional[Dict],
+        metadata_is_ranked: Optional[bool] = None,
+        metadata_is_pve: Optional[bool] = None,
     ) -> Tuple[str, bool, str]:
-        """Classify match type for filtering and analytics compatibility."""
+        """Classify match type for filtering and analytics compatibility.
+
+        metadata_is_ranked comes from the playlist_metadata cache (see
+        _lookup_or_resolve_playlist_ranked) - a live "ranked" substring match
+        against the playlist's real PublicName, resolved via the
+        discovery-infiniteugc API. RANKED_PLAYLIST_IDS is checked first as a
+        zero-network fast path for already-known IDs, but Halo Infinite
+        rotates playlist asset IDs across seasons, so that static set alone
+        misses newer/reworked ranked playlists - metadata_is_ranked=True
+        catches those. False/None means "no positive signal from the cache",
+        not "confirmed not ranked" - the existing heuristics below still run.
+
+        metadata_is_pve is the parallel PvE (Firefight) signal from the same
+        cache (a PVE_PLAYLIST_NAME_HINTS substring match on PublicName). PvE
+        co-op matches are bucketed as 'custom' so they're excluded from PvP
+        'overall'/'social' aggregates - kept distinguishable via the
+        'pve_firefight' category_source. False/None means "no PvE signal".
+        """
         playlist_id = (playlist_asset_id or "").strip()
         playlist_id_lower = playlist_id.lower()
 
         if playlist_id_lower in self.RANKED_PLAYLIST_IDS:
             return "ranked", True, "playlist_map"
+
+        if metadata_is_ranked is True:
+            return "ranked", True, "playlist_metadata"
+
+        # PvE/Firefight -> reuse the 'custom' bucket (excluded from every PvP
+        # aggregate) but tag the source so these stay identifiable. Checked
+        # before the `if playlist_id: return "social"` default below, since
+        # Firefight playlists carry a real playlist_id.
+        if metadata_is_pve is True:
+            return "custom", False, "pve_firefight"
 
         playlist_name = ""
         if isinstance(playlist_info, dict):
@@ -1862,7 +1996,22 @@ class HaloAPIClient:
             if playlist_experience is None and not playlist_map_mode_pair:
                 return "custom", False, "matchinfo_structural"
 
-        if "ranked" in signal_text:
+        # Authoritative matchmade-vs-custom signal: LifecycleMode. Matchmade
+        # games (ranked AND social alike) are LifecycleMode=3 and always carry
+        # a Playlist; custom/local lobbies are LifecycleMode=1 with no Playlist
+        # (verified live against the match-stats MatchInfo). A private lobby can
+        # run ranked *game modes* (a "Ranked Slayer" variant etc.), so catch
+        # customs by lifecycle here - BEFORE the "ranked" name heuristic below -
+        # or such a match would be mislabeled ranked and counted in ranked
+        # stats. There is no per-match isRanked flag; ranked is a property of
+        # the matchmade playlist, which a custom by definition doesn't have.
+        if not playlist_id and lifecycle_mode in self.CUSTOM_LIFECYCLE_MODES:
+            return "custom", False, "matchinfo_lifecycle"
+
+        # Only a matchmade game (which always has a Playlist) can be ranked, so
+        # require playlist_id here - a custom whose variant is merely *named*
+        # "Ranked ..." must never be classified ranked by name alone.
+        if playlist_id and self.RANKED_NAME_RE.search(signal_text):
             return "ranked", True, "text_heuristic"
 
         if any(token in signal_text for token in self.CUSTOM_MATCH_TEXT_HINTS):
@@ -1875,7 +2024,142 @@ class HaloAPIClient:
             return "social", False, "missing_playlist_text"
 
         return "custom", False, "missing_playlist_fallback"
-    
+
+    async def resolve_playlist_metadata(
+        self,
+        asset_id: str,
+        version_id: Optional[str],
+        session: aiohttp.ClientSession,
+    ) -> Dict:
+        """
+        Resolve a playlist's PublicName via discovery-infiniteugc and derive
+        ranked status from a case-insensitive "ranked" substring match.
+
+        The inline MatchInfo.Playlist object on a match never carries a name
+        field (only AssetKind/AssetId/VersionId), and the response here has
+        no HasCsr boolean (confirmed live against the real API) - so
+        PublicName text-matching is the only signal available. Response keys
+        observed: Admin, AssetHome, AssetId, AssetStats, CloneBehavior,
+        Contributors, CustomData, Description, DisplayOwnerOverride, Files,
+        InspectionResult, Order, PublicName, PublishedDate, RotationEntries,
+        Tags, VersionId, VersionNumber.
+
+        Tries the versioned URL first (if version_id given), then falls back
+        to the unversioned form - both resolve correctly per live testing,
+        and the backfill script (which only has historical asset ids, no
+        stored version id) relies entirely on the unversioned form.
+
+        This is a best-effort, secondary lookup that must never take down the
+        primary match-stats fetch it's called from (get_match_stats_for_match)
+        - the entire body, including rate-limiter/token setup, is wrapped so
+        that any failure here (including exhausting a test's or a real
+        rate-limiter backoff) degrades to 'error' instead of propagating.
+
+        Never raises. Always returns {'public_name', 'is_ranked', 'resolution_status'}.
+        """
+        try:
+            account_index = await halo_stats_rate_limiter.wait_if_needed()
+            spartan_token = self.get_next_spartan_token(account_index)
+            if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                spartan_token = spartan_token['token']
+
+            headers = {
+                "Authorization": f"Spartan {spartan_token}",
+                "x-343-authorization-spartan": spartan_token,
+                "User-Agent": self.user_agent,
+                "Accept": "application/json",
+            }
+            # Not required (confirmed 200 without it live) but sent
+            # opportunistically for consistency with get_player_stats' headers.
+            if self.clearance_token and self.clearance_token != "skip":
+                headers["x-343-authorization-clearance"] = self.clearance_token
+
+            urls = []
+            if version_id:
+                urls.append(f"{self.DISCOVERY_UGC_URL}/hi/playlists/{asset_id}/versions/{version_id}")
+            urls.append(f"{self.DISCOVERY_UGC_URL}/hi/playlists/{asset_id}")
+
+            last_status = 'error'
+            for url in urls:
+                try:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            public_name = str(data.get('PublicName') or '').strip()
+                            return {
+                                'public_name': public_name or None,
+                                'is_ranked': bool(self.RANKED_NAME_RE.search(public_name.lower())),
+                                'is_pve': self._public_name_is_pve(public_name),
+                                'resolution_status': 'resolved',
+                            }
+                        elif response.status == 404:
+                            last_status = 'not_found'
+                            continue
+                        elif response.status == 429:
+                            retry_after = response.headers.get('Retry-After')
+                            wait_time = int(retry_after) if retry_after and retry_after.isdigit() else 3
+                            halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                            last_status = 'error'
+                            continue
+                        else:
+                            last_status = 'error'
+                            continue
+                except Exception as e:
+                    print(f"[PLAYLIST] Error resolving {asset_id}: {e}")
+                    last_status = 'error'
+                    continue
+
+            return {'public_name': None, 'is_ranked': False, 'is_pve': False, 'resolution_status': last_status}
+        except Exception as e:
+            print(f"[PLAYLIST] Error resolving {asset_id}: {e}")
+            return {'public_name': None, 'is_ranked': False, 'is_pve': False, 'resolution_status': 'error'}
+
+    async def _lookup_or_resolve_playlist_ranked(
+        self,
+        playlist_asset_id: Optional[str],
+        playlist_version_id: Optional[str],
+        session: aiohttp.ClientSession,
+    ) -> Tuple[Optional[bool], Optional[bool]]:
+        """
+        Consult (and, on a cache miss, populate) playlist_metadata to
+        determine whether playlist_asset_id is ranked and/or PvE (Firefight).
+        Returns a (is_ranked, is_pve) tuple: each is True/False once resolved,
+        None if still unresolvable (no asset id, confirmed 404, or a fresh
+        network failure) - callers treat None as "no signal, fall back to
+        _classify_match_category's other heuristics".
+
+        Zero-network for any asset id already cached 'resolved' or
+        'not_found'. In steady state this only costs a network round trip
+        the first time any player's match ever references a given asset id
+        anywhere in the bot's history (there are only a few dozen distinct
+        playlists active at once, not one per match), which is what makes
+        this self-healing at ingest time without waiting for a manual
+        backfill run when a playlist rotates.
+        """
+        if not playlist_asset_id:
+            return None, None
+        asset_id = playlist_asset_id.strip()
+        if asset_id.lower() in self.RANKED_PLAYLIST_IDS:
+            return None, None  # already covered by the zero-DB-read fast path
+
+        cached = self.stats_cache.db.get_playlist_metadata(asset_id)
+        if cached:
+            if cached['resolution_status'] == 'resolved':
+                return bool(cached['is_ranked']), self._public_name_is_pve(cached['public_name'])
+            if cached['resolution_status'] == 'not_found':
+                return None, None  # confirmed unresolvable; don't hammer it every match
+
+        resolved = await self.resolve_playlist_metadata(asset_id, playlist_version_id, session)
+        await asyncio.get_running_loop().run_in_executor(
+            self._db_write_executor,
+            self.stats_cache.db.upsert_playlist_metadata,
+            asset_id, resolved['public_name'], resolved['is_ranked'],
+            resolved['resolution_status'], playlist_version_id,
+        )
+        if resolved['resolution_status'] == 'resolved':
+            return resolved['is_ranked'], resolved['is_pve']
+        return None, None
+
     async def get_match_stats_for_match(
         self,
         match_id: str,
@@ -2080,13 +2364,18 @@ class HaloAPIClient:
                             map_asset_id = None
                             map_version_id = None
                         
+                        metadata_is_ranked, metadata_is_pve = await self._lookup_or_resolve_playlist_ranked(
+                            playlist_asset_id, playlist_version_id, session
+                        )
                         match_category, is_ranked, category_source = self._classify_match_category(
                             playlist_asset_id=playlist_asset_id,
                             playlist_version_id=playlist_version_id,
                             playlist_info=playlist_info,
                             match_info=match_info,
+                            metadata_is_ranked=metadata_is_ranked,
+                            metadata_is_pve=metadata_is_pve,
                         )
-                        
+
                         # Build match data with playlist information, map, and player XUIDs
                         csr, csr_tier = self._extract_csr_and_tier(player)
 
@@ -2326,8 +2615,13 @@ class HaloAPIClient:
             matches_to_process = 999999  # Process all matches
         full_history_requested = matches_to_process >= 999999
         try:
-            # Check cache first
-            cached_data = self.load_cached_stats(xuid, stat_type, gamertag)
+            # Check cache first. Runs in the default executor, not on the event
+            # loop, since a cold-cache read on the HDD-backed DB can take
+            # seconds to minutes and would otherwise stall the Discord gateway
+            # heartbeat.
+            cached_data = await asyncio.get_running_loop().run_in_executor(
+                None, self.load_cached_stats, xuid, stat_type, gamertag
+            )
             last_update = None
             existing_matches = {}
             cache_marked_incomplete = False
@@ -2365,9 +2659,13 @@ class HaloAPIClient:
             # If cache is sufficient and we're not requesting ALL matches, return cached data immediately
             if cache_is_sufficient and not full_history_requested:
                 print(f"Using cached data ({len(existing_matches)} matches)")
-                # Calculate stats from cached matches (stats are not stored, only raw match data)
                 cached_matches = cached_data.get('processed_matches', [])
-                stats = self._calculate_stats_from_matches(cached_matches, stat_type)
+                # Prefer the precomputed per-mode summary over rescanning the
+                # cached matches in Python; falls back for players not yet
+                # covered by the player_mode_stats backfill.
+                stats = self.stats_cache.get_player_mode_summary(xuid, stat_type)
+                if stats is None:
+                    stats = self._calculate_stats_from_matches(cached_matches, stat_type)
                 return {
                     'error': 0,
                     'stats': stats,
@@ -2721,9 +3019,14 @@ class HaloAPIClient:
                             use_incremental = False
                         else:
                             print(f"No new matches found, using cache ({len(existing_matches)} matches)")
-                            # Calculate stats from cached matches (stats are not stored, only raw match data)
                             cached_matches = cached_data.get('processed_matches', [])
-                            stats = self._calculate_stats_from_matches(cached_matches, stat_type)
+                            # Prefer the precomputed per-mode summary over
+                            # rescanning the cached matches in Python; falls
+                            # back for players not yet covered by the
+                            # player_mode_stats backfill.
+                            stats = self.stats_cache.get_player_mode_summary(xuid, stat_type)
+                            if stats is None:
+                                stats = self._calculate_stats_from_matches(cached_matches, stat_type)
                             return {
                                 'error': 0,
                                 'stats': stats,
@@ -2965,17 +3268,23 @@ class HaloAPIClient:
                         'csr_tier': latest_csr_tier,
                     }
                 
-                # Calculate stats for all three types: overall, ranked, and social
+                # Split for the CSR fallback lookup below and for the legacy
+                # Python-computed fallback if the precomputed summary isn't
+                # available yet. Custom/private matches (match_category ==
+                # 'custom') are excluded from "social" (and, via
+                # overall_matches below, "overall") - they stay in the DB but
+                # never count toward aggregates.
                 ranked_matches = [m for m in all_processed_matches if m.get('is_ranked', False)]
-                social_matches = [m for m in all_processed_matches if not m.get('is_ranked', False)]
-                
+                social_matches = [
+                    m for m in all_processed_matches
+                    if not m.get('is_ranked', False) and m.get('match_category') != 'custom'
+                ]
+                overall_matches = [m for m in all_processed_matches if m.get('match_category') != 'custom']
+
                 print(f"Match breakdown: {len(all_processed_matches)} total, {len(ranked_matches)} ranked, {len(social_matches)} social")
-                
-                overall_stats = calculate_stats_for_matches(all_processed_matches)
-                ranked_stats = calculate_stats_for_matches(ranked_matches)
-                social_stats = calculate_stats_for_matches(social_matches)
-                
-                # Prepare cache data with all three stat types
+
+                # Prepare cache data (stats are not stored here - not read by
+                # save_player_stats/load_player_stats - only processed_matches is)
                 cache_data = {
                     'last_update': datetime.now().isoformat(),
                     'gamertag': gamertag,
@@ -2988,23 +3297,62 @@ class HaloAPIClient:
                     'incomplete_data': len(failed_matches) > 0,
                     'failed_match_count': len(failed_matches),
                     'failed_matches': failed_matches[:50] if len(failed_matches) <= 50 else failed_matches[:50] + ['...truncated'],
-                    'stats': {
-                        'overall': overall_stats,
-                        'ranked': ranked_stats,
-                        'social': social_stats
-                    }
                 }
-                
+
                 # Save to cache off the event loop, so the blocking SQLite write
                 # batch can't stall the gateway heartbeat or other commands.
+                # This is also what applies the player_mode_stats/player_medal_totals
+                # deltas (via insert_player_match), so the precomputed summary
+                # read below is guaranteed fresh once this completes.
                 await asyncio.get_running_loop().run_in_executor(
                     self._db_write_executor,
                     self.save_stats_cache, xuid, stat_type, cache_data, gamertag,
                 )
-                
+
+                # Prefer the precomputed per-mode summary (now up to date) over
+                # rescanning all_processed_matches in Python; only estimated_csr/
+                # csr_tier (not tracked in player_mode_stats) still need a cheap
+                # front-of-list lookup, since matches are sorted newest-first.
+                def latest_csr_tier(matches):
+                    return (
+                        next((m.get('csr') for m in matches if m.get('csr') is not None), None),
+                        next((m.get('csr_tier') for m in matches if m.get('csr_tier')), None),
+                    )
+
+                overall_summary = self.stats_cache.get_player_mode_summary(xuid, "overall")
+                ranked_summary = self.stats_cache.get_player_mode_summary(xuid, "ranked")
+                social_summary = self.stats_cache.get_player_mode_summary(xuid, "social")
+
+                if overall_summary is not None and ranked_summary is not None and social_summary is not None:
+                    overall_csr, overall_csr_tier = latest_csr_tier(all_processed_matches)
+                    ranked_csr, ranked_csr_tier = latest_csr_tier(ranked_matches)
+                    social_csr, social_csr_tier = latest_csr_tier(social_matches)
+                    overall_stats = {**overall_summary, 'estimated_csr': overall_csr, 'csr_tier': overall_csr_tier}
+                    ranked_stats = {**ranked_summary, 'estimated_csr': ranked_csr, 'csr_tier': ranked_csr_tier}
+                    social_stats = {**social_summary, 'estimated_csr': social_csr, 'csr_tier': social_csr_tier}
+                else:
+                    overall_stats = calculate_stats_for_matches(overall_matches)
+                    ranked_stats = calculate_stats_for_matches(ranked_matches)
+                    social_stats = calculate_stats_for_matches(social_matches)
+
                 # Return the appropriate stats based on stat_type
                 if stat_type == "ranked":
                     selected_stats = ranked_stats
+                elif stat_type in ("core_ranked", "rotational_ranked"):
+                    # Not part of the three-summary gate above: players with
+                    # zero core (or rotational) games have no summary row at
+                    # all, and that's expected - fall back per stat_type only.
+                    split_matches = [
+                        m for m in ranked_matches
+                        if ((m.get('playlist_id') or '').strip().lower() in CORE_RANKED_PLAYLIST_IDS)
+                        == (stat_type == "core_ranked")
+                    ]
+                    summary = self.stats_cache.get_player_mode_summary(xuid, stat_type)
+                    if summary is not None:
+                        split_csr, split_csr_tier = latest_csr_tier(split_matches)
+                        selected_stats = {**summary, 'estimated_csr': split_csr, 'csr_tier': split_csr_tier}
+                    else:
+                        selected_stats = calculate_stats_for_matches(split_matches)
                 elif stat_type == "social":
                     selected_stats = social_stats
                 else:
@@ -3567,36 +3915,42 @@ class StatsFind:
         stat_type: str,
         matches_to_process: int = 10,
         force_full_fetch: bool = False,
+        xuid: Optional[str] = None,
     ) -> 'StatsFind':
         """
         Get player stats using Halo API.
-        
+
         Args:
             gamertag: Player's Xbox gamertag
-            stat_type: "stats" (all), "ranked", or "social"
+            stat_type: "stats" (all), "ranked", "core_ranked",
+                "rotational_ranked", or "social"
             matches_to_process: Number of matches to process
             force_full_fetch: If True, bypass cache and fetch full history from API
-        
+            xuid: Pre-resolved XUID, if the caller already has one
+
         Returns:
             Self with populated stats
         """
         print(f"Getting {stat_type} stats for {gamertag} "
               f"(matches: {'ALL' if matches_to_process is None else matches_to_process})")
-        
+
         # Map stat_type to API parameters
         stat_type_map = {
             "stats": "overall",
             "ranked": "ranked",
+            "core_ranked": "core_ranked",
+            "rotational_ranked": "rotational_ranked",
             "social": "social"
         }
         api_stat_type = stat_type_map.get(stat_type, "overall")
-        
+
         try:
             result = await api_client.get_player_stats(
                 gamertag,
                 api_stat_type,
                 matches_to_process=matches_to_process,
                 force_full_fetch=force_full_fetch,
+                xuid=xuid,
             )
             
             if result.get("error", 0) != 0:

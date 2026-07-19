@@ -2,15 +2,24 @@
 One-time backfill for the player_mode_stats summary table from existing
 player_match/matches history. Safe to re-run: each mode's rows are fully
 recomputed and written with INSERT OR REPLACE, not incremented.
+
+Run all modes:    python -m src.database.player_mode_stats_backfill
+Specific modes:   python -m src.database.player_mode_stats_backfill core_ranked rotational_ranked
+(the mode filter avoids rescanning player_match x matches for buckets that
+are already correct - each mode is a full-table scan, slow on the prod HDD)
 """
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Sequence
 
+from src.config import CORE_RANKED_PLAYLIST_IDS
 from src.database.cache import get_cache, PlayerStatsCacheV2
+
+ALL_MODES = ("overall", "ranked", "core_ranked", "rotational_ranked", "social")
 
 
 @dataclass
@@ -19,30 +28,59 @@ class BackfillResult:
     rows_written: int = 0
 
 
-def backfill_player_mode_stats(db_path: Optional[str] = None) -> BackfillResult:
-    """Recompute player_mode_stats for every player and game mode."""
+def _mode_where_clause(mode: str) -> tuple[str, tuple]:
+    """Return (WHERE clause, params) selecting the matches in a game_mode
+    bucket, mirroring _apply_player_mode_stats_delta's bucketing."""
+    core_placeholders = ",".join("?" for _ in CORE_RANKED_PLAYLIST_IDS)
+    core_params = tuple(sorted(CORE_RANKED_PLAYLIST_IDS))
+
+    if mode == "overall":
+        return "WHERE m.match_category != 'custom'", ()
+    if mode == "ranked":
+        return "WHERE m.is_ranked = 1", ()
+    if mode == "core_ranked":
+        # COALESCE matters: LOWER(NULL) IN (...) is NULL, which would drop
+        # NULL-playlist ranked rows from BOTH ranked sub-buckets and break the
+        # ranked == core + rotational invariant. Coalescing to '' routes them
+        # to rotational, matching the Python delta.
+        return (
+            f"WHERE m.is_ranked = 1 AND LOWER(COALESCE(m.playlist_id, '')) IN ({core_placeholders})",
+            core_params,
+        )
+    if mode == "rotational_ranked":
+        return (
+            f"WHERE m.is_ranked = 1 AND LOWER(COALESCE(m.playlist_id, '')) NOT IN ({core_placeholders})",
+            core_params,
+        )
+    if mode == "social":
+        return "WHERE m.is_ranked = 0 AND m.match_category != 'custom'", ()
+    raise ValueError(f"Unknown game mode: {mode}")
+
+
+def backfill_player_mode_stats(db_path: Optional[str] = None,
+                               modes: Optional[Sequence[str]] = None) -> BackfillResult:
+    """Recompute player_mode_stats for every player, for the given game modes
+    (default: all of them)."""
     cache = PlayerStatsCacheV2(db_path) if db_path else get_cache()
     db = cache.db
     conn = db._get_connection()
     cursor = conn.cursor()
 
     # Buckets mirror HaloClient._calculate_stats_from_matches' stat_type
-    # filter, which splits on is_ranked, not match_category.
-    modes = ["overall", "ranked", "social"]
+    # filter: is_ranked picks 'ranked' vs 'social', but match_category='custom'
+    # (private/forge/local lobbies) is excluded from 'social' and 'overall' too.
+    # 'core_ranked'/'rotational_ranked' split 'ranked' by playlist_id against
+    # CORE_RANKED_PLAYLIST_IDS.
+    selected_modes = tuple(modes) if modes else ALL_MODES
+    unknown = set(selected_modes) - set(ALL_MODES)
+    if unknown:
+        raise ValueError(f"Unknown game modes: {sorted(unknown)} (valid: {ALL_MODES})")
 
     result = BackfillResult()
     now = datetime.now().isoformat()
 
-    for mode in modes:
-        if mode == "overall":
-            where_clause = ""
-            params: tuple = ()
-        elif mode == "ranked":
-            where_clause = "WHERE m.is_ranked = 1"
-            params = ()
-        else:
-            where_clause = "WHERE m.is_ranked = 0"
-            params = ()
+    for mode in selected_modes:
+        where_clause, params = _mode_where_clause(mode)
 
         cursor.execute(f"""
             SELECT
@@ -81,5 +119,6 @@ def backfill_player_mode_stats(db_path: Optional[str] = None) -> BackfillResult:
 
 
 if __name__ == "__main__":
-    outcome = backfill_player_mode_stats()
+    requested_modes = sys.argv[1:] or None
+    outcome = backfill_player_mode_stats(modes=requested_modes)
     print(f"Backfilled {outcome.rows_written} player_mode_stats rows across {outcome.modes_processed} modes")

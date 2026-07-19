@@ -11,61 +11,176 @@ from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 import threading
 
-from src.config import DATABASE_FILE
+from src.config import CORE_RANKED_PLAYLIST_IDS, DATABASE_FILE
 
-# Medal name mappings from Halo Infinite API
-# Source: Halo Infinite medal metadata
+# Medal name mappings from Halo Infinite API.
+# Source: the official medal metadata endpoint
+# (gamecms-hacs.svc.halowaypoint.com/hi/Waypoint/file/medals/metadata.json),
+# fetched and verified 2026-07-17 - the previous hand-curated version of this
+# table had every entry except Double Kill paired with the wrong medal name.
 MEDAL_NAME_MAPPING = {
-    # Multi-kill medals
+    # Spree medals
+    3233952928: "Killjoy",
+    2780740615: "Killing Spree",
+    3169118333: "Driving Spree",
+    4261842076: "Killing Frenzy",
+    2848470465: "Death Cabbie",
+    1739996188: "Immortal Chauffeur",
+    418532952: "Running Riot",
+    1486797009: "Rampage",
+    710323196: "Nightmare",
+    1720896992: "Boogeyman",
+    2567026752: "Grim Reaper",
+    2875941471: "Demon",
+
+    # Mode medals
+    3488248720: "Stopped Short",
+    976049027: "Flag Joust",
+    4247875860: "Duelist",
+    1472686630: "Always Rotating",
+    2717755703: "Sole Survivor",
+    4285712605: "Hang Up",
+    2964157454: "Call Blocked",
+    3227840152: "Goal Line Stand",
+    2623698509: "Lone Wolf",
+    3732790338: "Fumble",
+    3630529364: "Clock Stop",
+    1376646881: "Great Journey",
+    1025827095: "Culling",
+    88914608: "Blight",
+    557309779: "Zombie Slayer",
+    1090931685: "Monopoly",
+    580478179: "Hill Guardian",
+    394349536: "Clear Reception",
+    2426456555: "Secure Line",
+    3931425309: "Signal Block",
+    1680000231: "Flawless Victory",
+    1169390319: "Steaktacular",
+    3011158621: "Necromancer",
+    3120600565: "Immortal",
+    521420212: "Ace",
+    781229683: "Straight Balling",
+    3528500956: "All That Juice",
+    629165579: "Power Outage",
+    3467301935: "Purge",
+    1155542859: "Disease",
+    1447057920: "Undead Hunter",
+    1064731598: "Untainted",
+    865763896: "Perfection",
+    4100966367: "Extermination",
+    217730222: "Hell's Janitor",
+    17866865: "The Sickness",
+    1765213446: "Cleansing",
+    3786134933: "Plague",
+    1719203329: "Pestilence",
+    496411737: "Purification",
+    3520382976: "Scourge",
+    2164872967: "Divine Intervention",
+    3653884673: "Apocalypse",
+
+    # Multikill medals
     622331684: "Double Kill",
-    2780740615: "Triple Kill",
-    2063152177: "Overkill",
-    835814121: "Killtacular",
-    2123530881: "Killtrocity",
-    # Note: Higher multi-kills use different IDs
-    
-    # Killing Spree medals
-    2758320809: "Killing Spree",      # 5 kills without dying
-    1169390319: "Killing Frenzy",     # 10 kills without dying
-    3934547153: "Running Riot",       # 15 kills without dying
-    1512363953: "Rampage",            # 20 kills without dying
-    3655682764: "Nightmare",          # 25 kills without dying
-    1176569867: "Boogeyman",          # 30 kills without dying
-    265478668: "Grim Reaper",         # 35 kills without dying
-    4261842076: "Demon",              # 40 kills without dying
-    
-    # Weapon-specific medals
-    3233952928: "Headshot",           # Precision weapon headshot kill
-    548533137: "Perfect",             # Kill with perfect accuracy (no missed shots)
-    1734214473: "Sniper Kill",        # Kill with sniper rifle
-    3091261182: "No Scope",           # Sniper kill without scoping
-    2625820422: "Snapshot",           # Quick scope sniper kill
-    269174970: "Reversal",            # Kill enemy who damaged you first
-    1169571763: "Ninja",              # Back smack/assassination
-    1172766553: "Grenade Kill",       # Kill with grenade
-    2852571933: "Melee Kill",         # Kill with melee
-    2861418269: "Beatdown",           # Melee kill from behind
-    1146876011: "Bulltrue",           # Kill enemy while they're sword lunging
-    2418616582: "Hail Mary",          # Long distance grenade kill
-    3488248720: "Sticky",             # Kill with plasma grenade stick
-    1210678802: "Remote Detonation",  # Kill with remote detonation
-    3905838030: "Skewer Kill",        # Kill with Skewer
-    1880789493: "Pancake",            # Kill with Repulsor (push off map)
-    4229934157: "Return to Sender",   # Kill with deflected projectile
-    1283796619: "Tag & Bag",          # Kill recently marked enemy
-    
-    # Objective medals
-    1284032216: "Flag Kill",          # Kill while holding flag
-    3334154676: "Ball Kill",          # Kill while holding oddball
-    3732790338: "Carrier Kill",       # Kill the flag/ball carrier
-    2602963073: "Goal Line Stand",    # Kill flag carrier near your base
-    1472686630: "Interception",       # Grab enemy flag mid-air
-    
-    # Vehicle medals  
-    # (Add more as discovered)
-    
-    # Assist medals
-    # (Add more as discovered)
+    2063152177: "Triple Kill",
+    835814121: "Overkill",
+    2137071619: "Killtacular",
+    1430343434: "Killtrocity",
+    3835606176: "Killamanjaro",
+    2242633421: "Killtastrophe",
+    3352648716: "Killpocalypse",
+    3233051772: "Killionaire",
+
+    # Proficiency medals
+    2477555653: "Spotter",
+    1685043466: "Treasure Hunter",
+    20397755: "Saboteur",
+    1284032216: "Wingman",
+    2926348688: "Wheelman",
+    3783455472: "Gunner",
+    3027762381: "Driver",
+    2593226288: "Pilot",
+    2278023431: "Tanker",
+    2852571933: "Rifleman",
+    1146876011: "Bomber",
+    2648272972: "Grenadier",
+    269174970: "Boxer",
+    1210678802: "Warrior",
+    1172766553: "Gunslinger",
+    3347922939: "Scattergunner",
+    4277328263: "Sharpshooter",
+    2758320809: "Marksman",
+    4086138034: "Heavy",
+    555849395: "Bodyguard",
+    2750622016: "Breacher",
+
+    # Skill medals
+    548533137: "Back Smack",
+    1229018603: "Dogfight",
+    2418616582: "Harpoon",
+    87172902: "Odin's Raven",
+    731054446: "Skyjack",
+    3655682764: "Stick",
+    3546244406: "Kong",
+    2123530881: "Reversal",
+    4229934157: "Snipe",
+    3334154676: "Guardian Angel",
+    1969067783: "Chain Reaction",
+    221693153: "Splatter",
+    3114137341: "Bulltrue",
+    3905838030: "Cluster Luck",
+    1880789493: "Mind the Gap",
+    3876426273: "Pancake",
+    656245292: "Rideshare",
+    1841872491: "Tag & Bag",
+    1734214473: "Whiplash",
+    2827657131: "Windshield Wiper",
+    3934547153: "Hail Mary",
+    265478668: "Nade Shot",
+    1512363953: "Perfect",
+    2414983178: "Bank Shot",
+    988255960: "Fire & Forget",
+    4215552487: "Ballista",
+    4132863117: "Pull",
+    2602963073: "No Scope",
+    677323068: "Death Race",
+    1477806194: "Counter-snipe",
+    2253222811: "Nuclear Football",
+    524758914: "Boom Block",
+    3059799290: "Return to Sender",
+    1623236079: "Autopilot Engaged",
+    670606868: "Sneak King",
+    3217141618: "Achilles Spine",
+    1646928910: "Grand Slam",
+    651256911: "Interlinked",
+    3085856613: "Ninja",
+    1312042926: "Quigley",
+    3160646854: "Remote Detonation",
+
+    # Style medals
+    3739610597: "Flyin' High",
+    2625820422: "From the Grave",
+    3091261182: "Last Shot",
+    1065136443: "Mount Up",
+    2861418269: "Quick Draw",
+    1445036152: "Reclaimer",
+    275666139: "Special Delivery",
+    3588869844: "From the Void",
+    690125105: "Grapple-jack",
+    175594566: "Hold This",
+    3475540930: "Lawnmower",
+    1283796619: "Off the Rack",
+    3583966655: "Party's Over",
+    2019283350: "Pineapple Express",
+    1298835518: "Ramming Speed",
+    1169571763: "Shot Caller",
+    1176569867: "Yard Sale",
+    1331361851: "Mounted & Loaded",
+    1427176344: "360",
+    641726424: "Combat Evolved",
+    2396845048: "Deadly Catch",
+    197913196: "Driveby",
+    2967011722: "Street Sweeper",
+    4007438389: "Blind Fire",
+    1211820913: "Fastball",
 }
 
 # Reverse mapping for lookups
@@ -143,7 +258,12 @@ class HaloStatsDBv2:
                 date_added TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
+        # Migration-safe columns for existing DBs created before completeness
+        # tracking was persisted (previously computed per-request and discarded).
+        self._ensure_column_exists("players", "incomplete_data", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column_exists("players", "failed_match_count", "INTEGER NOT NULL DEFAULT 0")
+
         # ============================================================
         # Table 3: Medal Types - Reference table for medal IDs to names
         # ============================================================
@@ -213,7 +333,9 @@ class HaloStatsDBv2:
         # ============================================================
         # Table 7: Player Mode Stats - Precomputed per-player, per-game-mode
         # aggregates, maintained incrementally by insert_player_match to
-        # avoid on-demand full match-history scans.
+        # avoid on-demand full match-history scans. game_mode is 'overall'/
+        # 'ranked'/'social' plus the ranked split 'core_ranked'/
+        # 'rotational_ranked' (see CORE_RANKED_PLAYLIST_IDS).
         # ============================================================
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS player_mode_stats (
@@ -234,10 +356,56 @@ class HaloStatsDBv2:
         """)
 
         # ============================================================
+        # Table 8: Player Medal Totals - Precomputed per-player, per-game-mode,
+        # per-medal counts, maintained incrementally by insert_player_match
+        # (mirrors player_mode_stats above). game_mode is 'ranked'/'social'/
+        # 'overall'; 'overall' is the combined total across both modes.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_medal_totals (
+                xuid TEXT NOT NULL,
+                game_mode TEXT NOT NULL,
+                medal_name_id INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                last_updated TEXT,
+                PRIMARY KEY (xuid, game_mode, medal_name_id),
+                FOREIGN KEY (xuid) REFERENCES players(xuid),
+                FOREIGN KEY (medal_name_id) REFERENCES medal_types(medal_name_id)
+            )
+        """)
+
+        # ============================================================
+        # Table 9: Playlist Metadata - cache of discovery-infiniteugc
+        # playlist lookups, keyed by playlist_asset_id (not asset+version -
+        # ranked status is a property of the playlist's persistent identity;
+        # a reworked playlist gets a new asset id, not a new version of the
+        # old one). Populated lazily at ingest time
+        # (HaloAPIClient._lookup_or_resolve_playlist_ranked) and proactively
+        # by reclassify_playlists_backfill.py, so _classify_match_category
+        # can detect ranked playlists that rotated in after
+        # RANKED_PLAYLIST_IDS was last hand-updated.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS playlist_metadata (
+                playlist_asset_id TEXT PRIMARY KEY,
+                public_name TEXT,
+                is_ranked INTEGER NOT NULL DEFAULT 0,
+                resolution_status TEXT NOT NULL DEFAULT 'unresolved',
+                last_checked_at TEXT NOT NULL,
+                last_version_id TEXT
+            )
+        """)
+
+        # ============================================================
         # Indexes for performance
         # ============================================================
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_start_time ON matches(start_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_playlist ON matches(playlist_id)")
+        # Lets reclassify_playlists_backfill's "most recent match per
+        # playlist" sample query (WHERE playlist_id=? ORDER BY start_time
+        # DESC LIMIT 1) do an index-only seek instead of sorting every
+        # matching row - decisive on popular playlists with millions of rows.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_playlist_start ON matches(playlist_id, start_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_ranked ON matches(is_ranked)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_category ON matches(match_category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_map ON matches(map_id)")
@@ -249,6 +417,7 @@ class HaloStatsDBv2:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_participants_team ON match_participants(team_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_participants_inferred_team ON match_participants(inferred_team_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_medal_sets_hash ON medal_sets(medal_hash)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_medal_totals_medal_name_id ON player_medal_totals(medal_name_id)")
         
         # Populate medal_types reference table
         self._populate_medal_types(cursor)
@@ -276,14 +445,26 @@ class HaloStatsDBv2:
         return ",\n                ".join(columns)
     
     def _populate_medal_types(self, cursor):
-        """Populate the medal_types reference table"""
+        """Populate/refresh the medal_types reference table so a corrected
+        MEDAL_NAME_MAPPING self-heals any previously mislabeled rows on the
+        next startup, rather than leaving stale names stuck in an existing
+        database. Uses INSERT OR IGNORE + UPDATE (not INSERT OR REPLACE):
+        REPLACE deletes-then-reinserts on a PK conflict, and since
+        player_medal_totals has a foreign key on medal_name_id, every delete
+        forces SQLite to scan that (multi-million-row) table to verify no
+        child rows reference it - here we only ever touch non-key columns, so
+        no delete/FK check ever fires."""
         for medal_id, medal_name in MEDAL_NAME_MAPPING.items():
             # Determine category based on medal name
             category = self._get_medal_category(medal_name)
-            cursor.execute("""
-                INSERT OR IGNORE INTO medal_types (medal_name_id, medal_name, medal_category)
-                VALUES (?, ?, ?)
-            """, (medal_id, medal_name, category))
+            cursor.execute(
+                "INSERT OR IGNORE INTO medal_types (medal_name_id, medal_name, medal_category) VALUES (?, ?, ?)",
+                (medal_id, medal_name, category)
+            )
+            cursor.execute(
+                "UPDATE medal_types SET medal_name = ?, medal_category = ? WHERE medal_name_id = ?",
+                (medal_name, category, medal_id)
+            )
     
     def _get_medal_category(self, medal_name: str) -> str:
         """Categorize medal by name"""
@@ -435,18 +616,51 @@ class HaloStatsDBv2:
         except Exception as e:
             print(f"Error inserting match: {e}")
             return False
-    
-    def insert_or_update_player(self, xuid: str, gamertag: str = None,
-                                 last_processed_at: str = None, commit: bool = True) -> bool:
-        """Insert or update player information"""
+
+    def get_playlist_metadata(self, playlist_asset_id: str) -> Optional[sqlite3.Row]:
+        """Point lookup by asset id. Cheap indexed PK read - called inline
+        from classification code, same convention as get_player_mode_summary."""
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+        cursor.execute(
+            "SELECT * FROM playlist_metadata WHERE playlist_asset_id = ?",
+            (playlist_asset_id,)
+        )
+        return cursor.fetchone()
+
+    def upsert_playlist_metadata(self, playlist_asset_id: str, public_name: Optional[str],
+                                  is_ranked: bool, resolution_status: str,
+                                  version_id: Optional[str] = None, commit: bool = True) -> None:
+        """No FK children reference playlist_metadata, so INSERT OR REPLACE is safe here."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            INSERT OR REPLACE INTO playlist_metadata
+                (playlist_asset_id, public_name, is_ranked, resolution_status, last_checked_at, last_version_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (playlist_asset_id, public_name, 1 if is_ranked else 0, resolution_status, now, version_id))
+        if commit:
+            conn.commit()
+
+    def insert_or_update_player(self, xuid: str, gamertag: str = None,
+                                 last_processed_at: str = None, commit: bool = True,
+                                 incomplete_data: Optional[bool] = None,
+                                 failed_match_count: Optional[int] = None) -> bool:
+        """Insert or update player information.
+
+        incomplete_data/failed_match_count reflect whether the most recent
+        fetch that populated this player had any failed match lookups -
+        persisted (not just computed per-request and discarded) so the
+        history-sync completeness checks can act on it on the next request."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
         try:
             # Check if player exists
             cursor.execute("SELECT xuid FROM players WHERE xuid = ?", (xuid,))
             exists = cursor.fetchone()
-            
+
             if exists:
                 # Update existing player
                 updates = []
@@ -457,7 +671,13 @@ class HaloStatsDBv2:
                 if last_processed_at:
                     updates.append("last_processed_at = ?")
                     values.append(last_processed_at)
-                
+                if incomplete_data is not None:
+                    updates.append("incomplete_data = ?")
+                    values.append(1 if incomplete_data else 0)
+                if failed_match_count is not None:
+                    updates.append("failed_match_count = ?")
+                    values.append(failed_match_count)
+
                 if updates:
                     values.append(xuid)
                     cursor.execute(f"""
@@ -466,10 +686,13 @@ class HaloStatsDBv2:
             else:
                 # Insert new player
                 cursor.execute("""
-                    INSERT INTO players (xuid, gamertag, last_processed_at, date_added)
-                    VALUES (?, ?, ?, ?)
-                """, (xuid, gamertag, last_processed_at, datetime.now().isoformat()))
-            
+                    INSERT INTO players (xuid, gamertag, last_processed_at, date_added, incomplete_data, failed_match_count)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    xuid, gamertag, last_processed_at, datetime.now().isoformat(),
+                    1 if incomplete_data else 0, failed_match_count or 0
+                ))
+
             if commit:
                 conn.commit()
             return True
@@ -512,13 +735,25 @@ class HaloStatsDBv2:
             bucket_deltas[new_bucket] += 1
 
         # Buckets mirror HaloClient._calculate_stats_from_matches' stat_type
-        # filter, which splits on is_ranked (not match_category) - e.g.
-        # stat_type="social" includes custom/unknown matches too, as long as
-        # they aren't ranked.
+        # filter: is_ranked picks 'ranked' vs 'social', but
+        # match_category='custom' (private/forge/local lobbies) is excluded
+        # from every bucket, including 'overall' - customs stay in
+        # matches/player_match (never deleted) but never contribute to
+        # precomputed aggregates. 'unknown' (not yet classified) still
+        # counts, same as before. Ranked matches additionally land in exactly
+        # one of 'core_ranked' (permanent playlists, halotracker parity) or
+        # 'rotational_ranked' (every other CSR playlist), so
+        # ranked == core_ranked + rotational_ranked always holds.
         game_mode = 'ranked' if match_data.get('is_ranked') else 'social'
+        is_custom = match_data.get('match_category') == 'custom'
         now = datetime.now().isoformat()
 
-        for mode in {game_mode, 'overall'}:
+        modes = set() if is_custom else {game_mode, 'overall'}
+        if not is_custom and match_data.get('is_ranked'):
+            playlist_id = (match_data.get('playlist_id') or '').strip().lower()
+            modes.add('core_ranked' if playlist_id in CORE_RANKED_PLAYLIST_IDS
+                      else 'rotational_ranked')
+        for mode in modes:
             cursor.execute(
                 "INSERT OR IGNORE INTO player_mode_stats (xuid, game_mode) VALUES (?, ?)",
                 (xuid, mode)
@@ -542,6 +777,66 @@ class HaloStatsDBv2:
                 now, xuid, mode
             ))
 
+    def _medal_counts_from_set_id(self, cursor: sqlite3.Cursor, medal_set_id: Optional[int]) -> Dict[int, int]:
+        """Return {medal_name_id: count} for a medal_sets row, or {} if unset."""
+        if not medal_set_id:
+            return {}
+        cursor.execute("SELECT * FROM medal_sets WHERE medal_set_id = ?", (medal_set_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        counts = {}
+        for key in row.keys():
+            if key.startswith('medal_') and key != 'medal_set_id' and key != 'medal_hash':
+                count = row[key]
+                if count:
+                    counts[int(key.replace('medal_', ''))] = count
+        return counts
+
+    def _apply_player_medal_totals_delta(self, cursor: sqlite3.Cursor, xuid: str,
+                                          match_id: str, match_data: Dict,
+                                          new_medal_set_id: Optional[int]) -> None:
+        """Update the precomputed player_medal_totals rows for xuid to reflect
+        this match insert/replace, using a signed per-medal delta so
+        reprocessing an already-seen match doesn't double-count (mirrors
+        _apply_player_mode_stats_delta above)."""
+        cursor.execute(
+            "SELECT medal_set_id FROM player_match WHERE xuid = ? AND match_id = ?",
+            (xuid, match_id)
+        )
+        old_row = cursor.fetchone()
+        old_medal_set_id = old_row['medal_set_id'] if old_row else None
+
+        if old_medal_set_id == new_medal_set_id:
+            return
+
+        old_counts = self._medal_counts_from_set_id(cursor, old_medal_set_id)
+        new_counts = self._medal_counts_from_set_id(cursor, new_medal_set_id)
+        medal_ids = set(old_counts) | set(new_counts)
+        if not medal_ids:
+            return
+
+        game_mode = 'ranked' if match_data.get('is_ranked') else 'social'
+        is_custom = match_data.get('match_category') == 'custom'
+        now = datetime.now().isoformat()
+
+        modes = set() if is_custom else {game_mode, 'overall'}
+        for mode in modes:
+            for medal_id in medal_ids:
+                delta = new_counts.get(medal_id, 0) - old_counts.get(medal_id, 0)
+                if delta == 0:
+                    continue
+                cursor.execute(
+                    "INSERT OR IGNORE INTO player_medal_totals (xuid, game_mode, medal_name_id, count) "
+                    "VALUES (?, ?, ?, 0)",
+                    (xuid, mode, medal_id)
+                )
+                cursor.execute("""
+                    UPDATE player_medal_totals
+                    SET count = count + ?, last_updated = ?
+                    WHERE xuid = ? AND game_mode = ? AND medal_name_id = ?
+                """, (delta, now, xuid, mode, medal_id))
+
     def insert_player_match(self, xuid: str, match_data: Dict, commit: bool = True) -> bool:
         """Insert player's performance for a specific match"""
         conn = self._get_connection()
@@ -554,6 +849,7 @@ class HaloStatsDBv2:
 
             match_id = match_data.get('match_id')
             self._apply_player_mode_stats_delta(cursor, xuid, match_id, match_data)
+            self._apply_player_medal_totals_delta(cursor, xuid, match_id, match_data, medal_set_id)
 
             cursor.execute("""
                 INSERT OR REPLACE INTO player_match
@@ -1096,12 +1392,16 @@ class HaloStatsDBv2:
         conn = self._get_connection()
         cursor = conn.cursor()
         
-        ranked_filter = ""
+        # Custom/private matches never count toward "social" or "overall",
+        # same as HaloClient._calculate_stats_from_matches / the
+        # player_mode_stats and player_medal_totals backfills.
         if stat_type == "ranked":
             ranked_filter = "AND m.is_ranked = 1"
         elif stat_type == "social":
-            ranked_filter = "AND m.is_ranked = 0"
-        
+            ranked_filter = "AND m.is_ranked = 0 AND m.match_category != 'custom'"
+        else:
+            ranked_filter = "AND m.match_category != 'custom'"
+
         # Get all medal columns
         cursor.execute("PRAGMA table_info(medal_sets)")
         columns = []

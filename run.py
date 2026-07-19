@@ -16,6 +16,16 @@ import sys
 import time
 from pathlib import Path
 
+# When stdout/stderr are redirected to a file (service/headless runs), Python
+# defaults to the locale codepage (cp1252), and any emoji in a print (e.g. the
+# token re-auth warnings) raises UnicodeEncodeError and kills startup. Force
+# UTF-8 with replacement so logging can never crash the bot.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))

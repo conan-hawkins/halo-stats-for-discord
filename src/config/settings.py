@@ -63,12 +63,31 @@ DATABASE_FILE = DATA_DIR / "halo_stats_v2.db"
 CACHE_PROGRESS_FILE = DATA_DIR / "cache_progress.json"
 
 # =============================================================================
-# API CONFIGURATION  
+# API CONFIGURATION
 # =============================================================================
 
 # Rate limiting settings
 REQUESTS_PER_SECOND_PER_ACCOUNT = 8
 MAX_ACCOUNTS = 5
+
+# =============================================================================
+# STATS CLASSIFICATION
+# =============================================================================
+
+# The permanent "core" ranked playlists (current Ranked Arena, Ranked Doubles,
+# Ranked Slayer). #coreranked aggregates only these, which matches
+# halotracker.com's ranked lifetime overview; every other CSR playlist
+# (retired launch-era Ranked Arena queues, rotational playlists like Ranked
+# Snipers / Tactical / FFA / 1v1 Showdown, and any future rotation entries)
+# falls into #rotationalranked automatically because rotational is defined as
+# "is_ranked and not core". Compare against a lowercased playlist_id.
+# Lives here (not client.py) so src/database can import it without a circular
+# import through src.api.
+CORE_RANKED_PLAYLIST_IDS = frozenset({
+    "edfef3ac-9cbe-4fa2-b949-8f29deafd483",  # Ranked Arena
+    "fa5aa2a3-2428-4912-a023-e1eeea7b877c",  # Ranked Doubles
+    "dcb2e24e-05fb-4390-8076-32a0cdb4326e",  # Ranked Slayer
+})
 
 # =============================================================================
 # TERMINAL AUTH CONFIGURATION

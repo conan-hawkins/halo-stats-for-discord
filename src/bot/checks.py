@@ -7,7 +7,7 @@ from discord.ext import commands
 from src.config.settings import ADMIN_USER_IDS
 
 # Commands anyone can run without being on the admin allowlist.
-PUBLIC_COMMANDS = {"help", "full", "ranked", "casual"}
+PUBLIC_COMMANDS = {"help", "full", "ranked", "coreranked", "rotationalranked", "casual"}
 
 
 def is_admin(ctx: commands.Context) -> bool:

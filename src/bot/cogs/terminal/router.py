@@ -39,6 +39,8 @@ async def execute_terminal_action(
     user_allowed_actions = {
         "cmd_full",
         "cmd_ranked",
+        "cmd_coreranked",
+        "cmd_rotationalranked",
         "cmd_casual",
         "cmd_iss_level0",
         "cmd_iss_level1",

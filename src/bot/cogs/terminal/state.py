@@ -32,6 +32,8 @@ TERMINAL_MENUS: Dict[str, List[TerminalMenuItem]] = {
     "stats": [
         TerminalMenuItem("FULL STATS", action="cmd_full", requires_input=True, input_hint="Gamertag", description="Run the full stats command for a player."),
         TerminalMenuItem("RANKED STATS", action="cmd_ranked", requires_input=True, input_hint="Gamertag", description="Run ranked-only stats for a player."),
+        TerminalMenuItem("CORE RANKED STATS", action="cmd_coreranked", requires_input=True, input_hint="Gamertag", description="Run permanent-playlist ranked stats (Arena/Doubles/Slayer) for a player."),
+        TerminalMenuItem("ROTATIONAL RANKED STATS", action="cmd_rotationalranked", requires_input=True, input_hint="Gamertag", description="Run retired/rotational ranked stats for a player."),
         TerminalMenuItem("CASUAL STATS", action="cmd_casual", requires_input=True, input_hint="Gamertag", description="Run casual-only stats for a player."),
     ],
     "social": [

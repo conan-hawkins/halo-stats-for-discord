@@ -2,9 +2,14 @@
 
 from datetime import datetime
 
-from src.api.client import StatsFind1
+from src.api.client import StatsFind1, api_client
 from src.bot.embeds import format_error_embed, format_stats_embed
-from src.bot.presentation.embeds.loading import build_stats_loading_embed
+from src.bot.presentation.embeds.loading import (
+    build_first_run_collecting_embed,
+    build_first_run_complete_embed,
+    build_first_run_failed_embed,
+    build_stats_loading_embed,
+)
 
 
 async def fetch_and_display_stats(
@@ -16,7 +21,7 @@ async def fetch_and_display_stats(
 ):
     """
     Fetch and display player statistics
-    
+
     Args:
         ctx: Discord context
         gamertag: Xbox gamertag to fetch
@@ -26,6 +31,26 @@ async def fetch_and_display_stats(
     """
     print(f"[DEBUG] fetch_and_display_stats CALLED for '{gamertag}' at {datetime.now()}")
     print(f"Discord command received: {stat_type} for '{gamertag}' (matches: {'ALL' if matches_to_process is None else matches_to_process})")
+
+    xuid = await api_client.resolve_gamertag_to_xuid(gamertag)
+    if xuid and not api_client.stats_cache.check_player_cached(xuid, gamertag=gamertag):
+        print(f"[DEBUG] '{gamertag}' has no cached matches yet - starting background full collect")
+        await ctx.send(embed=build_first_run_collecting_embed(gamertag))
+
+        channel = ctx.channel
+
+        async def on_collect_complete(result):
+            if result.get('error', 0) == 0:
+                await channel.send(embed=build_first_run_complete_embed(
+                    gamertag, result.get('matches_processed', 0)
+                ))
+            else:
+                await channel.send(embed=build_first_run_failed_embed(
+                    gamertag, result.get('message', 'Unknown error')
+                ))
+
+        api_client.start_background_full_collect(xuid, gamertag, on_complete=on_collect_complete)
+        return
 
     loading_embed = build_stats_loading_embed(gamertag, matches_to_process=matches_to_process)
     print(f"[DEBUG] Sending loading embed...")
@@ -38,6 +63,7 @@ async def fetch_and_display_stats(
             stat_type,
             matches_to_process=matches_to_process,
             force_full_fetch=force_full_fetch,
+            xuid=xuid,
         )
         print(f"API call completed. Error code: {StatsFind1.error_no}")
         

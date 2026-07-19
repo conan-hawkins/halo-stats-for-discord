@@ -1,8 +1,15 @@
+from src.config import CORE_RANKED_PLAYLIST_IDS
 from src.database.cache import PlayerStatsCacheV2
 from src.database.player_mode_stats_backfill import backfill_player_mode_stats
 
+CORE_PLAYLIST_ID = sorted(CORE_RANKED_PLAYLIST_IDS)[0]
 
-def _match(match_id, ranked, start_time, kills=10, deaths=5, assists=2, outcome=2):
+# Every game_mode bucket player_mode_stats can hold.
+ALL_STAT_TYPES = ("overall", "ranked", "core_ranked", "rotational_ranked", "social")
+
+
+def _match(match_id, ranked, start_time, kills=10, deaths=5, assists=2, outcome=2,
+           playlist_id="playlist"):
     return {
         "match_id": match_id,
         "kills": kills,
@@ -14,7 +21,7 @@ def _match(match_id, ranked, start_time, kills=10, deaths=5, assists=2, outcome=
         "is_ranked": ranked,
         "match_category": "ranked" if ranked else "social",
         "category_source": "test",
-        "playlist_id": "playlist",
+        "playlist_id": playlist_id,
         "map_id": "map",
         "map_version": "v1",
         "medals": [],
@@ -108,6 +115,8 @@ def test_backfill_recomputes_matching_incremental_state(tmp_path):
         _match("m1", ranked=True, start_time="2026-01-01T00:00:00", kills=10, deaths=5, assists=2, outcome=2),
         _match("m2", ranked=False, start_time="2026-01-02T00:00:00", kills=4, deaths=8, assists=3, outcome=3),
         _match("m3", ranked=False, start_time="2026-01-03T00:00:00", kills=7, deaths=7, assists=1, outcome=1),
+        _match("m4", ranked=True, start_time="2026-01-04T00:00:00", kills=12, deaths=9, assists=4, outcome=3,
+               playlist_id=CORE_PLAYLIST_ID),
     ]
     for m in matches:
         db.insert_match(m)
@@ -115,7 +124,7 @@ def test_backfill_recomputes_matching_incremental_state(tmp_path):
 
     incremental = {
         stat_type: cache.get_player_mode_summary(xuid, stat_type)
-        for stat_type in ("overall", "ranked", "social")
+        for stat_type in ALL_STAT_TYPES
     }
 
     # Wipe the summary table to simulate a fresh backfill against pre-existing
@@ -127,9 +136,89 @@ def test_backfill_recomputes_matching_incremental_state(tmp_path):
     result = backfill_player_mode_stats(db_path)
     assert result.rows_written > 0
 
-    for stat_type in ("overall", "ranked", "social"):
+    for stat_type in ALL_STAT_TYPES:
         backfilled = cache.get_player_mode_summary(xuid, stat_type)
         assert backfilled == incremental[stat_type]
+
+
+def test_core_and_rotational_ranked_buckets_split_by_playlist(tmp_path):
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    db = cache.db
+    xuid = "xuid-split"
+
+    db.insert_or_update_player(xuid, "SplitPlayer", "2026-01-01T00:00:00")
+    matches = [
+        # Mixed-case core playlist id: bucketing must normalize before matching.
+        _match("core1", ranked=True, start_time="2026-01-01T00:00:00", kills=10, deaths=5, assists=3, outcome=2,
+               playlist_id=CORE_PLAYLIST_ID.upper()),
+        _match("rot1", ranked=True, start_time="2026-01-02T00:00:00", kills=7, deaths=6, assists=1, outcome=3,
+               playlist_id="some-rotational-playlist"),
+        _match("soc1", ranked=False, start_time="2026-01-03T00:00:00", kills=4, deaths=4, assists=2, outcome=2),
+    ]
+    for m in matches:
+        db.insert_match(m)
+        db.insert_player_match(xuid, m)
+
+    core = cache.get_player_mode_summary(xuid, "core_ranked")
+    rotational = cache.get_player_mode_summary(xuid, "rotational_ranked")
+    ranked = cache.get_player_mode_summary(xuid, "ranked")
+
+    assert core["games_played"] == 1
+    assert core["total_kills"] == 10
+    assert core["wins"] == 1
+    assert rotational["games_played"] == 1
+    assert rotational["total_kills"] == 7
+    assert rotational["losses"] == 1
+    # The split must partition ranked exactly.
+    assert ranked["games_played"] == core["games_played"] + rotational["games_played"]
+    assert ranked["total_kills"] == core["total_kills"] + rotational["total_kills"]
+    # Social matches must not leak into either ranked sub-bucket.
+    assert cache.get_player_mode_summary(xuid, "social")["games_played"] == 1
+
+
+def test_reprocessing_core_match_does_not_double_count_new_buckets(tmp_path):
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    db = cache.db
+    xuid = "xuid-split-2"
+
+    db.insert_or_update_player(xuid, "SplitPlayer2", "2026-01-01T00:00:00")
+    m1 = _match("m1", ranked=True, start_time="2026-01-01T00:00:00", kills=10, deaths=5, assists=2, outcome=2,
+                playlist_id=CORE_PLAYLIST_ID)
+    db.insert_match(m1)
+    db.insert_player_match(xuid, m1)
+
+    m1_revised = _match("m1", ranked=True, start_time="2026-01-01T00:00:00", kills=15, deaths=3, assists=6, outcome=2,
+                        playlist_id=CORE_PLAYLIST_ID)
+    db.insert_match(m1_revised)
+    db.insert_player_match(xuid, m1_revised)
+
+    core = cache.get_player_mode_summary(xuid, "core_ranked")
+    assert core["games_played"] == 1
+    assert core["total_kills"] == 15
+    assert cache.get_player_mode_summary(xuid, "rotational_ranked") is None
+
+
+def test_null_playlist_ranked_match_lands_in_rotational(tmp_path):
+    db_path = str(tmp_path / "stats.db")
+    cache = PlayerStatsCacheV2(db_path)
+    db = cache.db
+    xuid = "xuid-null-playlist"
+
+    db.insert_or_update_player(xuid, "NullPlaylist", "2026-01-01T00:00:00")
+    m1 = _match("m1", ranked=True, start_time="2026-01-01T00:00:00", playlist_id=None)
+    db.insert_match(m1)
+    db.insert_player_match(xuid, m1)
+
+    assert cache.get_player_mode_summary(xuid, "rotational_ranked")["games_played"] == 1
+    assert cache.get_player_mode_summary(xuid, "core_ranked") is None
+
+    # The SQL backfill must agree (COALESCE routes NULL playlists to rotational).
+    conn = db._get_connection()
+    conn.execute("DELETE FROM player_mode_stats")
+    conn.commit()
+    backfill_player_mode_stats(db_path)
+    assert cache.get_player_mode_summary(xuid, "rotational_ranked")["games_played"] == 1
+    assert cache.get_player_mode_summary(xuid, "core_ranked") is None
 
 
 def _assert_summary_consistent_with_recompute(cache, db_path, xuid):
@@ -137,11 +226,11 @@ def _assert_summary_consistent_with_recompute(cache, db_path, xuid):
     from player_match. A mismatch means a partial/orphaned delta leaked past a
     failed match."""
     incremental = {
-        st: cache.get_player_mode_summary(xuid, st) for st in ("overall", "ranked", "social")
+        st: cache.get_player_mode_summary(xuid, st) for st in ALL_STAT_TYPES
     }
     backfill_player_mode_stats(db_path)  # overwrites player_mode_stats from player_match
     recomputed = {
-        st: cache.get_player_mode_summary(xuid, st) for st in ("overall", "ranked", "social")
+        st: cache.get_player_mode_summary(xuid, st) for st in ALL_STAT_TYPES
     }
     assert incremental == recomputed, f"summary desync: {incremental} != {recomputed}"
 

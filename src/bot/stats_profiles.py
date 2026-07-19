@@ -37,6 +37,34 @@ RANKED_STATS_PROFILE = StatsProfile(
     guide_description="Ranked-only performance summary.",
 )
 
+CORE_RANKED_STATS_PROFILE = StatsProfile(
+    command_name="coreranked",
+    terminal_action="cmd_coreranked",
+    fetch_stat_type="core_ranked",
+    api_stat_type="core_ranked",
+    display_name="CORE RANKED STATS",
+    embed_color=0xC0392B,
+    command_help=(
+        "Get stats from the permanent ranked playlists only (Ranked Arena, Doubles, Slayer - "
+        "matches halotracker's ranked overview). Usage: #coreranked <gamertag>"
+    ),
+    guide_description="Permanent ranked playlists only (Arena/Doubles/Slayer, halotracker parity).",
+)
+
+ROTATIONAL_RANKED_STATS_PROFILE = StatsProfile(
+    command_name="rotationalranked",
+    terminal_action="cmd_rotationalranked",
+    fetch_stat_type="rotational_ranked",
+    api_stat_type="rotational_ranked",
+    display_name="ROTATIONAL RANKED STATS",
+    embed_color=0x9B59B6,
+    command_help=(
+        "Get stats from retired and rotational ranked playlists (launch-era Ranked Arena queues, "
+        "Snipers, Tactical, 1v1 Showdown, ...). Usage: #rotationalranked <gamertag>"
+    ),
+    guide_description="Retired/rotational ranked playlists (everything ranked outside the core three).",
+)
+
 CASUAL_STATS_PROFILE = StatsProfile(
     command_name="casual",
     terminal_action="cmd_casual",
@@ -51,6 +79,8 @@ CASUAL_STATS_PROFILE = StatsProfile(
 STATS_PROFILES: Tuple[StatsProfile, ...] = (
     FULL_STATS_PROFILE,
     RANKED_STATS_PROFILE,
+    CORE_RANKED_STATS_PROFILE,
+    ROTATIONAL_RANKED_STATS_PROFILE,
     CASUAL_STATS_PROFILE,
 )
 
@@ -62,6 +92,8 @@ STATS_PROFILE_BY_FETCH_TYPE: Dict[str, StatsProfile] = {
     FULL_STATS_PROFILE.fetch_stat_type: FULL_STATS_PROFILE,
     FULL_STATS_PROFILE.api_stat_type: FULL_STATS_PROFILE,
     RANKED_STATS_PROFILE.fetch_stat_type: RANKED_STATS_PROFILE,
+    CORE_RANKED_STATS_PROFILE.fetch_stat_type: CORE_RANKED_STATS_PROFILE,
+    ROTATIONAL_RANKED_STATS_PROFILE.fetch_stat_type: ROTATIONAL_RANKED_STATS_PROFILE,
     CASUAL_STATS_PROFILE.fetch_stat_type: CASUAL_STATS_PROFILE,
 }
 

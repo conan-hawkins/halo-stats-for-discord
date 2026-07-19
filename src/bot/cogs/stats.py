@@ -30,8 +30,10 @@ from src.bot.checks import PUBLIC_COMMANDS, admin_only, is_admin
 from src.bot.presentation.embeds.help import build_command_help_embed, build_stats_help_guide_embed
 from src.bot.stats_profiles import (
     CASUAL_STATS_PROFILE,
+    CORE_RANKED_STATS_PROFILE,
     FULL_STATS_PROFILE,
     RANKED_STATS_PROFILE,
+    ROTATIONAL_RANKED_STATS_PROFILE,
     STATS_PROFILES,
     StatsProfile,
 )
@@ -85,7 +87,17 @@ class StatsCog(commands.Cog, name="Stats"):
     async def ranked(self, ctx: commands.Context, *inputs):
         """Get stats from ranked matches only"""
         await self._run_profile_from_inputs(ctx, RANKED_STATS_PROFILE, inputs)
-    
+
+    @commands.command(name='coreranked', help=CORE_RANKED_STATS_PROFILE.command_help)
+    async def coreranked(self, ctx: commands.Context, *inputs):
+        """Get stats from the permanent core ranked playlists only"""
+        await self._run_profile_from_inputs(ctx, CORE_RANKED_STATS_PROFILE, inputs)
+
+    @commands.command(name='rotationalranked', help=ROTATIONAL_RANKED_STATS_PROFILE.command_help)
+    async def rotationalranked(self, ctx: commands.Context, *inputs):
+        """Get stats from retired/rotational ranked playlists only"""
+        await self._run_profile_from_inputs(ctx, ROTATIONAL_RANKED_STATS_PROFILE, inputs)
+
     @commands.command(name='casual', help=CASUAL_STATS_PROFILE.command_help)
     async def casual(self, ctx: commands.Context, *inputs):
         """Get stats from casual/social matches only"""

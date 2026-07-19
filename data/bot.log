@@ -1,0 +1,161 @@
+==================================================
+Halo Infinite Discord Stats Bot
+Made by Conan Hawkins
+==================================================
+
+Validating Halo authentication tokens...
+Refreshing expired Account 2 tokens...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 2 needs manual re-auth. Run: python -m src.auth.setup_account 2
+Refreshing expired Account 3 tokens...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 3 needs manual re-auth. Run: python -m src.auth.setup_account 3
+Refreshing expired Account 4 tokens...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 4 needs manual re-auth. Run: python -m src.auth.setup_account 4
+Refreshing expired Account 5 tokens...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 5 needs manual re-auth. Run: python -m src.auth.setup_account 5
+Loaded 1 Spartan account(s) for match fetching
+📊 Rate limiter updated: 1 accounts = 5 max concurrent requests
+📱 Loaded 1 Xbox account(s) for friends list
+📱 Xbox rate limiter: 1 accounts, 2 max concurrent
+All tokens validated successfully!
+
+✓ Loaded cog: src.bot.cogs.stats
+[GRAPH DB] Initialized social graph database at C:\Users\conan\Downloads\halo-stats-for-discord\data\halo_social_graph.db
+✓ Loaded cog: src.bot.cogs.graph
+✓ Loaded cog: src.bot.cogs.graph_commands.display.network.cog
+✓ Loaded cog: src.bot.cogs.graph_commands.display.halonet.cog
+✓ Loaded cog: src.bot.cogs.terminal
+
+Halo-Stat-Tracker#2610 has connected to Discord!
+Bot is in 2 server(s)
+✓ Automatic token refresh enabled (checks every hour)
+✓ Weekly proactive refresh enabled (prevents 90-day token expiration)
+Checking token validity...
+Refreshing expired Account 2 tokens...
+🔄 Weekly proactive token refresh for all accounts...
+Recovered token cache from interrupted refresh swap
+🔄 Proactively refreshing Account 2...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 2 needs manual re-auth. Run: python -m src.auth.setup_account 2
+Refreshing expired Account 3 tokens...
+Refreshing OAuth tokens...
+Requesting Xbox Live user token...
+Requesting XUID and XSTS tokens...
+Requesting Spartan token...
+Requesting Clearance token...
+✅ Account 2 tokens refreshed proactively
+🔄 Proactively refreshing Account 3...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 3 needs manual re-auth. Run: python -m src.auth.setup_account 3
+Refreshing expired Account 4 tokens...
+Refreshing OAuth tokens...
+Requesting Xbox Live user token...
+Requesting XUID and XSTS tokens...
+Requesting Spartan token...
+Requesting Clearance token...
+✅ Account 3 tokens refreshed proactively
+🔄 Proactively refreshing Account 4...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 4 needs manual re-auth. Run: python -m src.auth.setup_account 4
+Refreshing expired Account 5 tokens...
+Refreshing OAuth tokens...
+Requesting Xbox Live user token...
+Requesting XUID and XSTS tokens...
+Requesting Spartan token...
+Requesting Clearance token...
+✅ Account 4 tokens refreshed proactively
+🔄 Proactively refreshing Account 5...
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token request failed (401)
+Clearance token unavailable (not critical)
+⚠️ Account 5 needs manual re-auth. Run: python -m src.auth.setup_account 5
+Loaded 1 Spartan account(s) for match fetching
+📊 Rate limiter updated: 1 accounts = 5 max concurrent requests
+📱 Loaded 4 Xbox account(s) for friends list
+📱 Xbox rate limiter: 4 accounts, 8 max concurrent
+Tokens are valid
+Refreshing OAuth tokens...
+Requesting Xbox Live user token...
+Requesting XUID and XSTS tokens...
+Requesting Spartan token...
+Requesting Clearance token...
+✅ Account 5 tokens refreshed proactively
+🔄 Weekly proactive refresh complete
+[DEBUG] fetch_and_display_stats CALLED for 'XxUK D3STROYxX' at 2026-07-19 15:01:53.884746
+Discord command received: core_ranked for 'XxUK D3STROYxX' (matches: ALL)
+Cache alias hit: 'XxUK D3STROYxX' -> XUID: 2533274924643541
+[DEBUG] Sending loading embed...
+[DEBUG] Loading embed sent, message ID: 1528401392971153552
+Getting core_ranked stats for XxUK D3STROYxX (matches: ALL)
+Loaded valid Spartan token (expires: Mon Jul 20 14:00:00 2026)
+Using XUID: 2533274924643541
+Loaded Clearance from cache: 6553ba68-d1b0-48c2-b66c-01b7b722fa89
+[CLIENT] Attempting to load cache for xuid=2533274924643541, gamertag=XxUK D3STROYxX, stat_type=core_ranked
+[CACHE] Loading stats for xuid=2533274924643541, gamertag=XxUK D3STROYxX, stat_type=core_ranked
+[CACHE] Found player: XxUK D3STROYxX, last_processed=2026-07-18T00:46:48.269866
+[CACHE] Found 3418 total matches for XxUK D3STROYxX
+[CLIENT] Loaded cached stats for XxUK D3STROYxX: 3418 matches
+Last cache update: 2026-07-18T00:46:48.269866
+Cache contains 3418 matches
+Full match history requested, will check for updates...
+Fetch params: force_full_fetch=False, cached_data=exists, matches_to_process=999999
+Using incremental fetch (cache has 3418 matches)
+Checking for new matches (incremental fetch)...
+Fetching matches for XUID: 2533274924643541 (gamertag: XxUK D3STROYxX)
+   First page: 25 matches found
+History sync check: boundary_found=True, probe_checked=True, completeness_proven=True, cache_plus_new=3418, cache_marked_incomplete=False, total_hint_source=none, total_hint_reliable=False, fallback_reason=none
+No new matches found, using cache (3418 matches)
+Stats calculated: 3418 matches (0 new)
+Stats retrieved for XxUK D3STROYxX: ['1.07', '54.5%', '3.0', '14946', '15923', '6857', '1088']
+API call completed. Error code: 0
+API success, formatting Discord message
+Formatting Discord embed for XxUK D3STROYxX (core_ranked)
+Stats data: ['1.07', '54.5%', '3.0', '14946', '15923', '6857', '1088']
+[DEBUG] Editing loading message 1528401392971153552 with stats embed...
+[DEBUG] Stats embed edit complete
+[DEBUG] fetch_and_display_stats CALLED for 'XxUK D3STROYxX' at 2026-07-19 15:03:56.675215
+Discord command received: rotational_ranked for 'XxUK D3STROYxX' (matches: ALL)
+Cache alias hit: 'XxUK D3STROYxX' -> XUID: 2533274924643541
+[DEBUG] Sending loading embed...
+[DEBUG] Loading embed sent, message ID: 1528401908534874174
+Getting rotational_ranked stats for XxUK D3STROYxX (matches: ALL)
+Using XUID: 2533274924643541
+[CLIENT] Attempting to load cache for xuid=2533274924643541, gamertag=XxUK D3STROYxX, stat_type=rotational_ranked
+[CACHE] Loading stats for xuid=2533274924643541, gamertag=XxUK D3STROYxX, stat_type=rotational_ranked
+[CACHE] Found player: XxUK D3STROYxX, last_processed=2026-07-18T00:46:48.269866
+[CACHE] Found 3418 total matches for XxUK D3STROYxX
+[CLIENT] Loaded cached stats for XxUK D3STROYxX: 3418 matches
+Last cache update: 2026-07-18T00:46:48.269866
+Cache contains 3418 matches
+Full match history requested, will check for updates...
+Fetch params: force_full_fetch=False, cached_data=exists, matches_to_process=999999
+Using incremental fetch (cache has 3418 matches)
+Checking for new matches (incremental fetch)...
+Fetching matches for XUID: 2533274924643541 (gamertag: XxUK D3STROYxX)
+   First page: 25 matches found
+History sync check: boundary_found=True, probe_checked=True, completeness_proven=True, cache_plus_new=3418, cache_marked_incomplete=False, total_hint_source=none, total_hint_reliable=False, fallback_reason=none

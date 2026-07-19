@@ -46,7 +46,11 @@ class PlayerStatsCacheV2:
             # never "0 of 115"), and no partial player_mode_stats delta or
             # ALTER TABLE from a failed match survives the commit.
             last_update = stats_data.get('last_update', datetime.now().isoformat())
-            self.db.insert_or_update_player(xuid, gamertag, last_update, commit=False)
+            self.db.insert_or_update_player(
+                xuid, gamertag, last_update, commit=False,
+                incomplete_data=bool(stats_data.get('incomplete_data')),
+                failed_match_count=int(stats_data.get('failed_match_count') or 0),
+            )
 
             # Process each match
             matches_to_save = stats_data.get('processed_matches', [])
@@ -132,11 +136,17 @@ class PlayerStatsCacheV2:
             
             # Find player by XUID or gamertag
             player_xuid = xuid
-            cursor.execute("SELECT xuid, gamertag, last_processed_at FROM players WHERE xuid = ?", (xuid,))
+            cursor.execute(
+                "SELECT xuid, gamertag, last_processed_at, incomplete_data, failed_match_count FROM players WHERE xuid = ?",
+                (xuid,)
+            )
             player = cursor.fetchone()
-            
+
             if not player and gamertag:
-                cursor.execute("SELECT xuid, gamertag, last_processed_at FROM players WHERE gamertag = ?", (gamertag,))
+                cursor.execute(
+                    "SELECT xuid, gamertag, last_processed_at, incomplete_data, failed_match_count FROM players WHERE gamertag = ?",
+                    (gamertag,)
+                )
                 player = cursor.fetchone()
                 if player:
                     player_xuid = player['xuid']
@@ -163,8 +173,8 @@ class PlayerStatsCacheV2:
                 'gamertag': player['gamertag'],
                 'stat_type': stat_type,
                 'last_update': player['last_processed_at'],
-                'incomplete_data': False,
-                'failed_match_count': 0,
+                'incomplete_data': bool(player['incomplete_data']),
+                'failed_match_count': player['failed_match_count'] or 0,
                 'processed_matches': matches
             }
             
@@ -192,7 +202,7 @@ class PlayerStatsCacheV2:
         limit_clause = f"LIMIT {limit}" if limit else ""
         
         cursor.execute(f"""
-            SELECT 
+            SELECT
                 pm.match_id,
                 pm.kills,
                 pm.deaths,
@@ -213,9 +223,13 @@ class PlayerStatsCacheV2:
             ORDER BY m.start_time DESC
             {limit_clause}
         """, (xuid,))
-        
+
+        rows = cursor.fetchall()
+        medal_set_ids = {row['medal_set_id'] for row in rows if row['medal_set_id']}
+        medals_by_set_id = self._get_medals_for_sets(medal_set_ids)
+
         matches = []
-        for row in cursor.fetchall():
+        for row in rows:
             match_dict = {
                 'match_id': row['match_id'],
                 'kills': row['kills'],
@@ -230,15 +244,11 @@ class PlayerStatsCacheV2:
                 'category_source': row['category_source'],
                 'map_id': row['map_id'],
                 'map_version': row['map_version'],
-                'medals': []  # Will be populated if needed
+                'medals': medals_by_set_id.get(row['medal_set_id'], []) if row['medal_set_id'] else []
             }
-            
-            # Optionally get medals (expensive, only if needed)
-            if row['medal_set_id']:
-                match_dict['medals'] = self._get_medals_for_set(row['medal_set_id'])
-            
+
             matches.append(match_dict)
-        
+
         return matches
     
     def get_player_mode_summary(self, xuid: str, stat_type: str = "overall") -> Optional[Dict]:
@@ -252,7 +262,8 @@ class PlayerStatsCacheV2:
         conn = self.db._get_connection()
         cursor = conn.cursor()
 
-        game_mode = stat_type if stat_type in ("ranked", "social") else "overall"
+        game_mode = (stat_type if stat_type in ("ranked", "social", "core_ranked", "rotational_ranked")
+                     else "overall")
 
         cursor.execute(
             "SELECT * FROM player_mode_stats WHERE xuid = ? AND game_mode = ?",
@@ -288,17 +299,46 @@ class PlayerStatsCacheV2:
             'win_rate': win_rate
         }
 
-    def _get_medals_for_set(self, medal_set_id: int) -> List[Dict]:
-        """Get medal list from medal_set_id"""
+    def get_player_medal_summary(self, xuid: str, stat_type: str = "overall") -> Optional[List[Dict]]:
+        """
+        Get precomputed per-medal counts for a player/mode from player_medal_totals:
+        one {medal_name_id, medal_name, count} entry per medal type earned in
+        that mode. stat_type "overall" returns the combined total across modes.
+
+        Returns None if no rows exist yet (e.g. player added before the
+        medal-totals backfill ran, or before their first match with medals was
+        inserted) - callers should fall back to on-demand calculation.
+        """
         conn = self.db._get_connection()
         cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM medal_sets WHERE medal_set_id = ?", (medal_set_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            return []
-        
+
+        game_mode = stat_type if stat_type in ("ranked", "social") else "overall"
+
+        cursor.execute("""
+            SELECT pmt.medal_name_id, mt.medal_name, pmt.count
+            FROM player_medal_totals pmt
+            LEFT JOIN medal_types mt ON mt.medal_name_id = pmt.medal_name_id
+            WHERE pmt.xuid = ? AND pmt.game_mode = ? AND pmt.count > 0
+            ORDER BY pmt.count DESC
+        """, (xuid, game_mode))
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+
+        return [
+            {
+                'medal_name_id': row['medal_name_id'],
+                'medal_name': row['medal_name'] or f"Unknown Medal {row['medal_name_id']}",
+                'count': row['count'],
+            }
+            for row in rows
+        ]
+
+    _MEDAL_SET_ID_BATCH_SIZE = 500
+
+    @staticmethod
+    def _medals_from_row(row) -> List[Dict]:
+        """Convert a medal_sets row into a list of {NameId, Count, ...} medals"""
         medals = []
         for key in row.keys():
             if key.startswith('medal_') and key != 'medal_set_id' and key != 'medal_hash':
@@ -310,8 +350,27 @@ class PlayerStatsCacheV2:
                         'Count': count,
                         'TotalPersonalScoreAwarded': 0
                     })
-        
         return medals
+
+    def _get_medals_for_sets(self, medal_set_ids) -> Dict[int, List[Dict]]:
+        """Batch-fetch medal lists for many medal_set_ids in a few IN (...) queries"""
+        medal_set_ids = list(medal_set_ids)
+        if not medal_set_ids:
+            return {}
+
+        conn = self.db._get_connection()
+        cursor = conn.cursor()
+
+        medals_by_set_id: Dict[int, List[Dict]] = {}
+        batch_size = self._MEDAL_SET_ID_BATCH_SIZE
+        for i in range(0, len(medal_set_ids), batch_size):
+            chunk = medal_set_ids[i:i + batch_size]
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(f"SELECT * FROM medal_sets WHERE medal_set_id IN ({placeholders})", chunk)
+            for row in cursor.fetchall():
+                medals_by_set_id[row['medal_set_id']] = self._medals_from_row(row)
+
+        return medals_by_set_id
     
     def get_cached_match_ids(self, xuid: str, stat_type: str = "overall") -> set:
         """
