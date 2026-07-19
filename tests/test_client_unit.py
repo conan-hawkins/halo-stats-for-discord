@@ -1,11 +1,12 @@
 import asyncio
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from src.api.client import HaloAPIClient
-from src.config import CORE_RANKED_PLAYLIST_IDS
+from src.config import CORE_RANKED_PLAYLIST_IDS, STATS_HISTORY_FRESHNESS_TTL_SECONDS
 
 
 def test_get_next_spartan_token_round_robin_and_index_selection():
@@ -1964,3 +1965,245 @@ async def test_incomplete_cache_forces_refetch_instead_of_bounded_short_circuit(
     # The whole point: at least one HTTP request happened, proving the
     # bounded "cache has enough matches" short-circuit was NOT taken.
     assert len(requested_starts) > 0
+
+
+# =============================================================================
+# In-flight coalescing (get_player_stats) and history-freshness TTL
+# =============================================================================
+
+
+def _make_coalescing_client(monkeypatch):
+    client = HaloAPIClient()
+    client.clearance_token = "clr"
+    calls = []
+
+    async def _slow_fetch(xuid, gamertag, stat_type, matches_to_process, force_full_fetch):
+        calls.append((xuid, stat_type, matches_to_process, force_full_fetch))
+        await asyncio.sleep(0.05)
+        return {"error": 0, "stats_list": ["x"], "gamertag": gamertag, "stat_type": stat_type}
+
+    monkeypatch.setattr(client, "_fetch_player_stats", _slow_fetch)
+    return client, calls
+
+
+@pytest.mark.asyncio
+async def test_get_player_stats_coalesces_identical_concurrent_requests(monkeypatch):
+    client, calls = _make_coalescing_client(monkeypatch)
+
+    results = await asyncio.gather(*(
+        client.get_player_stats(
+            "Tester", stat_type="core_ranked", matches_to_process=None, xuid="xuid-1"
+        )
+        for _ in range(5)
+    ))
+
+    # One underlying fetch shared by all five callers, same result object.
+    assert len(calls) == 1
+    assert all(r is results[0] for r in results)
+    # The in-flight registry must be cleaned up once the task completes.
+    assert client._stats_inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_get_player_stats_does_not_coalesce_distinct_requests(monkeypatch):
+    client, calls = _make_coalescing_client(monkeypatch)
+
+    await asyncio.gather(
+        client.get_player_stats("Tester", stat_type="ranked", matches_to_process=None, xuid="xuid-1"),
+        client.get_player_stats("Tester", stat_type="social", matches_to_process=None, xuid="xuid-1"),
+        client.get_player_stats(
+            "Tester", stat_type="ranked", matches_to_process=None,
+            force_full_fetch=True, xuid="xuid-1",
+        ),
+    )
+
+    # Different stat_type or force_full_fetch => different keys, no sharing.
+    assert len(calls) == 3
+
+    # A request issued after the in-flight one completed fetches fresh.
+    await client.get_player_stats("Tester", stat_type="ranked", matches_to_process=None, xuid="xuid-1")
+    assert len(calls) == 4
+
+
+def _make_ttl_client(monkeypatch, cached_matches, incomplete=False):
+    """Client whose HTTP layer explodes if touched, with a stubbed cache."""
+    from src.api import client as client_module
+
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("HTTP layer should not be touched")
+
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", _boom)
+    monkeypatch.setattr(client_module.aiohttp, "TCPConnector", _boom)
+    monkeypatch.setattr(client_module.aiohttp, "ClientTimeout", _boom)
+
+    cached = {"processed_matches": cached_matches}
+    if incomplete:
+        cached["incomplete_data"] = True
+    monkeypatch.setattr(client, "load_cached_stats", lambda *args, **kwargs: cached)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *args, **kwargs: None)
+    return client
+
+
+_TTL_CACHED_MATCHES = [
+    {"match_id": "m1", "kills": 5, "deaths": 4, "assists": 2, "outcome": 2, "is_ranked": False},
+    {"match_id": "m2", "kills": 3, "deaths": 6, "assists": 1, "outcome": 3, "is_ranked": True},
+]
+
+
+@pytest.mark.asyncio
+async def test_full_history_within_freshness_ttl_serves_cache_without_api(monkeypatch):
+    client = _make_ttl_client(monkeypatch, _TTL_CACHED_MATCHES)
+    client._history_checked_at["test-xuid"] = time.monotonic()
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="test-xuid", stat_type="overall", gamertag="Tester",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    # Zero API calls (the HTTP stubs would have raised) and cache served.
+    assert result["error"] == 0
+    assert result["new_matches"] == 0
+    assert result["stats"]["games_played"] == 2
+
+
+@pytest.mark.asyncio
+async def test_full_history_freshness_ttl_expired_attempts_api(monkeypatch):
+    client = _make_ttl_client(monkeypatch, _TTL_CACHED_MATCHES)
+    client._history_checked_at["test-xuid"] = (
+        time.monotonic() - STATS_HISTORY_FRESHNESS_TTL_SECONDS - 5
+    )
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="test-xuid", stat_type="overall", gamertag="Tester",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    # Stale stamp => the incremental check ran (and hit the exploding HTTP
+    # layer, surfacing as an error result rather than a cache hit).
+    assert result["error"] != 0
+
+
+@pytest.mark.asyncio
+async def test_force_full_fetch_bypasses_freshness_ttl(monkeypatch):
+    client = _make_ttl_client(monkeypatch, _TTL_CACHED_MATCHES)
+    client._history_checked_at["test-xuid"] = time.monotonic()
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="test-xuid", stat_type="overall", gamertag="Tester",
+        matches_to_process=None, force_full_fetch=True,
+    )
+
+    assert result["error"] != 0
+
+
+@pytest.mark.asyncio
+async def test_incomplete_cache_bypasses_freshness_ttl(monkeypatch):
+    client = _make_ttl_client(monkeypatch, _TTL_CACHED_MATCHES, incomplete=True)
+    client._history_checked_at["test-xuid"] = time.monotonic()
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="test-xuid", stat_type="overall", gamertag="Tester",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] != 0
+
+
+@pytest.mark.asyncio
+async def test_no_new_matches_stamps_freshness_and_skips_api_on_repeat(monkeypatch):
+    client = HaloAPIClient()
+    client.spartan_token = "spartan-token"
+
+    from src.api import client as client_module
+
+    class _FakeRateLimiter:
+        async def wait_if_needed(self, force_account=None):
+            return 0
+
+        def set_backoff(self, seconds, account_index=None):
+            return None
+
+    class _FakeResponse:
+        def __init__(self, status, payload):
+            self.status = status
+            self._payload = payload
+            self.headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return self._payload
+
+        async def text(self):
+            return ""
+
+    starts = []
+    cached_matches = [
+        {
+            "match_id": f"old-{idx}",
+            "kills": 3,
+            "deaths": 2,
+            "assists": 1,
+            "outcome": 2,
+            "is_ranked": False,
+            "start_time": f"2026-01-{((idx - 1) % 28) + 1:02d}T00:00:00",
+        }
+        for idx in range(1, 26)
+    ]
+    first_page_results = [{"MatchId": f"old-{idx}"} for idx in range(1, 26)]
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, headers=None):
+            start = int(url.split("start=")[1].split("&")[0])
+            starts.append(start)
+            if start == 0:
+                return _FakeResponse(200, {"Results": first_page_results})
+            return _FakeResponse(200, {"Results": []})
+
+    monkeypatch.setattr(client_module, "halo_stats_rate_limiter", _FakeRateLimiter())
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda *args, **kwargs: _FakeSession())
+    monkeypatch.setattr(client_module.aiohttp, "TCPConnector", lambda *args, **kwargs: object())
+    monkeypatch.setattr(client_module.aiohttp, "ClientTimeout", lambda *args, **kwargs: object())
+
+    monkeypatch.setattr(
+        client,
+        "load_cached_stats",
+        lambda *args, **kwargs: {"processed_matches": cached_matches},
+    )
+    monkeypatch.setattr(client, "save_stats_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *args, **kwargs: None)
+
+    first = await client.calculate_comprehensive_stats(
+        xuid="test-xuid", stat_type="overall", gamertag="Tester",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert first["error"] == 0
+    assert first["stats"]["games_played"] == 25
+    # The confirmed-current check must stamp the freshness timestamp.
+    assert "test-xuid" in client._history_checked_at
+    requests_after_first = len(starts)
+    assert requests_after_first > 0
+
+    second = await client.calculate_comprehensive_stats(
+        xuid="test-xuid", stat_type="overall", gamertag="Tester",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    # Within the TTL the repeat request makes zero HTTP calls.
+    assert second["error"] == 0
+    assert second["stats"]["games_played"] == 25
+    assert len(starts) == requests_after_first

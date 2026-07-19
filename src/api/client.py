@@ -44,6 +44,7 @@ from src.config import (
     XUID_CACHE_FILE,
     REQUESTS_PER_SECOND_PER_ACCOUNT,
     CORE_RANKED_PLAYLIST_IDS,
+    STATS_HISTORY_FRESHNESS_TTL_SECONDS,
 )
 
 # Import from refactored modules
@@ -192,6 +193,16 @@ class HaloAPIClient:
         # second request for the same brand-new player doesn't start a
         # duplicate collect. Different players collect concurrently.
         self._full_collect_tasks: Dict[str, asyncio.Task] = {}
+
+        # In-flight stat requests keyed by (xuid, stat_type, matches_to_process,
+        # force_full_fetch), so spammed identical commands share one fetch
+        # instead of stacking API calls into 429s.
+        self._stats_inflight: Dict[tuple, asyncio.Task] = {}
+
+        # time.monotonic() of the last completed API history check, per xuid.
+        # Keyed by xuid alone: every stat_type runs the identical incremental
+        # history check, only the post-fetch filtering differs.
+        self._history_checked_at: Dict[str, float] = {}
 
     async def _refresh_account_via_swap(self, account_num: int, account_cache: Dict) -> bool:
         """Refresh a secondary account by swapping its cache into the primary slot."""
@@ -1335,6 +1346,46 @@ class HaloAPIClient:
                     }
                     return self.parse_stats(stats_result, stat_type, gamertag)
 
+            # Coalesce identical concurrent requests: a spammed command joins
+            # the in-flight fetch instead of running its own. Each Discord
+            # invocation still edits its own loading embed with the shared
+            # result. Callers only read the result dict, so sharing is safe.
+            key = (xuid, stat_type, matches_to_process, bool(force_full_fetch))
+            existing = self._stats_inflight.get(key)
+            if existing is not None and not existing.done():
+                print(f"[COALESCE] Joining in-flight {stat_type} request for {gamertag or xuid}")
+                return await existing
+
+            task = asyncio.create_task(self._fetch_player_stats(
+                xuid, gamertag, stat_type, matches_to_process, force_full_fetch
+            ))
+            self._stats_inflight[key] = task
+            try:
+                return await task
+            finally:
+                if self._stats_inflight.get(key) is task:
+                    self._stats_inflight.pop(key, None)
+
+        except Exception as e:
+            print(f"EXCEPTION in get_player_stats: {e}")
+            traceback.print_exc()
+            return {"error": 4, "message": f"API request failed: {str(e)}"}
+
+    async def _fetch_player_stats(
+        self,
+        xuid: str,
+        gamertag: str,
+        stat_type: str,
+        matches_to_process: Optional[int],
+        force_full_fetch: bool,
+    ) -> Dict:
+        """
+        The expensive part of get_player_stats, run as a shared task so
+        identical concurrent requests coalesce onto one fetch. Never raises:
+        errors come back as {"error": ...} dicts so every awaiter sees the
+        same result shape.
+        """
+        try:
             # Set up headers with whatever token we have
             headers = {
                 "User-Agent": self.user_agent,
@@ -1381,11 +1432,11 @@ class HaloAPIClient:
                 print(f"Stats calculated: {stats_result.get('matches_processed', 0)} matches "
                       f"({stats_result.get('new_matches', 0)} new)")
                 return self.parse_stats(stats_result, stat_type, gamertag)
-            
+
             return stats_result
-                    
+
         except Exception as e:
-            print(f"EXCEPTION in get_player_stats: {e}")
+            print(f"EXCEPTION in _fetch_player_stats: {e}")
             traceback.print_exc()
             return {"error": 4, "message": f"API request failed: {str(e)}"}
 
@@ -2628,6 +2679,7 @@ class HaloAPIClient:
             
             # Check if cache is sufficient for the request
             cache_is_sufficient = False
+            history_is_fresh = False
             if cached_data:
                 last_update = cached_data.get('last_update')
                 existing_matches = {m['match_id']: m for m in cached_data.get('processed_matches', [])}
@@ -2641,9 +2693,22 @@ class HaloAPIClient:
                 # For now, if cache has at least 25 matches and we want all matches,
                 # we'll do an incremental fetch to check for new ones
                 if full_history_requested:
-                    # Requesting all matches - always check for new matches
-                    print(f"Full match history requested, will check for updates...")
-                    cache_is_sufficient = False
+                    # Requesting all matches - check for new ones, unless a
+                    # history check for this xuid completed within the
+                    # freshness TTL, in which case serve cache with zero API
+                    # calls. force_full_fetch and incomplete caches bypass.
+                    checked = self._history_checked_at.get(xuid)
+                    age = (time.monotonic() - checked) if checked is not None else None
+                    if (not force_full_fetch and not cache_marked_incomplete
+                            and age is not None
+                            and age < STATS_HISTORY_FRESHNESS_TTL_SECONDS):
+                        print(f"History checked {age:.0f}s ago "
+                              f"(< {STATS_HISTORY_FRESHNESS_TTL_SECONDS}s TTL), serving cache")
+                        cache_is_sufficient = True
+                        history_is_fresh = True
+                    else:
+                        print(f"Full match history requested, will check for updates...")
+                        cache_is_sufficient = False
                 elif cache_marked_incomplete:
                     print("Cache is marked incomplete, fetching additional match history...")
                     cache_is_sufficient = False
@@ -2656,8 +2721,9 @@ class HaloAPIClient:
                     print(f"Cache has {cached_games} matches but {matches_to_process} requested, will fetch more...")
                     cache_is_sufficient = False
             
-            # If cache is sufficient and we're not requesting ALL matches, return cached data immediately
-            if cache_is_sufficient and not full_history_requested:
+            # If cache is sufficient and we're not requesting ALL matches (or
+            # the history check is still fresh), return cached data immediately
+            if cache_is_sufficient and (history_is_fresh or not full_history_requested):
                 print(f"Using cached data ({len(existing_matches)} matches)")
                 cached_matches = cached_data.get('processed_matches', [])
                 # Prefer the precomputed per-mode summary over rescanning the
@@ -3018,6 +3084,10 @@ class HaloAPIClient:
                             )
                             use_incremental = False
                         else:
+                            # A real API check just confirmed the cache is
+                            # current; stamp it so requests within the
+                            # freshness TTL skip the API entirely.
+                            self._history_checked_at[xuid] = time.monotonic()
                             print(f"No new matches found, using cache ({len(existing_matches)} matches)")
                             cached_matches = cached_data.get('processed_matches', [])
                             # Prefer the precomputed per-mode summary over
@@ -3357,7 +3427,13 @@ class HaloAPIClient:
                     selected_stats = social_stats
                 else:
                     selected_stats = overall_stats
-                
+
+                # Stamp only when full history was verified: bounded fetches
+                # never proved the history is complete, so they must not let
+                # later full-history requests skip their API check.
+                if full_history_requested:
+                    self._history_checked_at[xuid] = time.monotonic()
+
                 return {
                     'error': 0,
                     'stats': selected_stats,

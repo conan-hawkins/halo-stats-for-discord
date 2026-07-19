@@ -37,7 +37,12 @@ from src.bot.stats_profiles import (
     STATS_PROFILES,
     StatsProfile,
 )
-from src.config import CACHE_PROGRESS_FILE, PROJECT_ROOT, XUID_CACHE_FILE
+from src.config import (
+    CACHE_PROGRESS_FILE,
+    PROJECT_ROOT,
+    STATS_USER_COOLDOWN_SECONDS,
+    XUID_CACHE_FILE,
+)
 from src.database.graph_schema import get_graph_db
 
 
@@ -79,26 +84,31 @@ class StatsCog(commands.Cog, name="Stats"):
         await ctx.send(embed=embed)
     
     @commands.command(name='full', help=FULL_STATS_PROFILE.command_help)
+    @commands.cooldown(1, STATS_USER_COOLDOWN_SECONDS, commands.BucketType.user)
     async def full(self, ctx: commands.Context, *inputs):
         """Get complete stats from player's entire match history"""
         await self._run_profile_from_inputs(ctx, FULL_STATS_PROFILE, inputs)
     
     @commands.command(name='ranked', help=RANKED_STATS_PROFILE.command_help)
+    @commands.cooldown(1, STATS_USER_COOLDOWN_SECONDS, commands.BucketType.user)
     async def ranked(self, ctx: commands.Context, *inputs):
         """Get stats from ranked matches only"""
         await self._run_profile_from_inputs(ctx, RANKED_STATS_PROFILE, inputs)
 
     @commands.command(name='coreranked', help=CORE_RANKED_STATS_PROFILE.command_help)
+    @commands.cooldown(1, STATS_USER_COOLDOWN_SECONDS, commands.BucketType.user)
     async def coreranked(self, ctx: commands.Context, *inputs):
         """Get stats from the permanent core ranked playlists only"""
         await self._run_profile_from_inputs(ctx, CORE_RANKED_STATS_PROFILE, inputs)
 
     @commands.command(name='rotationalranked', help=ROTATIONAL_RANKED_STATS_PROFILE.command_help)
+    @commands.cooldown(1, STATS_USER_COOLDOWN_SECONDS, commands.BucketType.user)
     async def rotationalranked(self, ctx: commands.Context, *inputs):
         """Get stats from retired/rotational ranked playlists only"""
         await self._run_profile_from_inputs(ctx, ROTATIONAL_RANKED_STATS_PROFILE, inputs)
 
     @commands.command(name='casual', help=CASUAL_STATS_PROFILE.command_help)
+    @commands.cooldown(1, STATS_USER_COOLDOWN_SECONDS, commands.BucketType.user)
     async def casual(self, ctx: commands.Context, *inputs):
         """Get stats from casual/social matches only"""
         await self._run_profile_from_inputs(ctx, CASUAL_STATS_PROFILE, inputs)

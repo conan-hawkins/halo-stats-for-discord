@@ -101,6 +101,13 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         await ctx.send(f"Invalid argument: {error}")
         return
 
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(
+            f"⏳ Easy there — try `#{ctx.command}` again in {error.retry_after:.0f}s.",
+            delete_after=max(3.0, min(error.retry_after, 10.0)),
+        )
+        return
+
     if isinstance(error, commands.CheckFailure):
         await ctx.send("🚫 This command is admin-only.")
         return

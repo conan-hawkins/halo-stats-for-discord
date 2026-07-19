@@ -2603,3 +2603,36 @@ async def test_iss_level3_uses_full_history_fetch_for_blacklist_candidates(monke
     assert stats_calls
     assert stats_calls[0]["matches_to_process"] is None
     assert stats_calls[0]["force_full_fetch"] is True
+
+
+def test_stats_commands_have_per_user_cooldown():
+    from discord.ext import commands as dcommands
+    from src.config import STATS_USER_COOLDOWN_SECONDS
+
+    for command in (
+        StatsCog.full,
+        StatsCog.ranked,
+        StatsCog.coreranked,
+        StatsCog.rotationalranked,
+        StatsCog.casual,
+    ):
+        cooldown = command._buckets._cooldown
+        assert cooldown is not None, f"{command.name} has no cooldown"
+        assert cooldown.rate == 1
+        assert cooldown.per == STATS_USER_COOLDOWN_SECONDS
+        assert command._buckets._type is dcommands.BucketType.user
+
+
+def test_stats_command_cooldown_blocks_rapid_repeat_from_same_user():
+    message = SimpleNamespace(author=SimpleNamespace(id=42), channel=None, guild=None)
+    bucket = StatsCog.coreranked._buckets.get_bucket(message)
+
+    assert bucket.update_rate_limit() is None
+    retry_after = bucket.update_rate_limit()
+    assert retry_after is not None and retry_after > 0
+
+    # A different user gets their own bucket and is not blocked.
+    other = SimpleNamespace(author=SimpleNamespace(id=99), channel=None, guild=None)
+    other_bucket = StatsCog.coreranked._buckets.get_bucket(other)
+    assert other_bucket is not bucket
+    assert other_bucket.update_rate_limit() is None

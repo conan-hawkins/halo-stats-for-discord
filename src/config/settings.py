@@ -71,6 +71,19 @@ REQUESTS_PER_SECOND_PER_ACCOUNT = 8
 MAX_ACCOUNTS = 5
 
 # =============================================================================
+# SPAM PROTECTION / FRESHNESS
+# =============================================================================
+
+# Per-user cooldown on stat commands (#full/#ranked/#coreranked/#rotationalranked/#casual)
+STATS_USER_COOLDOWN_SECONDS = int(os.getenv("STATS_USER_COOLDOWN_SECONDS", "8"))
+
+# If a player's match history was API-checked within this window, serve straight
+# from cache with zero API calls. force_full_fetch bypasses this.
+STATS_HISTORY_FRESHNESS_TTL_SECONDS = int(
+    os.getenv("STATS_HISTORY_FRESHNESS_TTL_SECONDS", "90")
+)
+
+# =============================================================================
 # STATS CLASSIFICATION
 # =============================================================================
 

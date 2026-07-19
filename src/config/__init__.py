@@ -20,6 +20,9 @@ from src.config.settings import (
     # API configuration
     REQUESTS_PER_SECOND_PER_ACCOUNT,
     MAX_ACCOUNTS,
+    # Spam protection / freshness
+    STATS_USER_COOLDOWN_SECONDS,
+    STATS_HISTORY_FRESHNESS_TTL_SECONDS,
     # Stats classification
     CORE_RANKED_PLAYLIST_IDS,
     # Utility functions
@@ -42,6 +45,8 @@ __all__ = [
     "CACHE_PROGRESS_FILE",
     "REQUESTS_PER_SECOND_PER_ACCOUNT",
     "MAX_ACCOUNTS",
+    "STATS_USER_COOLDOWN_SECONDS",
+    "STATS_HISTORY_FRESHNESS_TTL_SECONDS",
     "CORE_RANKED_PLAYLIST_IDS",
     "ensure_data_directories",
 ]
