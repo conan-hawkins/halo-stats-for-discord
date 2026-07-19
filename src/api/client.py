@@ -218,7 +218,9 @@ class HaloAPIClient:
                 write_token_swap_marker(account1_backup, cache_file)
                 safe_write_json(TOKEN_CACHE_FILE, account_cache)
 
-                await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+                # interactive=False: the bot must never block on a browser
+                # login the headless server cannot complete.
+                await run_auth_flow(self.client_id, self.client_secret, use_halo=True, interactive=False)
 
                 refreshed_cache = safe_read_json(TOKEN_CACHE_FILE, default={})
                 if refreshed_cache:
@@ -277,7 +279,7 @@ class HaloAPIClient:
         cache = safe_read_json(TOKEN_CACHE_FILE, default={})
         if not cache:
             print("No token cache found for Account 1")
-            print("Run: python get_auth_tokens.py")
+            print("Run: python -m src.auth.tokens")
             return False
         
         # Check ALL required tokens for Account 1
@@ -397,7 +399,7 @@ class HaloAPIClient:
                     oauth_info = cache.get("oauth")
                     if not oauth_info or not oauth_info.get("refresh_token"):
                         print("No OAuth refresh token available for Account 1")
-                        print("Run: python get_auth_tokens.py")
+                        print("Run: python -m src.auth.tokens")
                         return False
 
                     print("Refreshing Account 1 tokens...")
@@ -408,8 +410,9 @@ class HaloAPIClient:
                             cache[key]["expires_at"] = 0
                     safe_write_json(TOKEN_CACHE_FILE, cache)
 
-                    # Run auth flow for Account 1
-                    await run_auth_flow(self.client_id, self.client_secret, use_halo=True)
+                    # Run auth flow for Account 1 (never open a browser from
+                    # the running bot - fail cleanly if the refresh token dies)
+                    await run_auth_flow(self.client_id, self.client_secret, use_halo=True, interactive=False)
 
                     # Reload and validate Account 1
                     cache = safe_read_json(TOKEN_CACHE_FILE, default={})
@@ -459,7 +462,7 @@ class HaloAPIClient:
                             print(f"Error refreshing Account {i}: {e}")
                     else:
                         print(f"No OAuth refresh token for Account {i}")
-                        print(f"Run: python setup_account{i}.py")
+                        print(f"Run: python -m src.auth.setup_account {i}")
             
             # Load tokens if Account 1 is valid (other accounts are optional)
             if account1_valid:
@@ -618,7 +621,7 @@ class HaloAPIClient:
 
             if not os.path.exists(cache_file):
                 print(f"ERROR: Token cache file '{cache_file}' not found")
-                print("Run: python get_auth_tokens.py")
+                print("Run: python -m src.auth.tokens")
                 return False
 
             # Hold the swap lock while reading so this can't observe another
@@ -725,7 +728,7 @@ class HaloAPIClient:
                 xsts_xbox = cache.get('xsts_xbox')
                 if not xsts_xbox:
                     print(f"Xbox Live XSTS token not found in cache")
-                    print(f"Run get_auth_tokens.py to authenticate with Xbox Live profile access")
+                    print(f"Run python -m src.auth.tokens to authenticate with Xbox Live profile access")
                     return None
                 
                 xbox_token = xsts_xbox.get('token')

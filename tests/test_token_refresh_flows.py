@@ -51,6 +51,11 @@ def _install_store(monkeypatch, store):
 
     monkeypatch.setattr(client_module, "safe_read_json", read_json)
     monkeypatch.setattr(client_module, "safe_write_json", write_json)
+    # Swap-marker helpers write the real data/auth/token_refresh_swap.json;
+    # stub them so no test ever leaves fixture data on disk for startup
+    # recovery to "restore" into the real token cache.
+    monkeypatch.setattr(client_module, "write_token_swap_marker", lambda backup, target: None)
+    monkeypatch.setattr(client_module, "clear_token_swap_marker", lambda: None)
     return client_module, writes
 
 
@@ -67,13 +72,11 @@ def test_ensure_valid_tokens_invokes_swap_recovery_and_clears_refresh_flag_on_er
 
     from src.api import client as client_module
 
-    cache = _invalid_bundle("acc1", with_refresh=True)
-
-    monkeypatch.setattr(
-        client_module,
-        "safe_read_json",
-        lambda path, default=None: copy.deepcopy(cache) if str(path) == str(client_module.TOKEN_CACHE_FILE) else {},
-    )
+    # Writes must be patched too (via _install_store): the refresh path
+    # force-expires tokens with safe_write_json, and an unpatched write
+    # clobbers the real data/auth/token_cache.json with this fixture bundle.
+    store = {str(client_module.TOKEN_CACHE_FILE): _invalid_bundle("acc1", with_refresh=True)}
+    _install_store(monkeypatch, store)
     monkeypatch.setattr(client_module, "is_token_valid", lambda info: False)
 
     called = {"recover": 0}

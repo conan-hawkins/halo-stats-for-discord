@@ -8,11 +8,13 @@ from src.bot.presentation.embeds.friends import (
 )
 from src.bot.presentation.embeds.help import build_command_help_embed, build_stats_help_guide_embed
 from src.bot.presentation.embeds.loading import build_stats_loading_embed
+from src.bot.presentation.embeds.medals import build_medals_embed
 from src.bot.presentation.embeds.stats import format_stats_embed
 
 __all__ = [
     "build_cache_status_embed",
     "build_command_help_embed",
+    "build_medals_embed",
     "build_stats_loading_embed",
     "build_stats_help_guide_embed",
     "build_xboxfriends_error_embed",

@@ -334,6 +334,38 @@ class PlayerStatsCacheV2:
             for row in rows
         ]
 
+    def get_player_earned_medals(self, xuid: str, stat_type: str = "overall") -> List[Dict]:
+        """
+        Get every medal a player has earned in a mode as a single, always-a-list
+        result: [{medal_id, medal_name, count}, ...] sorted by count desc.
+
+        Tries the precomputed player_medal_totals summary first; falls back to
+        an on-demand SUM over medal_sets for players who haven't been
+        backfilled yet. Callers don't need to know which path served the data.
+        """
+        summary = self.get_player_medal_summary(xuid, stat_type)
+        if summary is not None:
+            return [
+                {
+                    'medal_id': row['medal_name_id'],
+                    'medal_name': row['medal_name'],
+                    'count': row['count'],
+                }
+                for row in summary
+            ]
+
+        totals_by_id = self.db.get_player_medal_totals_by_id(xuid, stat_type)
+        earned = [
+            {
+                'medal_id': medal_id,
+                'medal_name': MEDAL_NAME_MAPPING.get(medal_id, f"Unknown Medal {medal_id}"),
+                'count': count,
+            }
+            for medal_id, count in totals_by_id.items()
+        ]
+        earned.sort(key=lambda m: (-m['count'], m['medal_name']))
+        return earned
+
     _MEDAL_SET_ID_BATCH_SIZE = 500
 
     @staticmethod

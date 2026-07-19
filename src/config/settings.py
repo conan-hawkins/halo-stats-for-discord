@@ -62,6 +62,11 @@ DATABASE_FILE = DATA_DIR / "halo_stats_v2.db"
 # Progress tracking file
 CACHE_PROGRESS_FILE = DATA_DIR / "cache_progress.json"
 
+# Medal icon cache (sprite sheet + metadata fetched from the Halo CDN)
+MEDAL_ICON_CACHE_DIR = DATA_DIR / "medal_icons"
+MEDAL_SHEET_CACHE_FILE = MEDAL_ICON_CACHE_DIR / "medal_sheet_xl.png"
+MEDAL_METADATA_CACHE_FILE = MEDAL_ICON_CACHE_DIR / "metadata.json"
+
 # =============================================================================
 # API CONFIGURATION
 # =============================================================================
@@ -132,6 +137,7 @@ def ensure_data_directories():
     """Ensure all required data directories exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    MEDAL_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # Create directories on import

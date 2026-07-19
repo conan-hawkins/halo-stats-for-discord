@@ -10,6 +10,7 @@ from src.bot.presentation.embeds.loading import (
     build_first_run_failed_embed,
     build_stats_loading_embed,
 )
+from src.bot.stats_medals_view import ShowMedalsView
 
 
 async def fetch_and_display_stats(
@@ -77,8 +78,10 @@ async def fetch_and_display_stats(
         else:
             print("API success, formatting Discord message")
             stats_embed = await format_stats_embed(gamertag, StatsFind1.stats_list, stat_type)
+            medals_view = ShowMedalsView(gamertag=gamertag, xuid=xuid, stat_type=stat_type, requester_id=ctx.author.id)
             print(f"[DEBUG] Editing loading message {loading_message.id} with stats embed...")
-            await loading_message.edit(embed=stats_embed)
+            await loading_message.edit(embed=stats_embed, view=medals_view)
+            medals_view.message = loading_message
             print(f"[DEBUG] Stats embed edit complete")
     except Exception as e:
         import traceback

@@ -172,7 +172,11 @@ class OAuthFlow:
                 "client_secret": self.client_secret
             }
         r = requests.post(url, data=payload)
-        r.raise_for_status()
+        if not r.ok:
+            grant = "authorization_code" if code else "refresh_token"
+            raise RuntimeError(
+                f"OAuth {grant} exchange failed ({r.status_code}): {r.text[:300]}"
+            )
         data = r.json()
         return {
             "access_token": data["access_token"],
@@ -521,8 +525,13 @@ class AuthenticationManager:
         self.cache = TokenCache(cache_file)
         self.oauth = OAuthFlow(client_id, client_secret)
     
-    async def get_clearance_token(self) -> Optional[str]:
-        """Get clearance token, handling full auth flow if needed"""
+    async def get_clearance_token(self, interactive: bool = True) -> Optional[str]:
+        """Get clearance token, handling full auth flow if needed.
+
+        interactive=False forbids the browser OAuth fallback: if the cached
+        refresh token is dead the call fails cleanly instead of blocking on a
+        browser window that can never be completed on a headless server.
+        """
         
         # Check cached clearance - only trust it if the tokens used to obtain it
         # (spartan/xsts/xsts_xbox) are still valid too. Clearance is cached with a
@@ -578,7 +587,7 @@ class AuthenticationManager:
                         return clearance.get("FlightConfigurationId") or clearance.get("token")
         
         # Need OAuth tokens
-        oauth = await self._get_oauth_tokens()
+        oauth = await self._get_oauth_tokens(interactive=interactive)
         if not oauth:
             print("OAuth authentication failed")
             return None
@@ -621,14 +630,14 @@ class AuthenticationManager:
         
         return None
     
-    async def _get_oauth_tokens(self) -> Optional[Dict[str, Any]]:
+    async def _get_oauth_tokens(self, interactive: bool = True) -> Optional[Dict[str, Any]]:
         """Get OAuth tokens through refresh or new authorization"""
         oauth_cache = self.cache.get("oauth")
-        
+
         # Try cached OAuth
         if self.cache.is_valid(oauth_cache):
             return oauth_cache
-        
+
         # Try refresh
         if oauth_cache and oauth_cache.get("refresh_token"):
             print("Refreshing OAuth tokens...")
@@ -636,9 +645,14 @@ class AuthenticationManager:
                 oauth = self.oauth.exchange_tokens(refresh_token=oauth_cache["refresh_token"])
                 self.cache.set("oauth", oauth)
                 return oauth
-            except:
-                print("Refresh failed, starting new OAuth flow...")
-        
+            except Exception as e:
+                print(f"OAuth refresh failed: {e}")
+
+        if not interactive:
+            print("Browser OAuth fallback disabled (non-interactive mode).")
+            print("Re-authenticate manually on a desktop machine: python -m src.auth.tokens")
+            return None
+
         # New OAuth flow
         print("Starting browser-based OAuth login...")
         print("Opening Chrome in Incognito mode for fresh account selection...")
@@ -655,7 +669,7 @@ class AuthenticationManager:
 
 
 # Legacy function for backward compatibility
-async def run_auth_flow(client_id: str, client_secret: str, use_halo: bool = True, force_account_selection: bool = False) -> Optional[str]:
+async def run_auth_flow(client_id: str, client_secret: str, use_halo: bool = True, force_account_selection: bool = False, interactive: bool = True) -> Optional[str]:
     """Legacy function wrapper for backward compatibility"""
     manager = AuthenticationManager(client_id, client_secret)
     
@@ -671,8 +685,8 @@ async def run_auth_flow(client_id: str, client_secret: str, use_halo: bool = Tru
             manager.cache.cache.pop("spartan", None)
             manager.cache.cache.pop("clearance", None)
             manager.cache.save()
-    
-    return await manager.get_clearance_token()
+
+    return await manager.get_clearance_token(interactive=interactive)
 
 
 if __name__ == "__main__":

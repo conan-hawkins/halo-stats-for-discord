@@ -88,8 +88,9 @@ async def proactive_token_refresh():
                         write_token_swap_marker(account1_backup, cache_file)
                         safe_write_json(TOKEN_CACHE_FILE, candidate_cache)
 
-                        # Run auth flow to refresh
-                        await run_auth_flow(client_id, client_secret, use_halo=True)
+                        # Run auth flow to refresh (non-interactive: never
+                        # block the bot on a browser login)
+                        await run_auth_flow(client_id, client_secret, use_halo=True, interactive=False)
 
                         # Save refreshed tokens back only if they are valid.
                         refreshed = safe_read_json(TOKEN_CACHE_FILE, default={})

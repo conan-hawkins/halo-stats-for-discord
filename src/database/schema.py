@@ -1387,11 +1387,12 @@ class HaloStatsDBv2:
         
         return [dict(row) for row in cursor.fetchall()]
     
-    def get_player_medal_totals(self, xuid: str, stat_type: str = "overall") -> Dict[str, int]:
-        """Get total medals earned by player"""
+    def _sum_medal_columns_by_id(self, xuid: str, stat_type: str = "overall") -> Dict[int, int]:
+        """On-demand SUM over medal_sets, keyed by medal_id. Shared by
+        get_player_medal_totals (name-keyed) and get_player_medal_totals_by_id."""
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         # Custom/private matches never count toward "social" or "overall",
         # same as HaloClient._calculate_stats_from_matches / the
         # player_mode_stats and player_medal_totals backfills.
@@ -1412,13 +1413,13 @@ class HaloStatsDBv2:
             medal_suffix = col.replace('medal_', '', 1)
             if medal_suffix.isdigit():
                 columns.append(col)
-        
+
         if not columns:
             return {}
-        
+
         # Build sum query for each medal column
         sums = ", ".join([f"SUM(ms.{col}) as {col}" for col in columns])
-        
+
         cursor.execute(f"""
             SELECT {sums}
             FROM player_match pm
@@ -1426,21 +1427,30 @@ class HaloStatsDBv2:
             JOIN medal_sets ms ON pm.medal_set_id = ms.medal_set_id
             WHERE pm.xuid = ? {ranked_filter}
         """, (xuid,))
-        
+
         row = cursor.fetchone()
         if not row:
             return {}
-        
-        # Convert to medal name -> count
+
         result = {}
         for col in columns:
             medal_id = int(col.replace('medal_', ''))
             count = row[col] or 0
             if count > 0:
-                medal_name = MEDAL_NAME_MAPPING.get(medal_id, f"Unknown ({medal_id})")
-                result[medal_name] = count
-        
+                result[medal_id] = count
+
         return result
+
+    def get_player_medal_totals(self, xuid: str, stat_type: str = "overall") -> Dict[str, int]:
+        """Get total medals earned by player, keyed by medal name"""
+        return {
+            MEDAL_NAME_MAPPING.get(medal_id, f"Unknown ({medal_id})"): count
+            for medal_id, count in self._sum_medal_columns_by_id(xuid, stat_type).items()
+        }
+
+    def get_player_medal_totals_by_id(self, xuid: str, stat_type: str = "overall") -> Dict[int, int]:
+        """Get total medals earned by player, keyed by medal_id (for icon lookup)"""
+        return self._sum_medal_columns_by_id(xuid, stat_type)
     
     def get_stats_summary(self) -> Dict:
         """Get database statistics"""
