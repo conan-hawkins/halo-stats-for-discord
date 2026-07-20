@@ -45,10 +45,10 @@ CORE_RANKED_STATS_PROFILE = StatsProfile(
     display_name="CORE RANKED STATS",
     embed_color=0xC0392B,
     command_help=(
-        "Get stats from the permanent ranked playlists only (Ranked Arena, Doubles, Slayer - "
-        "matches halotracker's ranked overview). Usage: #coreranked <gamertag>"
+        "Get stats from the core ranked playlists (Ranked Arena incl. launch-era queues, "
+        "Doubles, Slayer). Usage: #coreranked <gamertag>"
     ),
-    guide_description="Permanent ranked playlists only (Arena/Doubles/Slayer, halotracker parity).",
+    guide_description="Core ranked playlists (Arena incl. launch-era queues, Doubles, Slayer).",
 )
 
 ROTATIONAL_RANKED_STATS_PROFILE = StatsProfile(
@@ -59,8 +59,8 @@ ROTATIONAL_RANKED_STATS_PROFILE = StatsProfile(
     display_name="ROTATIONAL RANKED STATS",
     embed_color=0x9B59B6,
     command_help=(
-        "Get stats from retired and rotational ranked playlists (launch-era Ranked Arena queues, "
-        "Snipers, Tactical, 1v1 Showdown, ...). Usage: #rotationalranked <gamertag>"
+        "Get stats from retired and rotational ranked playlists (Snipers, Tactical, "
+        "1v1 Showdown, ...). Usage: #rotationalranked <gamertag>"
     ),
     guide_description="Retired/rotational ranked playlists (everything ranked outside the core three).",
 )

@@ -1778,8 +1778,8 @@ class HaloAPIClient:
         # (match_category == 'custom') are excluded from "social" and
         # "overall" - they stay in the DB but never count toward aggregates.
         # "core_ranked"/"rotational_ranked" split "ranked" by playlist:
-        # core = permanent playlists in CORE_RANKED_PLAYLIST_IDS (halotracker
-        # parity), rotational = every other CSR playlist.
+        # core = playlists in CORE_RANKED_PLAYLIST_IDS (permanent trio plus
+        # launch-era Ranked Arena), rotational = every other CSR playlist.
         if stat_type == "ranked":
             filtered_matches = [m for m in matches if m.get('is_ranked', False)]
         elif stat_type == "core_ranked":

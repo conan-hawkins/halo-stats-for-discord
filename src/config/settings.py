@@ -92,12 +92,14 @@ STATS_HISTORY_FRESHNESS_TTL_SECONDS = int(
 # STATS CLASSIFICATION
 # =============================================================================
 
-# The permanent "core" ranked playlists (current Ranked Arena, Ranked Doubles,
-# Ranked Slayer). #coreranked aggregates only these, which matches
-# halotracker.com's ranked lifetime overview; every other CSR playlist
-# (retired launch-era Ranked Arena queues, rotational playlists like Ranked
-# Snipers / Tactical / FFA / 1v1 Showdown, and any future rotation entries)
-# falls into #rotationalranked automatically because rotational is defined as
+# The "core" ranked playlists: the permanent trio (current Ranked Arena,
+# Ranked Doubles, Ranked Slayer) plus the retired launch-era Ranked Arena
+# queues, since those were the same core queue under older playlist IDs.
+# (halotracker.com's ranked lifetime overview counts only the permanent
+# trio, so #coreranked now exceeds tracker by the launch-era games.)
+# Every other CSR playlist (rotational playlists like Ranked Snipers /
+# Tactical / FFA / 1v1 Showdown, and any future rotation entries) falls
+# into #rotationalranked automatically because rotational is defined as
 # "is_ranked and not core". Compare against a lowercased playlist_id.
 # Lives here (not client.py) so src/database can import it without a circular
 # import through src.api.
@@ -105,6 +107,8 @@ CORE_RANKED_PLAYLIST_IDS = frozenset({
     "edfef3ac-9cbe-4fa2-b949-8f29deafd483",  # Ranked Arena
     "fa5aa2a3-2428-4912-a023-e1eeea7b877c",  # Ranked Doubles
     "dcb2e24e-05fb-4390-8076-32a0cdb4326e",  # Ranked Slayer
+    "f7f30787-f607-436b-bdec-44c65bc2ecef",  # Ranked Arena (launch-era queue)
+    "f7eb8c71-fedb-4696-8c0f-96025e285ffd",  # Ranked Arena (launch-era queue)
 })
 
 # =============================================================================

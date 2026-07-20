@@ -741,7 +741,7 @@ class HaloStatsDBv2:
         # matches/player_match (never deleted) but never contribute to
         # precomputed aggregates. 'unknown' (not yet classified) still
         # counts, same as before. Ranked matches additionally land in exactly
-        # one of 'core_ranked' (permanent playlists, halotracker parity) or
+        # one of 'core_ranked' (core playlists incl. launch-era Ranked Arena) or
         # 'rotational_ranked' (every other CSR playlist), so
         # ranked == core_ranked + rotational_ranked always holds.
         game_mode = 'ranked' if match_data.get('is_ranked') else 'social'
