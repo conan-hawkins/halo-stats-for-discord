@@ -102,6 +102,22 @@ class PlayerStatsCacheV2:
                         conn.execute("ROLLBACK TO SAVEPOINT participants_write")
                         conn.execute("RELEASE SAVEPOINT participants_write")
 
+            # Replace the durable set of failed match IDs for this player within
+            # the same transaction, so the next history check can retry exactly
+            # these instead of re-crawling. An empty list clears the set (gap
+            # closed). Only real match IDs are stored (collection uses the actual
+            # ID, never a placeholder).
+            failed_ids = [
+                mid for mid in (stats_data.get('failed_matches') or [])
+                if mid
+            ]
+            conn.execute("DELETE FROM player_failed_matches WHERE xuid = ?", (xuid,))
+            if failed_ids:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO player_failed_matches (xuid, match_id) VALUES (?, ?)",
+                    [(xuid, mid) for mid in failed_ids],
+                )
+
             conn.commit()
             print(f"[CACHE] Successfully saved {matches_saved}/{len(matches_to_save)} matches for {gamertag or xuid}")
             return True
@@ -175,9 +191,13 @@ class PlayerStatsCacheV2:
                 'last_update': player['last_processed_at'],
                 'incomplete_data': bool(player['incomplete_data']),
                 'failed_match_count': player['failed_match_count'] or 0,
+                # Specific match IDs whose detail fetch previously failed, so the
+                # caller can retry exactly those (targeted repair) instead of a
+                # full re-crawl. Empty list => no known repair targets.
+                'failed_matches': list(self.get_failed_match_ids(player_xuid)),
                 'processed_matches': matches
             }
-            
+
             return stats_data
             
         except Exception as e:
@@ -425,6 +445,20 @@ class PlayerStatsCacheV2:
             WHERE pm.xuid = ? {ranked_filter}
         """, (xuid,))
         
+        return {row['match_id'] for row in cursor.fetchall()}
+
+    def get_failed_match_ids(self, xuid: str) -> set:
+        """
+        Get the set of match IDs whose detail fetch previously failed for a
+        player. Used to retry exactly those matches (targeted repair) instead
+        of re-crawling the whole history.
+        """
+        conn = self.db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT match_id FROM player_failed_matches WHERE xuid = ?",
+            (xuid,),
+        )
         return {row['match_id'] for row in cursor.fetchall()}
 
     def get_seed_verified_match_ids(self, seed_xuid: str, limit_matches: int = None) -> List[str]:

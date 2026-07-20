@@ -265,6 +265,20 @@ class HaloStatsDBv2:
         self._ensure_column_exists("players", "failed_match_count", "INTEGER NOT NULL DEFAULT 0")
 
         # ============================================================
+        # Table 2b: Player Failed Matches - specific match IDs whose detail
+        # fetch failed, so the next history check can retry exactly those
+        # matches instead of re-crawling the player's entire history.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_failed_matches (
+                xuid TEXT NOT NULL,
+                match_id TEXT NOT NULL,
+                PRIMARY KEY (xuid, match_id),
+                FOREIGN KEY (xuid) REFERENCES players(xuid)
+            )
+        """)
+
+        # ============================================================
         # Table 3: Medal Types - Reference table for medal IDs to names
         # ============================================================
         cursor.execute("""

@@ -75,6 +75,15 @@ from src.api.xuid_cache import (
 )
 
 
+# Sentinel returned by fetch_match_page when a page-listing request fails after
+# exhausting its retries. Kept distinct from [] (a genuine empty/end-of-history
+# page) and None (401, needs token refresh) so a transient failure can never be
+# mistaken for "reached the end of the player's history" and silently truncate a
+# crawl. It is truthy and has no len(), so call sites MUST test `is
+# _PAGE_FETCH_FAILED` before any truthiness / len() check.
+_PAGE_FETCH_FAILED = object()
+
+
 # =============================================================================
 # HALO API CLIENT
 # =============================================================================
@@ -2831,7 +2840,7 @@ class HaloAPIClient:
                                 return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry, error_retry, rate_limit_retry + 1, force_account=account_index)
                             else:
                                 print(f"❌ Rate limit exceeded after {max_rate_limit_retries} retries at page {start_pos}")
-                                return []  # Return empty to continue with other pages
+                                return _PAGE_FETCH_FAILED  # Failure, not end-of-history
                         elif response.status == 401:
                             # Try rotating to next account instead of refreshing tokens
                             if account_retry < max_account_retries:
@@ -2852,13 +2861,13 @@ class HaloAPIClient:
                                 # Will automatically get a different account via rate limiter
                                 return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry, error_retry + 1, rate_limit_retry, force_account=None)
                             else:
-                                # Max retries reached - return empty to continue
-                                return []
+                                # Max retries reached - failure, not end-of-history
+                                return _PAGE_FETCH_FAILED
                         else:
                             print(f"Unexpected status: {response.status}")
                             text = await response.text()
                             print(f"   Response: {text[:200]}")
-                            return []
+                            return _PAGE_FETCH_FAILED
                 except OSError as e:
                     # Handle Windows semaphore timeout errors (WinError 121)
                     if 'semaphore timeout' in str(e).lower() or 'WinError 121' in str(e):
@@ -2869,10 +2878,10 @@ class HaloAPIClient:
                             return await fetch_match_page(session, start_pos, page_size, retry_count + 1, account_retry, error_retry, rate_limit_retry, force_account=None)
                         else:
                             print(f"Failed after {max_retries} retries due to socket exhaustion at page {start_pos}")
-                            return []
+                            return _PAGE_FETCH_FAILED
                     else:
                         print(f"OS Error fetching page at {start_pos}: {e}")
-                        return []
+                        return _PAGE_FETCH_FAILED
                 except aiohttp.ClientConnectorError as e:
                     # Handle connection errors (including semaphore timeouts)
                     if retry_count < max_retries:
@@ -2882,10 +2891,10 @@ class HaloAPIClient:
                         return await fetch_match_page(session, start_pos, page_size, retry_count + 1, account_retry, error_retry, rate_limit_retry, force_account=None)
                     else:
                         print(f"Failed after {max_retries} retries: {e}")
-                        return []
+                        return _PAGE_FETCH_FAILED
                 except Exception as e:
                     print(f"Error fetching page at {start_pos}: {e}")
-                return []
+                return _PAGE_FETCH_FAILED
             
             # Fetch multiple pages concurrently to determine total match count
             # Connection limits - conservative to avoid rate limiting
@@ -2904,7 +2913,11 @@ class HaloAPIClient:
             
             # Initialize 401 error tracking
             got_401_error = False
-            
+            # Set True if a full-crawl page listing stays failed after the repair
+            # pass = an "unknown gap" (we don't know which match IDs are missing).
+            # Marks the cache incomplete so the next full-history check re-crawls.
+            page_fetch_incomplete = False
+
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 # Decide fetching strategy: incremental vs full refetch
                 # Force full fetch ignores cache completely.
@@ -2924,7 +2937,26 @@ class HaloAPIClient:
                 else:
                     use_incremental = False
                     print(f"🆕 No cache, doing full fetch")
-                
+
+                # An incomplete cache has two distinct repairs:
+                #   - Known failed match IDs (details never saved): refetch exactly
+                #     those below, alongside the normal incremental check.
+                #   - Unknown gap (a page listing failed, IDs unknown): only a full
+                #     re-crawl can rediscover the missing matches.
+                repair_ids = []
+                if use_incremental and cache_marked_incomplete and not force_full_fetch:
+                    known_failed = [
+                        mid for mid in (cached_data.get('failed_matches') or [])
+                        if mid and mid not in existing_matches
+                    ]
+                    if known_failed:
+                        repair_ids = known_failed
+                        print(f"Cache incomplete with {len(repair_ids)} known failed match(es); "
+                              f"will attempt targeted repair (no full re-crawl)")
+                    else:
+                        print("Cache incomplete with unknown gap, forcing full re-crawl")
+                        use_incremental = False
+
                 # Smart cache update: fetch pages until we hit a cached match
                 if use_incremental:
                     print(f"Checking for new matches (incremental fetch)...")
@@ -2942,18 +2974,27 @@ class HaloAPIClient:
                             # Got 401 error - need to refresh token
                             got_401_error = True
                             break
-                        
+
+                        if page is _PAGE_FETCH_FAILED:
+                            # Page listing failed after retries. This is NOT
+                            # end-of-history: leave reached_history_end False so
+                            # the incremental result stays unproven and falls back
+                            # safely. (Distinguishes a page-0 failure from a genuine
+                            # empty first page = "no match history".)
+                            print(f"Page {page_num} fetch failed, incremental scan cannot prove completeness")
+                            break
+
                         if not page:
-                            # Empty page could mean:
+                            # Genuine empty page:
                             # 1. Player has 0 matches (first page, valid scenario)
                             # 2. Reached end of matches (later page)
-                            # 3. API error (not 401, would be None)
                             if page_num == 0:
                                 # First page empty = player has no match history, not an error
                                 print(f"Player has no match history")
                                 reached_history_end = True
                                 break
-                            print(f"Failed to fetch page {page_num}, stopping search")
+                            # A later genuine empty page also means end-of-history.
+                            reached_history_end = True
                             break
 
                         if page_num == 0:
@@ -3019,6 +3060,10 @@ class HaloAPIClient:
                         probe_page = await fetch_match_page(session, probe_plan.start, probe_plan.count)
                         if probe_page is None:
                             got_401_error = True
+                        elif probe_page is _PAGE_FETCH_FAILED:
+                            # Probe fetch failed - inconclusive. Leave probe_checked
+                            # False so completeness stays unproven and falls back safely.
+                            print("Boundary probe fetch failed; leaving completeness unproven")
                         else:
                             probe_checked = True
                             probe_match_id = probe_page[0].get('MatchId') if probe_page else None
@@ -3086,6 +3131,14 @@ class HaloAPIClient:
                                 "switching to full fetch."
                             )
                             use_incremental = False
+                        elif repair_ids:
+                            # No new matches, but there are known-failed matches to
+                            # repair. Fall through with an empty new-match list so the
+                            # detail-fetch stage below retries exactly those IDs and
+                            # re-saves (clearing the incomplete flag) - not a re-crawl.
+                            print(f"No new matches; performing targeted repair of "
+                                  f"{len(repair_ids)} failed match(es)")
+                            all_matches = list(new_matches_found)
                         else:
                             # A real API check just confirmed the cache is
                             # current; stamp it so requests within the
@@ -3129,7 +3182,11 @@ class HaloAPIClient:
                     else:
                         max_pages = 999999
                     got_empty_page = False
-                    
+                    # Page-listing fetches that failed after retries. A mid-crawl
+                    # failure must NOT stop the crawl (that silently truncates
+                    # history); we keep enqueuing and repair these afterwards.
+                    failed_page_nums = []
+
                     # Use asyncio queue for rolling concurrency
                     pending_tasks = set()
                     
@@ -3150,10 +3207,20 @@ class HaloAPIClient:
                         
                         for task in done:
                             page_num, page = task.result()
-                            
+
                             if page is None:
                                 got_401_error = True
                                 break
+                            elif page is _PAGE_FETCH_FAILED:
+                                # Page listing failed after retries. Do NOT treat
+                                # this as end-of-history: record it for the repair
+                                # pass and keep enqueuing subsequent pages so a
+                                # single transient failure can't truncate the crawl.
+                                failed_page_nums.append(page_num)
+                                if current_page < max_pages and not got_empty_page:
+                                    new_task = asyncio.create_task(fetch_and_track(current_page))
+                                    pending_tasks.add(new_task)
+                                    current_page += 1
                             elif page and len(page) > 0:
                                 all_matches.extend(page)
 
@@ -3167,19 +3234,44 @@ class HaloAPIClient:
                                     pending_tasks.add(new_task)
                                     current_page += 1
                             else:
-                                # Empty page - stop starting new requests
+                                # Genuine empty page - real end of history, stop starting new requests
                                 got_empty_page = True
-                        
+
                         if got_401_error:
                             # Cancel remaining tasks
                             for t in pending_tasks:
                                 t.cancel()
                             break
-                        
+
                         # Progress update
                         if len(all_matches) % 500 == 0 and len(all_matches) > 0:
                             print(f"   Fetched {len(all_matches)} matches so far...")
-                
+
+                    # In-crawl repair pass: retry any pages that failed mid-crawl,
+                    # serially and at low concurrency (per-request retries already
+                    # happened once inside fetch_match_page). Anything still failing
+                    # leaves an "unknown gap" flag so the cache is marked incomplete
+                    # and the next full-history check re-crawls (see targeted-repair
+                    # logic). Skip during 401 handling - that path retries wholesale.
+                    if failed_page_nums and not got_401_error:
+                        print(f"Repairing {len(failed_page_nums)} failed page(s) from full crawl...")
+                        still_failed = []
+                        for fp in failed_page_nums:
+                            repaired = await fetch_match_page(session, fp * PAGE_SIZE, PAGE_SIZE)
+                            if repaired is None:
+                                got_401_error = True
+                                break
+                            if repaired is _PAGE_FETCH_FAILED:
+                                still_failed.append(fp)
+                            elif repaired:
+                                all_matches.extend(repaired)
+                            # A genuine empty page here just means that offset is now
+                            # past end-of-history; nothing to add, not a failure.
+                        if still_failed:
+                            page_fetch_incomplete = True
+                            print(f"⚠️ {len(still_failed)} page(s) still failed after repair; "
+                                  f"cache will be marked incomplete (unknown gap)")
+
                 # Check if we got 401 errors and need to refresh tokens
                 if got_401_error:
                     if _retry_count >= 2:
@@ -3206,6 +3298,15 @@ class HaloAPIClient:
                         match.get('MatchId') for match in all_matches
                         if match.get('MatchId') and match.get('MatchId') not in existing_matches
                     ]
+                    # Targeted repair: also refetch known-failed match IDs. Their
+                    # details were never saved, so they aren't in existing_matches;
+                    # retrying them here clears the incomplete flag on save.
+                    if repair_ids:
+                        seen = set(uncached_match_ids)
+                        for mid in repair_ids:
+                            if mid not in seen:
+                                uncached_match_ids.append(mid)
+                                seen.add(mid)
                     print(f"Processing {len(uncached_match_ids)} uncached matches from {len(all_matches)} listed matches")
                     matches_to_fetch = [(match_id, xuid) for match_id in uncached_match_ids]
                     all_processed_matches = list(existing_matches.values())
@@ -3236,30 +3337,42 @@ class HaloAPIClient:
                 
                 async def fetch_match_detail(match_id, player_xuid):
                     """Fetch single match and return result"""
-                    result = await self.get_match_stats_for_match(match_id, player_xuid, session)
+                    try:
+                        result = await self.get_match_stats_for_match(match_id, player_xuid, session)
+                    except Exception as e:
+                        print(f"Error fetching match detail {match_id}: {e}")
+                        result = None
                     return match_id, result
-                
+
                 # Start initial batch
                 pending = set()
+                # Track task -> match_id so a failure always records the REAL match
+                # ID (never "unknown"); those IDs are persisted for targeted repair.
+                pending_match_ids = {}
                 match_iter = iter(matches_to_fetch)
-                
+
+                def _start_detail_task(mid, pxuid):
+                    task = asyncio.create_task(fetch_match_detail(mid, pxuid))
+                    pending.add(task)
+                    pending_match_ids[task] = mid
+
                 for _ in range(min(max_match_requests, len(matches_to_fetch))):
                     try:
                         match_id, player_xuid = next(match_iter)
-                        task = asyncio.create_task(fetch_match_detail(match_id, player_xuid))
-                        pending.add(task)
+                        _start_detail_task(match_id, player_xuid)
                     except StopIteration:
                         break
-                
+
                 # Rolling queue - as each completes, start next
                 completed = 0
                 total = len(matches_to_fetch)
-                
+
                 while pending:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                    
+
                     for task in done:
                         completed += 1
+                        mid = pending_match_ids.pop(task, None)
                         try:
                             match_id, result = task.result()
                             if result is not None:
@@ -3267,13 +3380,15 @@ class HaloAPIClient:
                             else:
                                 failed_matches.append(match_id)
                         except Exception as e:
-                            failed_matches.append("unknown")
-                        
+                            # Defensive net (fetch_match_detail already swallows
+                            # its own errors): record the real ID when known.
+                            if mid is not None:
+                                failed_matches.append(mid)
+
                         # Start next request immediately
                         try:
                             next_match_id, next_xuid = next(match_iter)
-                            new_task = asyncio.create_task(fetch_match_detail(next_match_id, next_xuid))
-                            pending.add(new_task)
+                            _start_detail_task(next_match_id, next_xuid)
                         except StopIteration:
                             pass
                     
@@ -3367,9 +3482,13 @@ class HaloAPIClient:
                     'total_matches_hint': total_matches_hint,
                     'newest_cached_match_id': all_processed_matches[0].get('match_id') if all_processed_matches else None,
                     'newest_cached_match_time': all_processed_matches[0].get('start_time') if all_processed_matches else None,
-                    'incomplete_data': len(failed_matches) > 0,
+                    # Incomplete if any match-detail fetch failed (known IDs) OR a
+                    # page listing stayed failed after repair (unknown gap, no IDs).
+                    'incomplete_data': len(failed_matches) > 0 or page_fetch_incomplete,
                     'failed_match_count': len(failed_matches),
-                    'failed_matches': failed_matches[:50] if len(failed_matches) <= 50 else failed_matches[:50] + ['...truncated'],
+                    # Full list of real failed match IDs (no truncation) so the next
+                    # run can retry exactly these instead of re-crawling everything.
+                    'failed_matches': failed_matches,
                 }
 
                 # Save to cache off the event loop, so the blocking SQLite write

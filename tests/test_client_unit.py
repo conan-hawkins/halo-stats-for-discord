@@ -2207,3 +2207,263 @@ async def test_no_new_matches_stamps_freshness_and_skips_api_on_repeat(monkeypat
     assert second["error"] == 0
     assert second["stats"]["games_played"] == 25
     assert len(starts) == requests_after_first
+
+
+# =============================================================================
+# Page-listing failure hardening + durable failed-match targeted repair
+# =============================================================================
+
+
+class _RepairFakeResponse:
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+        self.headers = {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return ""
+
+
+def _install_fake_http(monkeypatch, page_handler):
+    """Install a fake aiohttp layer.
+
+    page_handler(start:int) -> (status:int, results:list). A non-200/401/429/500
+    status (e.g. 503) makes fetch_match_page return the _PAGE_FETCH_FAILED
+    sentinel immediately (no retry sleeps). Returns the list of requested
+    `start` offsets so tests can assert on crawl breadth.
+    """
+    from src.api import client as client_module
+
+    class _FakeRateLimiter:
+        async def wait_if_needed(self, force_account=None):
+            return 0
+
+        def set_backoff(self, seconds, account_index=None):
+            return None
+
+    starts = []
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, headers=None):
+            start = int(url.split("start=")[1].split("&")[0])
+            starts.append(start)
+            status, results = page_handler(start)
+            return _RepairFakeResponse(status, {"Results": results})
+
+    monkeypatch.setattr(client_module, "halo_stats_rate_limiter", _FakeRateLimiter())
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda *a, **k: _FakeSession())
+    monkeypatch.setattr(client_module.aiohttp, "TCPConnector", lambda *a, **k: object())
+    monkeypatch.setattr(client_module.aiohttp, "ClientTimeout", lambda *a, **k: object())
+    return starts
+
+
+def _full_match(match_id, is_ranked=False):
+    """A processed-match dict complete enough for insert_match/insert_player_match."""
+    return {
+        "match_id": match_id, "kills": 1, "deaths": 1, "assists": 0, "outcome": 2,
+        "duration": "PT1M", "start_time": "2026-01-01T00:00:00", "is_ranked": is_ranked,
+        "match_category": "ranked" if is_ranked else "social", "category_source": "test",
+        "playlist_id": "p", "map_id": "m", "map_version": "v1", "medals": [],
+        "csr": None, "csr_tier": None, "players": ["seed"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_full_crawl_page_failure_does_not_truncate_and_marks_incomplete(monkeypatch):
+    """A page-listing failure mid-crawl must not be mistaken for end-of-history:
+    pages after the failure are still fetched, and the unrecovered page leaves an
+    explicit incomplete flag (unknown gap)."""
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+
+    # No cache -> full crawl. Page 2 (start=50) always fails; page 7 is the real
+    # end. Pages 5 & 6 live beyond the failure and must still appear.
+    def page_handler(start):
+        page_num = start // 25
+        if page_num == 2:
+            return 503, []          # immediate failure sentinel, no retry sleeps
+        if page_num >= 7:
+            return 200, []          # genuine end of history
+        return 200, [{"MatchId": f"m{page_num}"}]
+
+    _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+
+    saved = {}
+    monkeypatch.setattr(
+        client, "save_stats_cache",
+        lambda xuid, stat_type, stats_data, gamertag=None: saved.update(data=stats_data),
+    )
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    got_ids = {m["match_id"] for m in result["processed_matches"]}
+    # Page 2 failed; every other page's match survives, including pages 5 & 6
+    # that sit beyond the failure - proving the crawl did not truncate.
+    assert got_ids == {"m0", "m1", "m3", "m4", "m5", "m6"}
+    # The page stayed failed after the repair pass -> explicit incomplete signal.
+    assert saved["data"]["incomplete_data"] is True
+
+
+def test_failed_match_ids_survive_save_load_round_trip(tmp_path):
+    """Failed match IDs persist across save/load and the stored set is replaced
+    (not appended) on each save, clearing entirely when empty."""
+    from src.database.cache import PlayerStatsCacheV2
+
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    xuid = "xuid-rt"
+    kept = _full_match("kept-1")
+
+    cache.save_player_stats(xuid, "overall", {
+        "last_update": "2026-01-01T00:00:00",
+        "processed_matches": [kept],
+        "incomplete_data": True,
+        "failed_match_count": 2,
+        "failed_matches": ["fail-a", "fail-b"],
+    }, gamertag="RT")
+
+    assert cache.get_failed_match_ids(xuid) == {"fail-a", "fail-b"}
+    loaded = cache.load_player_stats(xuid, "overall", "RT")
+    assert set(loaded["failed_matches"]) == {"fail-a", "fail-b"}
+    assert loaded["incomplete_data"] is True
+
+    # A later save with a smaller set REPLACES the rows (repair reduced the gap).
+    cache.save_player_stats(xuid, "overall", {
+        "last_update": "2026-01-02T00:00:00",
+        "processed_matches": [kept],
+        "incomplete_data": True,
+        "failed_matches": ["fail-b"],
+    }, gamertag="RT")
+    assert cache.get_failed_match_ids(xuid) == {"fail-b"}
+
+    # Clearing the list removes every row (gap fully closed).
+    cache.save_player_stats(xuid, "overall", {
+        "last_update": "2026-01-03T00:00:00",
+        "processed_matches": [kept],
+        "incomplete_data": False,
+        "failed_matches": [],
+    }, gamertag="RT")
+    assert cache.get_failed_match_ids(xuid) == set()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_cache_with_known_ids_targets_repair_not_full_crawl(monkeypatch, tmp_path):
+    """Known failed match IDs trigger a targeted refetch of just those IDs -
+    not a full page-by-page re-crawl - and clear the incomplete flag on success."""
+    from src.database.cache import PlayerStatsCacheV2
+
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.stats_cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    xuid = "xuid-repair"
+
+    # Cache: boundary match b1 cached, plus a durable known-failed match id.
+    client.stats_cache.save_player_stats(xuid, "overall", {
+        "last_update": "2026-01-01T00:00:00",
+        "processed_matches": [_full_match("b1")],
+        "incomplete_data": True,
+        "failed_match_count": 1,
+        "failed_matches": ["old-fail"],
+    }, gamertag="G")
+
+    # Incremental scan hits the cached boundary (b1) on page 0; nothing new.
+    def page_handler(start):
+        if start == 0:
+            return 200, [{"MatchId": "b1"}]
+        return 200, []
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    detailed = []
+
+    async def _detail(match_id, player_xuid, session):
+        detailed.append(match_id)
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid=xuid, stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    # Only the failed match was refetched (targeted repair).
+    assert detailed == ["old-fail"]
+    # No deep rolling-queue crawl: nothing past the incremental boundary/probe.
+    assert max(starts) <= 25
+    # The gap is closed: durable failed set cleared and flag reset on reload.
+    assert client.stats_cache.get_failed_match_ids(xuid) == set()
+    assert client.stats_cache.load_player_stats(xuid, "overall", "G")["incomplete_data"] is False
+
+
+@pytest.mark.asyncio
+async def test_incomplete_cache_unknown_gap_forces_full_recrawl(monkeypatch, tmp_path):
+    """An incomplete cache with NO known failed IDs (a page-listing gap) has no
+    repairable target, so it must force a full re-crawl that then converges."""
+    from src.database.cache import PlayerStatsCacheV2
+
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.stats_cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    xuid = "xuid-gap"
+
+    # Marked incomplete but no failed_matches rows = unknown gap.
+    client.stats_cache.save_player_stats(xuid, "overall", {
+        "last_update": "2026-01-01T00:00:00",
+        "processed_matches": [_full_match("b1")],
+        "incomplete_data": True,
+        "failed_matches": [],
+    }, gamertag="G")
+    assert client.stats_cache.load_player_stats(xuid, "overall", "G")["incomplete_data"] is True
+
+    def page_handler(start):
+        if start == 0:
+            return 200, [{"MatchId": "b1"}]
+        return 200, []
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid=xuid, stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    # A full rolling-queue crawl requests pages well past the incremental
+    # boundary (start >= 50), which the incremental path never would.
+    assert max(starts) >= 50
+    # The re-crawl completed cleanly (no gap), clearing the incomplete flag.
+    assert client.stats_cache.load_player_stats(xuid, "overall", "G")["incomplete_data"] is False
