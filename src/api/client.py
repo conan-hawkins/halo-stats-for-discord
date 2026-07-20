@@ -262,7 +262,80 @@ class HaloAPIClient:
                 return False
 
             return refresh_succeeded
-    
+
+    @staticmethod
+    def _oauth_refresh_alive(account_cache: Optional[Dict]) -> bool:
+        """True if the account's OAuth token is still valid.
+
+        Used to decide whether a refresh miss is recoverable. A live OAuth
+        entry after a refresh attempt means the long-lived refresh token still
+        works and only the non-critical derived/clearance step hiccuped - so a
+        manual browser re-auth is NOT needed. Only a dead OAuth token requires
+        `setup_account`.
+        """
+        if not account_cache:
+            return False
+        return is_token_valid(account_cache.get("oauth"))
+
+    async def reload_spartan_accounts_from_cache(self) -> int:
+        """Rebuild the in-memory Spartan pool from the on-disk token caches.
+
+        No network calls. Re-reads the five token cache files and repopulates
+        self.spartan_accounts with every account whose cached spartan/xsts/xbox
+        tokens are still valid. The weekly proactive refresh rewrites those cache
+        files but never touches this in-memory pool, so without this the pool can
+        stay stuck at a single account and starve match-fetch concurrency.
+        """
+        async with get_token_swap_lock():
+            # Account 1 lives in the primary cache slot.
+            account1_cache = safe_read_json(TOKEN_CACHE_FILE, default={})
+            account1_spartan = account1_cache.get("spartan") if account1_cache else None
+
+            new_accounts: List[Dict] = []
+            if account1_spartan and account1_spartan.get("token"):
+                new_accounts.append({
+                    'id': 'account1',
+                    'token': account1_spartan.get("token"),
+                    'name': 'Account 1'
+                })
+
+            # Additional accounts (2-5): include only when fully valid, matching
+            # the membership gate used elsewhere in ensure_valid_tokens.
+            for i in range(2, 6):
+                cache_file = get_token_cache_path(i)
+                cache_data = safe_read_json(cache_file, default={})
+                if not cache_data:
+                    continue
+
+                spartan_info = cache_data.get("spartan")
+                xsts_info = cache_data.get("xsts")
+                xsts_xbox_info = cache_data.get("xsts_xbox")
+
+                if (spartan_info and is_token_valid(spartan_info) and
+                        xsts_info and is_token_valid(xsts_info) and
+                        xsts_xbox_info and is_token_valid(xsts_xbox_info)):
+                    new_accounts.append({
+                        'id': f'account{i}',
+                        'token': spartan_info.get("token"),
+                        'name': f'Account {i}',
+                        'cache_file': cache_file
+                    })
+
+            if not new_accounts:
+                # Never wipe the pool to empty - keep whatever is already loaded.
+                print("⚠️ reload_spartan_accounts_from_cache found no valid accounts; keeping existing pool")
+                return 0
+
+            # Single atomic reassignment so concurrent match-fetch readers never
+            # observe a half-built list.
+            self.spartan_accounts = new_accounts
+            if account1_spartan and account1_spartan.get("token"):
+                self.spartan_token = account1_spartan.get("token")
+
+            halo_stats_rate_limiter.set_num_accounts(len(new_accounts))
+            print(f"Reloaded {len(new_accounts)} Spartan account(s) from cache for match fetching")
+            return len(new_accounts)
+
     # =========================================================================
     # AUTHENTICATION METHODS
     # =========================================================================
@@ -366,7 +439,11 @@ class HaloAPIClient:
                         print(f"Error refreshing Account {i}: {e}")
 
                 if not refresh_success:
-                    print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
+                    post_cache = safe_read_json(cache_file, default={})
+                    if self._oauth_refresh_alive(post_cache):
+                        print(f"Account {i}: refreshed, clearance temporarily unavailable (non-critical)")
+                    else:
+                        print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
             
             self.spartan_token = account1_spartan_info.get("token")
             
@@ -495,6 +572,8 @@ class HaloAPIClient:
                         if i in refreshed_account_attempts:
                             if spartan_valid and xsts_valid and xbox_valid:
                                 print(f"Account {i} tokens refreshed successfully")
+                            elif self._oauth_refresh_alive(cache_data):
+                                print(f"Account {i}: refreshed, clearance temporarily unavailable (non-critical)")
                             else:
                                 print(f"⚠️ Account {i} needs manual re-auth. Run: python -m src.auth.setup_account {i}")
                         elif not (spartan_valid and xsts_valid and xbox_valid):

@@ -131,6 +131,12 @@ async def proactive_token_refresh():
                     print(f"⚠️ Account {i} refresh completed without valid refreshed tokens")
         
         print("🔄 Weekly proactive refresh complete")
+
+        # The loop above only rewrote cache files. Repopulate the running
+        # client's in-memory Spartan pool so match-fetching regains all valid
+        # accounts (and the rate limiter rescales) instead of staying stuck on
+        # whatever was loaded at the last hourly refresh.
+        await api_client.reload_spartan_accounts_from_cache()
     except Exception as e:
         print(f"⚠️ Proactive refresh error: {e}")
 
