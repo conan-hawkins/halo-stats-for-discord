@@ -13,6 +13,7 @@ class StatsProfile:
     command_help: str
     guide_description: str
     force_full_fetch: bool = False
+    modes_note: Optional[str] = None
 
 
 FULL_STATS_PROFILE = StatsProfile(
@@ -45,10 +46,11 @@ CORE_RANKED_STATS_PROFILE = StatsProfile(
     display_name="CORE RANKED STATS",
     embed_color=0xC0392B,
     command_help=(
-        "Get stats from the core ranked playlists (Ranked Arena incl. launch-era queues, "
+        "Get stats from the core ranked playlists (Ranked Arena, "
         "Doubles, Slayer). Usage: #coreranked <gamertag>"
     ),
-    guide_description="Core ranked playlists (Arena incl. launch-era queues, Doubles, Slayer).",
+    guide_description="Core ranked playlists (Arena, Doubles, Slayer).",
+    modes_note="Ranked Arena, Ranked Doubles, Ranked Slayer",
 )
 
 ROTATIONAL_RANKED_STATS_PROFILE = StatsProfile(
@@ -63,6 +65,8 @@ ROTATIONAL_RANKED_STATS_PROFILE = StatsProfile(
         "1v1 Showdown, ...). Usage: #rotationalranked <gamertag>"
     ),
     guide_description="Retired/rotational ranked playlists (everything ranked outside the core three).",
+    modes_note="""Ranked Snipers, Ranked Tactical, 
+    Ranked 1v1 Showdown, and other rotational playlists""",
 )
 
 CASUAL_STATS_PROFILE = StatsProfile(

@@ -31,6 +31,10 @@ async def format_stats_embed(gamertag, stats_list, stat_type="overall"):
         games_played = stats_list[6]
         embed.description = f"Based on {games_played} matches"
 
+    if profile.modes_note:
+        note = f"*Playlists: {profile.modes_note}*"
+        embed.description = f"{embed.description}\n{note}" if embed.description else note
+
     if not stats_list or len(stats_list) < 6:
         print("ERROR: Invalid stats list")
         embed.add_field(name="Error", value="Invalid stats data received from API", inline=False)
