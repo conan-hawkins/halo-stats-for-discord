@@ -332,7 +332,8 @@ class PlayerStatsCacheV2:
         conn = self.db._get_connection()
         cursor = conn.cursor()
 
-        game_mode = stat_type if stat_type in ("ranked", "social") else "overall"
+        game_mode = (stat_type if stat_type in ("ranked", "social", "core_ranked", "rotational_ranked")
+                     else "overall")
 
         cursor.execute("""
             SELECT pmt.medal_name_id, mt.medal_name, pmt.count

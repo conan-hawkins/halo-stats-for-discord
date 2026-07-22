@@ -1,12 +1,15 @@
+from src.config import CORE_RANKED_PLAYLIST_IDS
 from src.database.cache import PlayerStatsCacheV2
 from src.database.player_medal_totals_backfill import backfill_player_medal_totals
 
 DOUBLE_KILL = 622331684  # named in MEDAL_NAME_MAPPING
 TRIPLE_KILL = 2063152177  # named in MEDAL_NAME_MAPPING
 UNKNOWN_MEDAL = 999999999  # not in MEDAL_NAME_MAPPING
+CORE_PLAYLIST = next(iter(CORE_RANKED_PLAYLIST_IDS))
+ROTATIONAL_PLAYLIST = "rotational-playlist-not-in-core-set"
 
 
-def _match(match_id, ranked, start_time, medals=None):
+def _match(match_id, ranked, start_time, medals=None, playlist_id="playlist"):
     return {
         "match_id": match_id,
         "kills": 10,
@@ -18,7 +21,7 @@ def _match(match_id, ranked, start_time, medals=None):
         "is_ranked": ranked,
         "match_category": "ranked" if ranked else "social",
         "category_source": "test",
-        "playlist_id": "playlist",
+        "playlist_id": playlist_id,
         "map_id": "map",
         "map_version": "v1",
         "medals": medals or [],
@@ -174,7 +177,7 @@ def test_backfill_recomputes_matching_incremental_state(tmp_path):
     db.insert_or_update_player(xuid, "TestPlayer6", "2026-01-01T00:00:00")
     matches = [
         _match("m1", ranked=True, start_time="2026-01-01T00:00:00",
-               medals=[{"NameId": DOUBLE_KILL, "Count": 2}]),
+               medals=[{"NameId": DOUBLE_KILL, "Count": 2}], playlist_id=CORE_PLAYLIST),
         _match("m2", ranked=False, start_time="2026-01-02T00:00:00",
                medals=[{"NameId": TRIPLE_KILL, "Count": 1}]),
         _match("m3", ranked=False, start_time="2026-01-03T00:00:00",
@@ -184,9 +187,10 @@ def test_backfill_recomputes_matching_incremental_state(tmp_path):
         db.insert_match(m)
         db.insert_player_match(xuid, m)
 
+    modes = ("overall", "ranked", "social", "core_ranked", "rotational_ranked")
     incremental = {
         stat_type: _summary_by_name(cache, xuid, stat_type)
-        for stat_type in ("overall", "ranked", "social")
+        for stat_type in modes
     }
 
     conn = db._get_connection()
@@ -196,6 +200,49 @@ def test_backfill_recomputes_matching_incremental_state(tmp_path):
     result = backfill_player_medal_totals(db_path)
     assert result.rows_written > 0
 
-    for stat_type in ("overall", "ranked", "social"):
+    for stat_type in modes:
         backfilled = _summary_by_name(cache, xuid, stat_type)
         assert backfilled == incremental[stat_type]
+
+
+def test_core_and_rotational_ranked_medals_sum_to_ranked(tmp_path):
+    """Regression test: #coreranked/#rotationalranked medal totals must never
+    exceed #ranked - they used to silently fall back to the 'overall'
+    (lifetime, incl. social) bucket instead of a ranked sub-bucket."""
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    db = cache.db
+    xuid = "xuid-core-rotational"
+
+    db.insert_or_update_player(xuid, "TestPlayerCoreRot", "2026-01-01T00:00:00")
+
+    core_match = _match("m1", ranked=True, start_time="2026-01-01T00:00:00",
+                        medals=[{"NameId": DOUBLE_KILL, "Count": 2}],
+                        playlist_id=CORE_PLAYLIST)
+    rotational_match = _match("m2", ranked=True, start_time="2026-01-02T00:00:00",
+                              medals=[{"NameId": DOUBLE_KILL, "Count": 1},
+                                      {"NameId": TRIPLE_KILL, "Count": 3}],
+                              playlist_id=ROTATIONAL_PLAYLIST)
+    social_match = _match("m3", ranked=False, start_time="2026-01-03T00:00:00",
+                          medals=[{"NameId": DOUBLE_KILL, "Count": 10}])
+
+    for m in (core_match, rotational_match, social_match):
+        db.insert_match(m)
+        db.insert_player_match(xuid, m)
+
+    ranked = _summary_by_name(cache, xuid, "ranked")
+    core = _summary_by_name(cache, xuid, "core_ranked")
+    rotational = _summary_by_name(cache, xuid, "rotational_ranked")
+
+    assert ranked == {"Double Kill": 3, "Triple Kill": 3}
+    assert core == {"Double Kill": 2}
+    assert rotational == {"Double Kill": 1, "Triple Kill": 3}
+
+    all_medal_names = set(ranked) | set(core) | set(rotational)
+    for name in all_medal_names:
+        assert core.get(name, 0) + rotational.get(name, 0) == ranked.get(name, 0)
+        assert core.get(name, 0) <= ranked.get(name, 0)
+        assert rotational.get(name, 0) <= ranked.get(name, 0)
+
+    for stat_type, expected in (("core_ranked", core), ("rotational_ranked", rotational)):
+        ground_truth = _ground_truth_by_name(db, xuid, stat_type)
+        assert expected == ground_truth

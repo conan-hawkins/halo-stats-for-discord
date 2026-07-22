@@ -372,8 +372,10 @@ class HaloStatsDBv2:
         # ============================================================
         # Table 8: Player Medal Totals - Precomputed per-player, per-game-mode,
         # per-medal counts, maintained incrementally by insert_player_match
-        # (mirrors player_mode_stats above). game_mode is 'ranked'/'social'/
-        # 'overall'; 'overall' is the combined total across both modes.
+        # (mirrors player_mode_stats above). game_mode is 'overall'/'ranked'/
+        # 'social' plus the ranked split 'core_ranked'/'rotational_ranked'
+        # (see CORE_RANKED_PLAYLIST_IDS); 'overall' is the combined total
+        # across ranked + social.
         # ============================================================
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS player_medal_totals (
@@ -835,6 +837,10 @@ class HaloStatsDBv2:
         now = datetime.now().isoformat()
 
         modes = set() if is_custom else {game_mode, 'overall'}
+        if not is_custom and match_data.get('is_ranked'):
+            playlist_id = (match_data.get('playlist_id') or '').strip().lower()
+            modes.add('core_ranked' if playlist_id in CORE_RANKED_PLAYLIST_IDS
+                      else 'rotational_ranked')
         for mode in modes:
             for medal_id in medal_ids:
                 delta = new_counts.get(medal_id, 0) - old_counts.get(medal_id, 0)
@@ -1410,10 +1416,22 @@ class HaloStatsDBv2:
         # Custom/private matches never count toward "social" or "overall",
         # same as HaloClient._calculate_stats_from_matches / the
         # player_mode_stats and player_medal_totals backfills.
+        filter_params: tuple = ()
         if stat_type == "ranked":
             ranked_filter = "AND m.is_ranked = 1"
         elif stat_type == "social":
             ranked_filter = "AND m.is_ranked = 0 AND m.match_category != 'custom'"
+        elif stat_type in ("core_ranked", "rotational_ranked"):
+            # Mirrors _mode_where_clause in player_mode_stats_backfill.py:
+            # COALESCE matters so NULL-playlist ranked rows route to
+            # rotational rather than dropping out of both sub-buckets.
+            core_placeholders = ",".join("?" for _ in CORE_RANKED_PLAYLIST_IDS)
+            in_clause = "IN" if stat_type == "core_ranked" else "NOT IN"
+            ranked_filter = (
+                f"AND m.is_ranked = 1 AND LOWER(COALESCE(m.playlist_id, '')) "
+                f"{in_clause} ({core_placeholders})"
+            )
+            filter_params = tuple(sorted(CORE_RANKED_PLAYLIST_IDS))
         else:
             ranked_filter = "AND m.match_category != 'custom'"
 
@@ -1440,7 +1458,7 @@ class HaloStatsDBv2:
             JOIN matches m ON pm.match_id = m.match_id
             JOIN medal_sets ms ON pm.medal_set_id = ms.medal_set_id
             WHERE pm.xuid = ? {ranked_filter}
-        """, (xuid,))
+        """, (xuid, *filter_params))
 
         row = cursor.fetchone()
         if not row:
