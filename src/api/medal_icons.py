@@ -184,6 +184,24 @@ async def _ensure_sheet_and_metadata() -> bool:
         return bool(_metadata) and bool(_sheet_bytes)
 
 
+def _crop_icon(sheet, sprite_index: int) -> bytes:
+    """Crop one cell out of an already-open sprite sheet as ICON_OUTPUT_PX PNG bytes."""
+    from PIL import Image
+
+    col = sprite_index % SHEET_COLUMNS
+    row = sprite_index // SHEET_COLUMNS
+    left = col * SHEET_CELL_PX
+    top = row * SHEET_CELL_PX
+    box = (left, top, left + SHEET_CELL_PX, top + SHEET_CELL_PX)
+    icon = sheet.crop(box).convert("RGBA").resize(
+        (ICON_OUTPUT_PX, ICON_OUTPUT_PX), Image.LANCZOS
+    )
+
+    buffer = io.BytesIO()
+    icon.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 async def get_medal_icon_bytes(medal_id: int) -> Optional[bytes]:
     """Return a 64px PNG icon for the given medal id, or None if unavailable.
 
@@ -208,18 +226,7 @@ async def get_medal_icon_bytes(medal_id: int) -> Optional[bytes]:
         from PIL import Image
 
         with Image.open(io.BytesIO(_sheet_bytes)) as sheet:
-            col = sprite_index % SHEET_COLUMNS
-            row = sprite_index // SHEET_COLUMNS
-            left = col * SHEET_CELL_PX
-            top = row * SHEET_CELL_PX
-            box = (left, top, left + SHEET_CELL_PX, top + SHEET_CELL_PX)
-            icon = sheet.crop(box).convert("RGBA").resize(
-                (ICON_OUTPUT_PX, ICON_OUTPUT_PX), Image.LANCZOS
-            )
-
-            buffer = io.BytesIO()
-            icon.save(buffer, format="PNG")
-            icon_bytes = buffer.getvalue()
+            icon_bytes = _crop_icon(sheet, sprite_index)
 
         try:
             MEDAL_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -231,3 +238,45 @@ async def get_medal_icon_bytes(medal_id: int) -> Optional[bytes]:
     except Exception as e:
         print(f"[medal_icons] Error extracting icon for medal {medal_id}: {e}")
         return None
+
+
+def _crop_missing_icons(metadata: Dict[int, int], sheet_bytes: bytes) -> int:
+    """Crop every metadata medal that has no cached PNG yet. Blocking - call in a thread.
+
+    The sheet is decoded once here rather than per-medal: get_medal_icon_bytes()
+    re-decodes the ~8MB sheet on every call, which is fine for a one-off lookup
+    but not for a sweep of the whole medal set.
+    """
+    from PIL import Image
+
+    written = 0
+    with Image.open(io.BytesIO(sheet_bytes)) as sheet:
+        for medal_id, sprite_index in metadata.items():
+            icon_cache_file = MEDAL_ICON_CACHE_DIR / f"{medal_id}.png"
+            if icon_cache_file.exists():
+                continue
+            try:
+                _write_bytes_atomic(icon_cache_file, _crop_icon(sheet, sprite_index))
+                written += 1
+            except Exception as e:
+                print(f"[medal_icons] Error warming icon {medal_id}: {e}")
+    return written
+
+
+async def warm_icon_cache() -> int:
+    """Pre-crop every known medal icon to disk, returning how many were written.
+
+    The bot's own embed only ever asks for a curated subset, but the stats
+    website lists every medal a player has earned - so the whole set needs to
+    exist on disk for the API to serve. A no-op once the cache is complete.
+    Never raises: returns 0 on any failure, and the next call retries.
+    """
+    try:
+        if not await _ensure_sheet_and_metadata():
+            return 0
+
+        MEDAL_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        return await asyncio.to_thread(_crop_missing_icons, dict(_metadata), _sheet_bytes)
+    except Exception as e:
+        print(f"[medal_icons] Error warming medal icon cache: {e}")
+        return 0

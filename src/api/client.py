@@ -213,6 +213,14 @@ class HaloAPIClient:
         # history check, only the post-fetch filtering differs.
         self._history_checked_at: Dict[str, float] = {}
 
+    def history_checked_age_seconds(self, xuid: str) -> Optional[float]:
+        """Seconds since this xuid's match history was last API-checked, or None
+        if never checked this session. This is the global freshness signal shared
+        across all callers (Discord and the web auto-refresh) - the same clock the
+        internal freshness TTL uses at calculate_comprehensive_stats."""
+        checked = self._history_checked_at.get(xuid)
+        return (time.monotonic() - checked) if checked is not None else None
+
     async def _refresh_account_via_swap(self, account_num: int, account_cache: Dict) -> bool:
         """Refresh a secondary account by swapping its cache into the primary slot."""
         cache_file = get_token_cache_path(account_num)

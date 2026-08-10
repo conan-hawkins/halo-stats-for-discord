@@ -19,8 +19,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.api import StatsFind1
+from src.api.medal_icons import warm_icon_cache
 from src.api.utils import recover_token_swap_marker
 from src.bot.tasks import auto_refresh_tokens, auto_cache_all_players, proactive_token_refresh
+from src.web.internal_api import start_internal_api
 
 
 # ============================================================================
@@ -66,6 +68,16 @@ async def load_cogs():
 # Event Handlers
 # ============================================================================
 
+async def warm_medal_icons():
+    """Fill the medal icon disk cache in the background, logging the result."""
+    try:
+        written = await warm_icon_cache()
+        if written:
+            print(f"✓ Medal icon cache warmed ({written} new icon(s))")
+    except Exception as e:
+        print(f"✗ Failed to warm medal icon cache: {e}")
+
+
 @bot.event
 async def on_ready():
     """Initialize bot and start background tasks"""
@@ -80,7 +92,21 @@ async def on_ready():
     if not proactive_token_refresh.is_running():
         proactive_token_refresh.start()
         print("✓ Weekly proactive refresh enabled (prevents 90-day token expiration)")
-    
+
+    # Start the loopback internal refresh endpoint for the stats website.
+    # Idempotent (guarded against on_ready firing again on reconnect); shares
+    # this event loop so it reuses the single DB writer + Halo rate limiters.
+    try:
+        await start_internal_api()
+    except Exception as e:
+        print(f"✗ Failed to start internal stats refresh API: {e}")
+
+    # Pre-crop any medal icons still missing from the disk cache, so the stats
+    # website's medals page can serve artwork for every medal - not just the
+    # curated subset the bot's own embed asks for. Backgrounded (a cold cache
+    # is a few seconds of Pillow work) and a no-op once the cache is complete.
+    asyncio.create_task(warm_medal_icons())
+
     # Uncomment to enable background caching
     # if not auto_cache_all_players.is_running():
     #     auto_cache_all_players.start()

@@ -134,6 +134,45 @@ def get_admin_user_ids() -> set[int]:
 ADMIN_USER_IDS = get_admin_user_ids()
 
 # =============================================================================
+# INTERNAL WEB API (loopback-only refresh endpoint for the stats website)
+# =============================================================================
+
+
+def get_internal_stats_refresh_token() -> str:
+    """Shared secret the external stats API must present to trigger a live
+    refresh. Leave unset/empty to disable the internal endpoint entirely."""
+    return os.getenv("INTERNAL_STATS_REFRESH_TOKEN", "").strip()
+
+
+# Token gating the loopback /internal/refresh-player endpoint. Must match the
+# stats API's BOT_INTERNAL_TOKEN.
+INTERNAL_STATS_REFRESH_TOKEN = get_internal_stats_refresh_token()
+
+# Loopback port for the internal refresh endpoint.
+INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8787"))
+
+# Upper bound on concurrent live refresh fetches triggered via the web (they all
+# share the same Halo rate limiters and single DB writer regardless).
+REFRESH_MAX_CONCURRENCY = int(os.getenv("REFRESH_MAX_CONCURRENCY", "2"))
+
+# The web auto-refresh coalescing window: a player API-checked (by ANYONE - the
+# website or a Discord command) within this many seconds is served from cache
+# with zero Halo calls. Deliberately just under the website's 5-minute timer so a
+# lone open tab reliably re-fetches each tick, while concurrent viewers of the
+# same player collapse to one fetch. Separate from STATS_HISTORY_FRESHNESS_TTL_SECONDS
+# (the 90s Discord spam window) so tuning one never disturbs the other.
+WEB_AUTOREFRESH_FRESHNESS_SECONDS = int(
+    os.getenv("WEB_AUTOREFRESH_FRESHNESS_SECONDS", "270")
+)
+
+# Global ceiling on ACTUAL Halo fetches triggered via the web per rolling minute
+# (only counts fetches that pass the freshness gate). The backstop that bounds a
+# scripted flood of distinct players - protects the bot's Halo OAuth account.
+WEB_REFRESH_MAX_FETCHES_PER_MINUTE = int(
+    os.getenv("WEB_REFRESH_MAX_FETCHES_PER_MINUTE", "20")
+)
+
+# =============================================================================
 # INITIALIZATION
 # =============================================================================
 
