@@ -16,6 +16,14 @@ BUCKET_MATCH_LIST = "match_list"    # /matches?start=..  - the tighter one
 BUCKET_MATCH_STATS = "match_stats"  # /matches/{id}/stats - the roomier one
 DEFAULT_BUCKET = "default"
 
+# AIMD constants for the adaptive per-bucket rate. Conservative on the way down
+# and slow on the way up, because being wrong upward costs 429s and retries
+# while being wrong downward only costs a little throughput.
+AIMD_DECREASE_FACTOR = 0.7
+AIMD_INCREASE_STEP = 0.25      # req/s/account
+AIMD_INCREASE_AFTER = 40       # consecutive clean responses
+AIMD_DECREASE_COOLDOWN = 2.0   # seconds; one overload = one decrease
+
 
 class XboxProfileRateLimiter:
     """
@@ -196,8 +204,12 @@ class HaloStatsRateLimiter:
         # to satisfy the tighter of the two, which throttles the endpoint that
         # is 87% of a crawl to protect the one that is 13%.
         self._next_free: Dict[tuple, float] = {}
-        # Per-bucket requests/sec/account; falls back to base_rate.
+        # Per-bucket requests/sec/account; falls back to base_rate. Adaptive -
+        # see set_bucket_rate and note_result.
         self._bucket_rates: Dict[str, float] = {}
+        self._bucket_bounds: Dict[str, tuple] = {}
+        self._bucket_successes: Dict[str, int] = {}
+        self._bucket_last_decrease: Dict[str, float] = {}
         self._account_last_request: Dict[int, float] = {}  # Per-account last request time
         self._account_backoff: Dict[int, float] = {}  # Per-account backoff until timestamp
         self.lock = asyncio.Lock()
@@ -239,16 +251,72 @@ class HaloStatsRateLimiter:
         # e.g., 8 req/sec = 0.125s between requests per account
         return 1.0 / self.base_rate
 
-    def set_bucket_rate(self, bucket: str, requests_per_second_per_account: float) -> None:
-        """Give one endpoint family its own pace.
+    def set_bucket_rate(self, bucket: str, requests_per_second_per_account: float,
+                        floor: Optional[float] = None,
+                        ceiling: Optional[float] = None) -> None:
+        """Give one endpoint family its own pace, and the room to adapt it.
 
         Buckets exist because Halo's endpoints are limited independently, and
         measured very differently: match-stats served 60/60 requests clean at
-        15, 30 AND 50 req/s, while matches-list 429'd 50% of requests at 30 and
-        was fastest overall at 15 - slower settings beat faster ones there
-        because the retry churn costs more than the pacing saves.
+        15, 30 AND 50 req/s, while matches-list 429'd 50% of requests at 30.
+
+        `requests_per_second_per_account` is a STARTING point, not a setting.
+        A fixed number cannot be right here: the value that looked optimal over
+        a 40-page burst (3/account) collapsed over a real 2,000-page crawl,
+        where 162 of ~340 pages exhausted their retries and the crawl never
+        found the end of the history. Halo's limit over a sustained crawl is
+        plainly lower than over a burst, and probably not constant. So the rate
+        moves within [floor, ceiling] via note_result() instead.
         """
-        self._bucket_rates[bucket] = float(requests_per_second_per_account)
+        rate = float(requests_per_second_per_account)
+        lo = float(floor) if floor is not None else rate / 4.0
+        hi = float(ceiling) if ceiling is not None else rate
+        self._bucket_rates[bucket] = max(lo, min(rate, hi))
+        self._bucket_bounds[bucket] = (lo, hi)
+        self._bucket_successes[bucket] = 0
+
+    def note_result(self, bucket: Optional[str], rate_limited: bool) -> None:
+        """Feed one response back into the bucket's pace (AIMD).
+
+        Additive increase, multiplicative decrease - the same shape TCP uses,
+        and for the same reason: the safe sustained rate is unknown, changes,
+        and is only discoverable by probing upward until told to stop.
+
+        The decrease is rate-limited itself. A single overload produces a burst
+        of 429s across many in-flight requests; treating each as independent
+        evidence would multiply the rate down by 0.7 twenty times over and
+        stall the crawl outright.
+        """
+        key = bucket or DEFAULT_BUCKET
+        bounds = self._bucket_bounds.get(key)
+        if bounds is None:
+            return                      # not an adaptive bucket
+        lo, hi = bounds
+        current = self._bucket_rates.get(key, hi)
+
+        if rate_limited:
+            now = time.monotonic()
+            if now - self._bucket_last_decrease.get(key, 0.0) < AIMD_DECREASE_COOLDOWN:
+                return
+            self._bucket_last_decrease[key] = now
+            self._bucket_successes[key] = 0
+            new = max(lo, current * AIMD_DECREASE_FACTOR)
+            if new != current:
+                self._bucket_rates[key] = new
+                print(f"📉 {key}: backing off to {new:.2f} req/s/account")
+            return
+
+        self._bucket_successes[key] = self._bucket_successes.get(key, 0) + 1
+        if self._bucket_successes[key] >= AIMD_INCREASE_AFTER:
+            self._bucket_successes[key] = 0
+            new = min(hi, current + AIMD_INCREASE_STEP)
+            if new != current:
+                self._bucket_rates[key] = new
+                print(f"📈 {key}: easing up to {new:.2f} req/s/account")
+
+    def bucket_rate(self, bucket: Optional[str]) -> float:
+        """Current adaptive rate, for logging and tests."""
+        return self._bucket_rates.get(bucket or DEFAULT_BUCKET, self.base_rate)
 
     def min_interval_for(self, bucket: Optional[str]) -> float:
         """Minimum gap between requests on one account within one bucket."""
@@ -480,5 +548,12 @@ halo_stats_rate_limiter = HaloStatsRateLimiter(requests_per_second_per_account=3
 # match-stats, 60 requests per trial: 60/60 HTTP 200 at 15, 30 AND 50 req/s.
 # Set to 30, not 50: these are real Xbox accounts and the cost of being wrong
 # is losing them, so this stays inside measured-safe rather than at its edge.
-halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3)    # 15/s across 5 accounts
-halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_STATS, 6)   # 30/s across 5 accounts
+# The listing rate ADAPTS. 3/account looked optimal over a 40-page burst and
+# collapsed over a real 2,000-page crawl (162 of ~340 pages exhausted their
+# retries), so it starts there and moves within [0.75, 3] on live evidence.
+halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3, floor=0.75, ceiling=3)
+
+# Match-stats measured clean at 15, 30 AND 50 req/s and sustained 30/s across a
+# 1,154-match crawl with zero 429s, so it starts at its ceiling and only moves
+# if the API starts objecting.
+halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_STATS, 6, floor=1.5, ceiling=6)

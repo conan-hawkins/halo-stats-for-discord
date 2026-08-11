@@ -3058,12 +3058,22 @@ class HaloAPIClient:
                                 print(f"Fetching matches for XUID: {xuid} (gamertag: {gamertag or 'unknown'})")
                         
                             if response.status == 200:
+                                halo_stats_rate_limiter.note_result(
+                                    BUCKET_MATCH_LIST, rate_limited=False
+                                )
                                 match_data = await response.json()
                                 results = match_data.get('Results', [])
                                 if start_pos == 0:
                                     print(f"   First page: {len(results)} matches found")
                                 return results
                             elif response.status == 429:
+                                # Tell the bucket to ease off. The sustained safe
+                                # rate is lower than any burst measurement shows,
+                                # so it is discovered from live responses rather
+                                # than configured from a short sample.
+                                halo_stats_rate_limiter.note_result(
+                                    BUCKET_MATCH_LIST, rate_limited=True
+                                )
                                 # Rate limited - use proper exponential backoff to avoid ban
                                 if rate_limit_retry < max_rate_limit_retries:
                                     # Honour what the server actually asked for.

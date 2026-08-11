@@ -206,3 +206,82 @@ async def test_bucket_backoff_is_shared_per_account():
     assert picks == {1}, f"backed-off account used in another bucket: {picks}"
     picks = {await limiter.wait_if_needed(bucket=BUCKET_MATCH_LIST) for _ in range(6)}
     assert picks == {1}
+
+
+def test_aimd_backs_off_on_429_and_recovers_on_success():
+    """The listing rate must be discovered, not configured.
+
+    3 req/s/account looked optimal over a 40-page burst and collapsed over a
+    real 2,000-page crawl - 162 of ~340 pages exhausted their retries and the
+    crawl never reached the end of the history. A fixed number cannot express
+    "fast when the API is happy, slow when it is not".
+    """
+    from src.api.rate_limiters import AIMD_INCREASE_AFTER, BUCKET_MATCH_LIST
+
+    limiter = HaloStatsRateLimiter(requests_per_second_per_account=3)
+    limiter.set_num_accounts(5)
+    limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3, floor=0.75, ceiling=3)
+    assert limiter.bucket_rate(BUCKET_MATCH_LIST) == 3
+
+    limiter.note_result(BUCKET_MATCH_LIST, rate_limited=True)
+    backed_off = limiter.bucket_rate(BUCKET_MATCH_LIST)
+    assert backed_off < 3, "a 429 must slow the bucket down"
+    # Pacing follows the rate, not just the bookkeeping.
+    assert limiter.min_interval_for(BUCKET_MATCH_LIST) == pytest.approx(1 / backed_off)
+
+    # Clean responses earn it back, gradually.
+    for _ in range(AIMD_INCREASE_AFTER):
+        limiter.note_result(BUCKET_MATCH_LIST, rate_limited=False)
+    assert limiter.bucket_rate(BUCKET_MATCH_LIST) > backed_off
+
+
+def test_aimd_one_overload_is_one_backoff():
+    """A burst of 429s from a single overload must not compound.
+
+    Twenty in-flight requests all failing is one piece of evidence, not twenty.
+    Treating them independently would multiply the rate down by 0.7 twenty
+    times over and stall the crawl outright.
+    """
+    from src.api.rate_limiters import BUCKET_MATCH_LIST
+
+    limiter = HaloStatsRateLimiter(requests_per_second_per_account=3)
+    limiter.set_num_accounts(5)
+    limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3, floor=0.75, ceiling=3)
+
+    for _ in range(20):
+        limiter.note_result(BUCKET_MATCH_LIST, rate_limited=True)
+
+    # 3 * 0.7 = 2.1 for one decrease; twenty compounded would be far under the
+    # floor. Exactly one should have landed inside the cooldown window.
+    assert limiter.bucket_rate(BUCKET_MATCH_LIST) == pytest.approx(2.1)
+
+
+def test_aimd_respects_floor_and_ceiling():
+    from src.api.rate_limiters import AIMD_DECREASE_COOLDOWN, BUCKET_MATCH_LIST
+    import time as _time
+
+    limiter = HaloStatsRateLimiter(requests_per_second_per_account=3)
+    limiter.set_num_accounts(5)
+    limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3, floor=0.75, ceiling=3)
+
+    # Drive it down past the floor, stepping past the cooldown each time.
+    for _ in range(20):
+        limiter._bucket_last_decrease[BUCKET_MATCH_LIST] = (
+            _time.monotonic() - AIMD_DECREASE_COOLDOWN - 1
+        )
+        limiter.note_result(BUCKET_MATCH_LIST, rate_limited=True)
+    assert limiter.bucket_rate(BUCKET_MATCH_LIST) == pytest.approx(0.75)
+
+    # And back up past the ceiling.
+    for _ in range(2000):
+        limiter.note_result(BUCKET_MATCH_LIST, rate_limited=False)
+    assert limiter.bucket_rate(BUCKET_MATCH_LIST) == pytest.approx(3)
+
+
+def test_non_adaptive_buckets_are_untouched():
+    """A bucket configured without bounds must ignore feedback entirely."""
+    limiter = HaloStatsRateLimiter(requests_per_second_per_account=5)
+    limiter.set_num_accounts(2)
+    before = limiter.bucket_rate("something_else")
+    limiter.note_result("something_else", rate_limited=True)
+    assert limiter.bucket_rate("something_else") == before

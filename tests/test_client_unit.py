@@ -741,6 +741,9 @@ async def test_calculate_comprehensive_stats_bounded_fetch_stops_at_required_pag
         def set_backoff(self, seconds, account_index=None):
             return None
 
+        def note_result(self, bucket=None, rate_limited=False):
+            return None
+
     class _FakeResponse:
         def __init__(self, status, payload):
             self.status = status
@@ -1056,6 +1059,9 @@ async def test_calculate_comprehensive_stats_full_history_incremental_topup(monk
         def set_backoff(self, seconds, account_index=None):
             return None
 
+        def note_result(self, bucket=None, rate_limited=False):
+            return None
+
     class _FakeResponse:
         def __init__(self, status, payload):
             self.status = status
@@ -1169,6 +1175,9 @@ async def test_calculate_comprehensive_stats_full_history_without_total_hint_use
             yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
     class _FakeResponse:
@@ -1293,6 +1302,9 @@ async def test_calculate_comprehensive_stats_full_history_probe_detects_uncached
         def set_backoff(self, seconds, account_index=None):
             return None
 
+        def note_result(self, bucket=None, rate_limited=False):
+            return None
+
     class _FakeResponse:
         def __init__(self, status, payload):
             self.status = status
@@ -1415,6 +1427,9 @@ async def test_calculate_comprehensive_stats_ignores_ambiguous_count_hint_and_pr
             yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
     class _FakeResponse:
@@ -1544,6 +1559,9 @@ async def test_calculate_comprehensive_stats_full_history_falls_back_when_gap_no
             yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
     class _FakeResponse:
@@ -1766,6 +1784,9 @@ async def test_calculate_comprehensive_stats_full_history_no_new_matches_uses_pr
         def set_backoff(self, seconds, account_index=None):
             return None
 
+        def note_result(self, bucket=None, rate_limited=False):
+            return None
+
     class _FakeResponse:
         def __init__(self, status, payload):
             self.status = status
@@ -1844,6 +1865,9 @@ async def test_calculate_comprehensive_stats_new_matches_reads_summary_after_sav
             yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
     class _FakeResponse:
@@ -1994,6 +2018,9 @@ async def test_incomplete_cache_forces_refetch_instead_of_bounded_short_circuit(
             yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
     class _FakeResponse:
@@ -2217,6 +2244,9 @@ async def test_no_new_matches_stamps_freshness_and_skips_api_on_repeat(monkeypat
         def set_backoff(self, seconds, account_index=None):
             return None
 
+        def note_result(self, bucket=None, rate_limited=False):
+            return None
+
     class _FakeResponse:
         def __init__(self, status, payload):
             self.status = status
@@ -2348,6 +2378,9 @@ def _install_fake_http(monkeypatch, page_handler):
             yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
     starts = []
@@ -2966,6 +2999,9 @@ def _install_latency_fake(monkeypatch, pages, latency=0.02, jitter=True):
             return 0
 
         def set_backoff(self, **kwargs):
+            return None
+
+        def note_result(self, bucket=None, rate_limited=False):
             return None
 
         def slot(self, account_index=None, bucket=None):
