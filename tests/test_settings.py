@@ -36,3 +36,23 @@ def test_get_terminal_admin_password_empty_when_unset(monkeypatch):
     monkeypatch.delenv("TERMINAL_ADMIN_PASSWORD", raising=False)
 
     assert settings.get_terminal_admin_password() == ""
+
+
+def test_get_internal_api_host_defaults_to_loopback(monkeypatch):
+    monkeypatch.delenv("INTERNAL_API_HOST", raising=False)
+
+    assert settings.get_internal_api_host() == "127.0.0.1"
+
+
+def test_get_internal_api_host_reads_current_env(monkeypatch):
+    monkeypatch.setenv("INTERNAL_API_HOST", "  0.0.0.0  ")
+
+    assert settings.get_internal_api_host() == "0.0.0.0"
+
+
+def test_get_internal_api_host_blank_falls_back_to_loopback(monkeypatch):
+    """An `INTERNAL_API_HOST=` line in an env_file must not silently bind every
+    interface - blank means "unset", not "all"."""
+    monkeypatch.setenv("INTERNAL_API_HOST", "   ")
+
+    assert settings.get_internal_api_host() == "127.0.0.1"

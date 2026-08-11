@@ -13,8 +13,11 @@ WEB_AUTOREFRESH_FRESHNESS_SECONDS. That, plus a global per-minute fetch cap,
 bounds Halo calls by *distinct stale players* rather than by viewer count - which
 is what makes a public, no-token auto-refresh safe.
 
-Security: bound to 127.0.0.1 only, and every request must present the shared
-INTERNAL_STATS_REFRESH_TOKEN (loopback API->bot auth), compared with
+Security: binds to INTERNAL_API_HOST, which defaults to 127.0.0.1. Widen it only
+when the port is confined to a private container network and is never published
+to the host - the Docker deploy sets 0.0.0.0 and puts the bot and the stats API
+alone on an `internal: true` compose network. Either way every request must
+present the shared INTERNAL_STATS_REFRESH_TOKEN (API->bot auth), compared with
 hmac.compare_digest.
 """
 from __future__ import annotations
@@ -199,8 +202,11 @@ async def start_internal_api() -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="127.0.0.1", port=settings.INTERNAL_API_PORT)
+    site = web.TCPSite(runner, host=settings.INTERNAL_API_HOST, port=settings.INTERNAL_API_PORT)
     await site.start()
 
     _web_server_started = True
-    print(f"✓ Internal stats refresh API on http://127.0.0.1:{settings.INTERNAL_API_PORT}")
+    print(
+        f"✓ Internal stats refresh API on "
+        f"http://{settings.INTERNAL_API_HOST}:{settings.INTERNAL_API_PORT}"
+    )

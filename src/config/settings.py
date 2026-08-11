@@ -148,7 +148,27 @@ def get_internal_stats_refresh_token() -> str:
 # stats API's BOT_INTERNAL_TOKEN.
 INTERNAL_STATS_REFRESH_TOKEN = get_internal_stats_refresh_token()
 
-# Loopback port for the internal refresh endpoint.
+
+def get_internal_api_host() -> str:
+    """Bind address for the internal refresh endpoint.
+
+    Defaults to loopback, so a bare `python run.py` stays reachable only from the
+    same machine, exactly as before. The Docker deploy sets 0.0.0.0 because the
+    stats API reaches the bot over a PRIVATE compose network on which port 8787
+    is never published to the host; the shared token still gates every request.
+
+    A blank value falls back to loopback on purpose: an env_file line like
+    `INTERNAL_API_HOST=` is easy to produce and would otherwise bind every
+    interface by accident.
+    """
+    return os.getenv("INTERNAL_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
+# Bind address for the internal refresh endpoint. See above: only ever widen
+# this when the port is confined to a private network.
+INTERNAL_API_HOST = get_internal_api_host()
+
+# Port for the internal refresh endpoint.
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8787"))
 
 # Upper bound on concurrent live refresh fetches triggered via the web (they all

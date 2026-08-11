@@ -1,0 +1,31 @@
+# MANDATORY, not hygiene: data/ holds a ~64GB SQLite database plus a ~2GB social
+# graph DB. Without this file `docker build` streams all of it to the daemon,
+# which on this box means starving the disk and RAM the LIVE bot is using.
+# If the build's "transferring context" line is more than a few MB, stop and fix.
+data/
+*.db
+*.db-shm
+*.db-wal
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.vscode/
+.claude/
+
+# Secrets never belong in an image layer - they arrive via compose env_file.
+.env
+
+tests/
+bot_docs/
+analysis_results/
+coverage.xml
+.coverage
+htmlcov/
+*.log
+.pytest_*
+cache_progress.json

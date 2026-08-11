@@ -1,0 +1,45 @@
+# Runtime dependencies for the bot.
+#
+# This file is TRACKED, unlike bot_docs/requirements.txt - `bot_docs/` is
+# gitignored (see .gitignore), so that file does not survive a clone and cannot
+# be relied on to build an image anywhere but the machine it already exists on.
+#
+# These pins are taken verbatim from `pip freeze` inside the image that is
+# running in production today, so a rebuild reproduces that environment exactly
+# rather than resolving something new during an infrastructure migration.
+# Regenerate the same way after any dependency change:
+#     docker compose exec bot pip freeze
+#
+# Deliberately NOT included, because they are absent from the running image too:
+#   pillow      - medal sprite-sheet cropping (src/api/medal_icons.py)
+#   matplotlib  - social-graph plots
+#   networkx    - social-graph analysis
+# All three are imported lazily INSIDE functions, so the bot starts and runs
+# without them; only those specific features raise ImportError. Adding them is a
+# behaviour change and should be a separate, deliberate commit - not something
+# bundled into the containerisation.
+
+# --- direct ---
+discord.py==2.7.1
+aiohttp==3.14.1
+requests==2.34.2
+python-dotenv==1.2.2
+# Real runtime dependency: src/api/utils.py imports it at module load and will
+# otherwise try to `pip install` it into the container at runtime, which fails
+# as a non-root user.
+portalocker==3.2.0
+
+# --- transitive ---
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+certifi==2026.6.17
+charset-normalizer==3.4.9
+frozenlist==1.8.0
+idna==3.18
+multidict==6.7.1
+packaging==26.2
+propcache==0.5.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+yarl==1.24.2
