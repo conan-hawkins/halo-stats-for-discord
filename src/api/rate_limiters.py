@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 # differently - see HaloStatsRateLimiter.set_bucket_rate for the measurements.
 BUCKET_MATCH_LIST = "match_list"    # /matches?start=..  - the tighter one
 BUCKET_MATCH_STATS = "match_stats"  # /matches/{id}/stats - the roomier one
+BUCKET_PROFILE = "profile"          # profile.svc /users?xuids= - 100 ids per call
 DEFAULT_BUCKET = "default"
 
 # AIMD constants for the adaptive per-bucket rate. Conservative on the way down
@@ -557,3 +558,12 @@ halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3, floor=0.75, ceilin
 # 1,154-match crawl with zero 429s, so it starts at its ceiling and only moves
 # if the API starts objecting.
 halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_STATS, 6, floor=1.5, ceiling=6)
+
+# profile.svc /users?xuids= carries up to 100 identities per request, so one
+# call here does the work of 100 on the Xbox profile endpoint. Deliberately
+# slow: measured latency was 2.4s for a full 100-id batch, and at 1/s/account a
+# five-account pool still resolves ~500 identities a second. There is no
+# measured ceiling for this endpoint - it was never driven hard enough to 429 -
+# so this starts low and adapts upward on clean responses rather than guessing
+# high against real Xbox accounts.
+halo_stats_rate_limiter.set_bucket_rate(BUCKET_PROFILE, 1, floor=0.25, ceiling=2)

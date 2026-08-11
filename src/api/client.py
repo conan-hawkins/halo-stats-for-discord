@@ -31,6 +31,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
 from dotenv import load_dotenv
 
 # Load environment variables before module initialization
@@ -54,6 +55,7 @@ from src.api.rate_limiters import (
     xbox_profile_rate_limiter,
     BUCKET_MATCH_LIST,
     BUCKET_MATCH_STATS,
+    BUCKET_PROFILE,
     halo_stats_rate_limiter,
 )
 from src.api.utils import (
@@ -149,6 +151,12 @@ class HaloAPIClient:
     SETTINGS_URL = "https://settings.svc.halowaypoint.com"
     STATS_URL = "https://halostats.svc.halowaypoint.com"
     PROFILE_URL = "https://profile.svc.halowaypoint.com/users/by-gamertag"
+    # Batch identity lookup. Takes repeated `xuids=` params and answers with
+    # [{xuid, gamertag, gamerpic}]. Runs on the Spartan pool, NOT the Xbox
+    # profile endpoint's 30-per-5-minute budget.
+    PROFILE_BATCH_URL = "https://profile.svc.halowaypoint.com/users"
+    # Hard ceiling, measured: 100 ids returns 200, 101 returns 400.
+    PROFILE_BATCH_MAX = 100
     DISCOVERY_UGC_URL = "https://discovery-infiniteugc.svc.halowaypoint.com"
     USER_AGENT = "HaloWaypoint/2021.01.10.01"
     # Zero-network fast path for known ranked playlist asset IDs. Asset IDs
@@ -250,6 +258,14 @@ class HaloAPIClient:
         # Keyed by xuid alone: every stat_type runs the identical incremental
         # history check, only the post-fetch filtering differs.
         self._history_checked_at: Dict[str, float] = {}
+
+        # XUIDs the batch profile endpoint rejects. One unknown id fails the
+        # WHOLE batch with a 400 (measured), so a bad id left in the working
+        # set would poison every batch it lands in. Process-lifetime only and
+        # deliberately not persisted: "unknown to profile.svc" can be a
+        # transient service answer, and this must never be confused with
+        # data/xuid_gamertag_blacklist.json, which is a moderation watchlist.
+        self._unresolvable_xuids: Set[str] = set()
 
     def history_checked_age_seconds(self, xuid: str) -> Optional[float]:
         """Seconds since this xuid's match history was last API-checked, or None
@@ -1039,6 +1055,149 @@ class HaloAPIClient:
 
         return None
     
+    async def _fetch_profile_batch(self, xuids: List[str]) -> Tuple[Optional[Dict[str, str]], int]:
+        """One batch request. Returns (mapping, status); mapping is None on failure.
+
+        Kept separate from the chunking/splitting logic above it so that the
+        400-isolation path can re-issue a smaller batch without re-entering it.
+        """
+        params = [("xuids", x) for x in xuids]
+        url = f"{self.PROFILE_BATCH_URL}?{urlencode(params)}"
+
+        try:
+            async with halo_stats_rate_limiter.slot(bucket=BUCKET_PROFILE) as account_index:
+                spartan_token = self.get_next_spartan_token(account_index)
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
+                if not spartan_token:
+                    return None, 0
+
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json",
+                }
+
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            halo_stats_rate_limiter.note_result(BUCKET_PROFILE, rate_limited=False)
+                            payload = await response.json()
+                            resolved: Dict[str, str] = {}
+                            for entry in payload if isinstance(payload, list) else []:
+                                if not isinstance(entry, dict):
+                                    continue
+                                entry_xuid = entry.get("xuid")
+                                gamertag = entry.get("gamertag")
+                                if entry_xuid and isinstance(gamertag, str) and gamertag.strip():
+                                    resolved[str(entry_xuid)] = gamertag.strip()
+                            return resolved, 200
+
+                        if response.status == 429:
+                            halo_stats_rate_limiter.note_result(BUCKET_PROFILE, rate_limited=True)
+                            retry_after = _parse_retry_after(response.headers.get('Retry-After'))
+                            halo_stats_rate_limiter.set_backoff(
+                                account_index=account_index, seconds=retry_after or 5.0
+                            )
+                        return None, response.status
+
+        except Exception as e:
+            print(f"[PROFILE] Batch request failed for {len(xuids)} xuid(s): {e}")
+            return None, -1
+
+    async def resolve_xuids_batch(self, xuids: List[str]) -> Dict[str, str]:
+        """Resolve many XUIDs to gamertags with ~1 request per 100, not per 1.
+
+        The single-XUID path (resolve_xuid_to_gamertag) goes through
+        profile.xboxlive.com behind a 30-request-per-5-minute budget, so
+        resolving a friends-of-friends fan-out one id at a time is the slowest
+        thing the crawler does. This endpoint takes 100 ids per call and runs
+        on the Spartan pool instead.
+
+        Cache-first and cache-through: known ids never leave the process, and
+        everything learned is written back for the single-id path to reuse.
+
+        Returns a mapping for whatever resolved. Missing keys mean "not
+        resolved" - never assume the player does not exist.
+        """
+        unique = [str(x) for x in dict.fromkeys(xuids) if x]
+        if not unique:
+            return {}
+
+        cache = load_xuid_cache()
+        resolved: Dict[str, str] = {}
+        pending: List[str] = []
+        for xuid in unique:
+            cached = cache.get(xuid)
+            if isinstance(cached, str) and cached.strip():
+                resolved[xuid] = cached
+            elif xuid not in self._unresolvable_xuids:
+                pending.append(xuid)
+
+        if not pending:
+            return resolved
+
+        print(f"[PROFILE] Batch-resolving {len(pending)} xuid(s) "
+              f"({len(resolved)} already cached)")
+
+        newly_resolved: Dict[str, str] = {}
+        for i in range(0, len(pending), self.PROFILE_BATCH_MAX):
+            chunk = pending[i:i + self.PROFILE_BATCH_MAX]
+            newly_resolved.update(await self._resolve_chunk(chunk))
+
+        if newly_resolved:
+            # Re-read rather than reusing the copy loaded above: a concurrent
+            # resolver may have added entries while these requests were in
+            # flight, and save_xuid_cache writes the whole file.
+            latest = load_xuid_cache()
+            latest.update(newly_resolved)
+            save_xuid_cache(latest)
+            print(f"[PROFILE] Resolved and cached {len(newly_resolved)} new gamertag(s)")
+
+        resolved.update(newly_resolved)
+        return resolved
+
+    async def _resolve_chunk(self, chunk: List[str]) -> Dict[str, str]:
+        """Resolve one chunk, isolating any id the endpoint refuses.
+
+        A 400 means one member of the batch is unacceptable, not that the
+        request shape is wrong - a single well-formed but nonexistent XUID
+        rejects all 100 of its companions (measured). Recursive halving finds
+        the offender in ~log2(n) requests and still resolves everyone else,
+        instead of discarding a whole chunk for one bad id.
+        """
+        if not chunk:
+            return {}
+
+        mapping, status = await self._fetch_profile_batch(chunk)
+        if mapping is not None:
+            # Ids the endpoint answered 200 for but did not mention do not
+            # exist as far as it is concerned. Remember them so they cannot
+            # poison a later batch.
+            for xuid in chunk:
+                if xuid not in mapping:
+                    self._unresolvable_xuids.add(xuid)
+            return mapping
+
+        if status == 400:
+            if len(chunk) == 1:
+                self._unresolvable_xuids.add(chunk[0])
+                print(f"[PROFILE] xuid {chunk[0]} rejected by the batch endpoint; "
+                      f"excluded from further batches this session")
+                return {}
+            mid = len(chunk) // 2
+            left = await self._resolve_chunk(chunk[:mid])
+            right = await self._resolve_chunk(chunk[mid:])
+            return {**left, **right}
+
+        # 401/429/timeout: transient. Leave these ids unresolved so the caller
+        # can fall back or retry - do NOT mark them unresolvable.
+        print(f"[PROFILE] Batch of {len(chunk)} failed with status {status}; "
+              f"leaving unresolved")
+        return {}
+
     # =========================================================================
     # XBOX PRIVACY
     # =========================================================================
@@ -4214,21 +4373,18 @@ async def get_players_from_recent_matches(
             
             print(f"Found {len(resolved_gamertags)} gamertags in cache, need to resolve {len(xuids_to_resolve)} XUIDs")
             
-            # Resolve remaining XUIDs
+            # Resolve remaining XUIDs. One request per 100 ids on the Spartan
+            # pool, rather than one per id through the Xbox profile endpoint's
+            # 30-per-5-minute budget. resolve_xuids_batch writes through to the
+            # XUID cache itself, so there is no save_xuid_cache call here.
             if xuids_to_resolve:
                 print(f"Resolving {len(xuids_to_resolve)} XUIDs to gamertags...")
-                for xuid in xuids_to_resolve:
-                    try:
-                        gamertag_result = await api_client.resolve_xuid_to_gamertag(xuid)
-                        if gamertag_result:
-                            resolved_gamertags.append(gamertag_result)
-                            xuid_cache[xuid] = gamertag_result
-                        await asyncio.sleep(0.1)  # Small delay
-                    except:
-                        continue
-                
-                # Save updated cache
-                save_xuid_cache(xuid_cache)
+                try:
+                    batch_resolved = await api_client.resolve_xuids_batch(xuids_to_resolve)
+                except Exception as e:
+                    print(f"Batch gamertag resolution failed: {e}")
+                    batch_resolved = {}
+                resolved_gamertags.extend(batch_resolved.values())
             
             print(f"Total: {len(resolved_gamertags)} gamertags resolved")
             return resolved_gamertags
