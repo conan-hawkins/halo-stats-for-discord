@@ -39,15 +39,21 @@ halo-stats-for-discord/
 │   │   ├── cache.py          # Stats cache
 │   │   ├── schema.py         # Stats schema
 │   │   └── graph_schema.py   # Social graph schema
-│   └── graph/                # Social graph
-│       └── crawler.py        # BFS graph crawler
-├── data/                     # Data files
-│   ├── auth/                 # Token cache files
-│   ├── halo_stats_v2.db      # Stats database
-│   ├── halo_social_graph.db  # Social graph database
-│   └── xuid_gamertag_cache.json  # XUID cache (86k+ entries)
-└── bot_docs/                 # Documentation
-    └── requirements.txt
+│   ├── graph/                # Social graph
+│   │   └── crawler.py        # BFS graph crawler
+│   └── web/                  # Internal HTTP API for the stats website
+│       └── internal_api.py   # POST /internal/refresh-player
+├── docker/
+│   └── healthcheck.py        # Container healthcheck (probes the internal API)
+├── Dockerfile                # Image used by the halo-stack deployment
+├── requirements.txt          # Runtime deps (TRACKED - see note in Quick Start)
+├── requirements-test.txt     # Test deps
+└── data/                     # Data files (bind-mounted in Docker)
+    ├── auth/                 # Token cache files
+    ├── halo_stats_v2.db      # Stats database
+    ├── halo_social_graph.db  # Social graph database
+    ├── medal_icons/          # Cropped medal PNGs, served by halo-stats-api
+    └── xuid_gamertag_cache.json  # XUID cache (86k+ entries)
 ```
 
 ## Quick Start
@@ -55,8 +61,12 @@ halo-stats-for-discord/
 ### 1. Install Dependencies
 
 ```bash
-pip install -r bot_docs/requirements.txt
+pip install -r requirements.txt
 ```
+
+> `bot_docs/` is gitignored, so `bot_docs/requirements.txt` does not survive a
+> clone and must not be used. The tracked `requirements.txt` in the project root
+> is the source of truth, and is what the Docker image installs from.
 
 ### 2. Configure
 
@@ -197,24 +207,109 @@ If tokens expire, re-authenticate manually:
 python -m src.auth.setup_account N  # Where N is 2-5
 ```
 
+## Stats website integration
+
+The bot is one of three services behind the stats website. It is the **single
+writer** of `halo_stats_v2.db`; the website's API reads that same file read-only
+and cannot write to it. Anything that needs fresh data from Halo goes through
+the bot, because the bot owns the Halo credentials, the rate limiters and the
+freshness signal shared with Discord commands.
+
+| Repo | Role |
+|---|---|
+| `halo-stats-for-discord` | this bot — Halo fetching, the only DB writer |
+| `halo-stats-api` | read-only HTTP API over the DB + a refresh proxy |
+| `halo-stats-web` | the React frontend |
+| `halo-stack` | Docker Compose, nginx and the deployment runbook |
+
+### The internal refresh endpoint
+
+`src/web/internal_api.py` runs an aiohttp server on the bot's own event loop,
+started from `on_ready()`. It exposes exactly one route:
+
+```
+POST /internal/refresh-player     header: X-Internal-Token     body: {"gamertag": "..."}
+```
+
+It is **a no-op unless `INTERNAL_STATS_REFRESH_TOKEN` is set** — if the token is
+unset the server never starts, and the website simply cannot trigger refreshes.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `INTERNAL_STATS_REFRESH_TOKEN` | *(unset)* | Shared secret. Must match the API's `BOT_INTERNAL_TOKEN` exactly |
+| `INTERNAL_API_HOST` | `127.0.0.1` | Bind address. See the warning below |
+| `INTERNAL_API_PORT` | `8787` | |
+| `REFRESH_MAX_CONCURRENCY` | `2` | Concurrent live fetches triggered from the web |
+| `WEB_AUTOREFRESH_FRESHNESS_SECONDS` | `270` | Coalescing window — skip if checked this recently |
+| `WEB_REFRESH_MAX_FETCHES_PER_MINUTE` | `20` | Global ceiling on actual Halo fetches from the web |
+
+> **`INTERNAL_API_HOST` defaults to loopback deliberately.** Only widen it to
+> `0.0.0.0` when the port is confined to a private container network and is
+> never published to the host — which is exactly what the `halo-stack` compose
+> file does. Widening it on a machine where 8787 is reachable would expose a
+> refresh trigger to anything that can reach that port.
+
+### Why public auto-refresh is safe
+
+The website calls this endpoint with **no user token**, on every player page
+open and roughly every 5 minutes per open tab. That is safe because the bot, not
+the caller, holds the throttle:
+
+- **Freshness gate** — a player checked by *anyone* (web or a Discord command)
+  within `WEB_AUTOREFRESH_FRESHNESS_SECONDS` returns immediately from cache,
+  costing zero Halo calls.
+- **Per-gamertag coalescing** — concurrent requests for the same player await
+  one shared fetch instead of stacking up.
+- **Global fetch cap** — `WEB_REFRESH_MAX_FETCHES_PER_MINUTE` bounds real Halo
+  calls per rolling minute, regardless of traffic.
+
+Together these bound Halo usage by *distinct stale players* rather than by
+viewer count. Both "skipped" outcomes return **HTTP 200** with `ok: true` on
+purpose — the page keeps showing cached data rather than erroring.
+
+## Docker
+
+The `Dockerfile` here builds the image; orchestration lives in `halo-stack`.
+
+```bash
+cd ../halo-stack && docker compose up -d bot
+```
+
+Notes that matter if you change it:
+
+- **`data/` is a bind mount**, not a volume — on the deployed box it points at a
+  directory on a large disk, not at the repo checkout. Never add a `VOLUME`
+  instruction for it; an anonymous volume would silently mask a missing mount
+  and the bot would start writing a brand-new empty database.
+- **The container runs as UID 1000**, matching the API container. This is not
+  cosmetic: a read-only SQLite reader still has to write the WAL `-shm`/`-wal`
+  files that this process creates, so mismatched UIDs break the website's reads.
+- **`.dockerignore` is mandatory.** The data directory can hold a 60GB database;
+  without it, `docker build` streams the lot to the daemon.
+
 ## Rate Limiting
 
 The bot uses conservative rate limiting to avoid API bans:
 
-- **3 requests/second per account** (Halo Stats API)
+- **8 requests/second per account** (`REQUESTS_PER_SECOND_PER_ACCOUNT`)
 - **5 max concurrent requests per account**
 - **Exponential backoff** on 429 errors (30s, 60s, 120s, 240s, 480s)
 - **Global backoff** when all accounts hit limits
 
 ## Requirements
 
-- Python 3.9+
-- discord.py 2.0+
-- aiohttp
-- python-dotenv
-- portalocker
+- **Python 3.11** — what the Docker image runs and what the pins are tested against
+- discord.py, aiohttp, requests, python-dotenv
+- **portalocker** — imported at module load in `src/api/utils.py`; without it the
+  bot tries to `pip install` at runtime, which fails inside a container
+- **Pillow** — medal sprite-sheet cropping. Imported lazily, so its absence is
+  silent: icon warming just raises `ImportError` on every startup and
+  `data/medal_icons/` never fills, leaving the website's medals page text-only
 
-See `bot_docs/requirements.txt` for full list.
+See `requirements.txt` (tracked, exact pins) for the full list. Two packages are
+deliberately **absent** because the deployed bot has never had them, and both are
+lazily imported so the bot runs fine without them: `matplotlib` and `networkx`,
+used only by the social-graph plots. Add them if you want those features.
 
 ## License
 
