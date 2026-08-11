@@ -285,3 +285,83 @@ def test_save_player_stats_persists_match_participants_with_team_fields(tmp_path
     assert by_xuid["xuid-3"]["team_id"] == "2"
 
     cache.close()
+
+
+def test_load_player_stats_index_only_skips_the_expensive_join(tmp_path):
+    """include_matches=False must answer "which matches?" without reading them.
+
+    The full load joins `matches` for ordering and match columns, which costs
+    roughly one random disk seek per match on a cold page cache - measured at
+    ~17ms/match, so 16.4s for a 696-match player. A freshness check only needs
+    membership to find the boundary between new and known, and the id set
+    answers that from one index: 0.03s against 12s for the same player.
+    """
+    from src.database.cache import PlayerStatsCacheV2
+
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    cache.save_player_stats("xuid-1", "overall", {
+        "last_update": "2026-01-01T00:00:00",
+        "processed_matches": [
+            {"match_id": "m1", "kills": 3, "deaths": 2, "assists": 1,
+             "outcome": 2, "duration": "PT10M",
+             "start_time": "2026-01-10T12:00:00", "is_ranked": False,
+             "playlist_id": "p", "map_id": "map1", "map_version": "v1",
+             "medals": []},
+            {"match_id": "m2", "kills": 3, "deaths": 2, "assists": 1,
+             "outcome": 2, "duration": "PT10M",
+             "start_time": "2026-01-09T12:00:00", "is_ranked": False,
+             "playlist_id": "p", "map_id": "map1", "map_version": "v1",
+             "medals": []},
+        ],
+    }, gamertag="G")
+
+    light = cache.load_player_stats("xuid-1", "overall", "G", include_matches=False)
+    assert light is not None
+    assert light["match_ids"] == {"m1", "m2"}
+    assert light["matches_included"] is False
+    # The expensive half is genuinely skipped, not just hidden.
+    assert light["processed_matches"] == []
+    # Metadata the caller still needs is present.
+    assert light["last_update"] == "2026-01-01T00:00:00"
+    assert light["incomplete_data"] is False
+
+    full = cache.load_player_stats("xuid-1", "overall", "G")
+    assert full["matches_included"] is True
+    assert {m["match_id"] for m in full["processed_matches"]} == {"m1", "m2"}
+    assert full["match_ids"] == {"m1", "m2"}
+
+
+def test_index_only_load_reports_empty_cache_the_same_way(tmp_path):
+    """An unknown player must be None on both paths, not an empty-but-present
+    payload the caller would read as "cached with zero matches"."""
+    from src.database.cache import PlayerStatsCacheV2
+
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    assert cache.load_player_stats("nobody", "overall", "X", include_matches=False) is None
+    assert cache.load_player_stats("nobody", "overall", "X") is None
+
+
+def test_get_cached_match_id_set_does_not_need_the_matches_table(tmp_path):
+    from src.database.cache import PlayerStatsCacheV2
+
+    cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+    cache.save_player_stats("xuid-1", "overall", {
+        "last_update": "2026-01-01T00:00:00",
+        "processed_matches": [
+            {"match_id": f"m{i}", "kills": 0, "deaths": 0, "assists": 0,
+             "outcome": 2, "duration": "PT10M",
+             "start_time": f"2026-01-{i + 1:02d}T12:00:00", "is_ranked": False,
+             "playlist_id": "p", "map_id": "map1", "map_version": "v1",
+             "medals": []}
+            for i in range(5)
+        ],
+    }, gamertag="G")
+
+    assert cache.get_cached_match_id_set("xuid-1") == {f"m{i}" for i in range(5)}
+    assert cache.get_cached_match_id_set("nobody") == set()
+
+    plan = [r[-1] for r in cache.db._get_connection().execute(
+        "EXPLAIN QUERY PLAN SELECT match_id FROM player_match WHERE xuid = ?", ("xuid-1",)
+    )]
+    # One index lookup, no join - the join is what makes the full load seek.
+    assert not any("matches" in step and "JOIN" in step.upper() for step in plan), plan

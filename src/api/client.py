@@ -1701,7 +1701,8 @@ class HaloAPIClient:
     # CACHE MANAGEMENT
     # =========================================================================
     
-    def load_cached_stats(self, xuid: str, stat_type: str, gamertag: str = None) -> Optional[Dict]:
+    def load_cached_stats(self, xuid: str, stat_type: str, gamertag: str = None,
+                          include_matches: bool = True) -> Optional[Dict]:
         """
         Load cached player stats from SQLite database.
         
@@ -1715,9 +1716,11 @@ class HaloAPIClient:
         """
         try:
             print(f"[CLIENT] Attempting to load cache for xuid={xuid}, gamertag={gamertag}, stat_type={stat_type}")
-            cached_data = self.stats_cache.load_player_stats(xuid, stat_type, gamertag)
+            cached_data = self.stats_cache.load_player_stats(
+                xuid, stat_type, gamertag, include_matches=include_matches
+            )
             if cached_data:
-                match_count = len(cached_data.get('processed_matches', []))
+                match_count = len(cached_data.get('match_ids') or cached_data.get('processed_matches', []))
                 print(f"[CLIENT] Loaded cached stats for {gamertag or xuid}: {match_count} matches")
                 return cached_data
             else:
@@ -2894,21 +2897,54 @@ class HaloAPIClient:
             # loop, since a cold-cache read on the HDD-backed DB can take
             # seconds to minutes and would otherwise stall the Discord gateway
             # heartbeat.
+            # Index only: which matches are cached, not their contents. The
+            # full rows cost ~17ms each on a cold page cache (one disk seek per
+            # match), so a 696-match player spent 16.4s here before doing any
+            # work - and when the freshness check finds nothing new, the stats
+            # come from the precomputed player_mode_stats summary and those rows
+            # are never read. Load them only if something actually needs them.
             cached_data = await asyncio.get_running_loop().run_in_executor(
-                None, self.load_cached_stats, xuid, stat_type, gamertag
+                None, self.load_cached_stats, xuid, stat_type, gamertag, False
             )
             last_update = None
-            existing_matches = {}
+            existing_match_ids = set()
             cache_marked_incomplete = False
+
+            _full_matches_cache = None
+
+            async def load_full_matches() -> Dict[str, Dict]:
+                """The cached match rows, keyed by id. Memoised, and paid for
+                only on the paths that genuinely need the contents: merging new
+                matches for a save, or computing stats when no precomputed
+                summary exists."""
+                nonlocal _full_matches_cache
+                if _full_matches_cache is None:
+                    # Already have them? A caller (or a test) may hand back a
+                    # payload that carries the rows regardless of the flag.
+                    rows = (cached_data or {}).get('processed_matches') or []
+                    if not rows:
+                        full = await asyncio.get_running_loop().run_in_executor(
+                            None, self.load_cached_stats, xuid, stat_type, gamertag, True
+                        )
+                        rows = (full or {}).get('processed_matches') or []
+                    _full_matches_cache = {m['match_id']: m for m in rows}
+                return _full_matches_cache
             
             # Check if cache is sufficient for the request
             cache_is_sufficient = False
             history_is_fresh = False
             if cached_data:
                 last_update = cached_data.get('last_update')
-                existing_matches = {m['match_id']: m for m in cached_data.get('processed_matches', [])}
+                existing_match_ids = set(cached_data.get('match_ids') or ())
+                if not existing_match_ids:
+                    # Payload predates the index-only load, or came from a
+                    # caller that always materialises rows. Derive rather than
+                    # treating a populated cache as empty.
+                    existing_match_ids = {
+                        m['match_id'] for m in (cached_data.get('processed_matches') or [])
+                    }
                 cache_marked_incomplete = bool(cached_data.get('incomplete_data')) or int(cached_data.get('failed_match_count') or 0) > 0
-                cached_games = len(existing_matches)
+                cached_games = len(existing_match_ids)
                 print(f"Last cache update: {last_update}")
                 print(f"Cache contains {cached_games} matches")
                 
@@ -2948,18 +2984,23 @@ class HaloAPIClient:
             # If cache is sufficient and we're not requesting ALL matches (or
             # the history check is still fresh), return cached data immediately
             if cache_is_sufficient and (history_is_fresh or not full_history_requested):
-                print(f"Using cached data ({len(existing_matches)} matches)")
-                cached_matches = cached_data.get('processed_matches', [])
+                print(f"Using cached data ({len(existing_match_ids)} matches)")
                 # Prefer the precomputed per-mode summary over rescanning the
                 # cached matches in Python; falls back for players not yet
                 # covered by the player_mode_stats backfill.
+                #
+                # The fallback is also the only reason to pay for the full match
+                # rows on this path, so it is what triggers loading them.
                 stats = self.stats_cache.get_player_mode_summary(xuid, stat_type)
                 if stats is None:
+                    cached_matches = list((await load_full_matches()).values())
                     stats = self._calculate_stats_from_matches(cached_matches, stat_type)
+                else:
+                    cached_matches = []
                 return {
                     'error': 0,
                     'stats': stats,
-                    'matches_processed': len(existing_matches),
+                    'matches_processed': len(existing_match_ids),
                     'new_matches': 0,
                     'processed_matches': cached_matches
                 }
@@ -3162,10 +3203,10 @@ class HaloAPIClient:
                 if force_full_fetch:
                     print(f"Force full fetch enabled - ignoring cache and fetching all matches...")
                     use_incremental = False
-                    existing_matches = {}  # Ignore cache completely
-                elif cached_data and existing_matches:
+                    existing_match_ids = set()  # Ignore cache completely
+                elif cached_data and existing_match_ids:
                     use_incremental = True
-                    print(f"Using incremental fetch (cache has {len(existing_matches)} matches)")
+                    print(f"Using incremental fetch (cache has {len(existing_match_ids)} matches)")
                 else:
                     use_incremental = False
                     print(f"🆕 No cache, doing full fetch")
@@ -3179,7 +3220,7 @@ class HaloAPIClient:
                 if use_incremental and cache_marked_incomplete and not force_full_fetch:
                     known_failed = [
                         mid for mid in (cached_data.get('failed_matches') or [])
-                        if mid and mid not in existing_matches
+                        if mid and mid not in existing_match_ids
                     ]
                     if known_failed:
                         repair_ids = known_failed
@@ -3265,7 +3306,7 @@ class HaloAPIClient:
                         found_cached_match = False
                         for match in page:
                             match_id = match.get('MatchId')
-                            if match_id and match_id not in existing_matches:
+                            if match_id and match_id not in existing_match_ids:
                                 new_matches_found.append(match)
                             else:
                                 # Hit a cached match - all older matches are cached
@@ -3285,10 +3326,10 @@ class HaloAPIClient:
 
                     probe_plan = build_boundary_probe_plan(
                         full_history_requested=full_history_requested,
-                        has_cached_matches=bool(existing_matches),
+                        has_cached_matches=bool(existing_match_ids),
                         reached_history_end=reached_history_end,
                         total_matches_hint=total_matches_hint,
-                        cached_match_count=len(existing_matches),
+                        cached_match_count=len(existing_match_ids),
                         new_match_count=len(new_matches_found),
                         cache_marked_incomplete=cache_marked_incomplete,
                     )
@@ -3306,7 +3347,7 @@ class HaloAPIClient:
                         else:
                             probe_checked = True
                             probe_match_id = probe_page[0].get('MatchId') if probe_page else None
-                            known_match_ids = set(existing_matches.keys())
+                            known_match_ids = set(existing_match_ids)
                             known_match_ids.update(
                                 match.get('MatchId')
                                 for match in new_matches_found
@@ -3323,7 +3364,7 @@ class HaloAPIClient:
                     sync_decision = decide_full_history_sync(
                         full_history_requested=full_history_requested,
                         total_matches_hint=total_matches_hint,
-                        cached_match_count=len(existing_matches),
+                        cached_match_count=len(existing_match_ids),
                         new_match_count=len(new_matches_found),
                         found_cached_boundary=found_cached_boundary,
                         reached_history_end=reached_history_end,
@@ -3383,19 +3424,26 @@ class HaloAPIClient:
                             # current; stamp it so requests within the
                             # freshness TTL skip the API entirely.
                             self._history_checked_at[xuid] = time.monotonic()
-                            print(f"No new matches found, using cache ({len(existing_matches)} matches)")
-                            cached_matches = cached_data.get('processed_matches', [])
+                            print(f"No new matches found, using cache ({len(existing_match_ids)} matches)")
                             # Prefer the precomputed per-mode summary over
                             # rescanning the cached matches in Python; falls
                             # back for players not yet covered by the
                             # player_mode_stats backfill.
+                            #
+                            # This is the hot path for a page visit with no new
+                            # games. When the summary exists - the normal case -
+                            # nothing here needs the match rows, which is the
+                            # whole point of not having loaded them.
                             stats = self.stats_cache.get_player_mode_summary(xuid, stat_type)
                             if stats is None:
+                                cached_matches = list((await load_full_matches()).values())
                                 stats = self._calculate_stats_from_matches(cached_matches, stat_type)
+                            else:
+                                cached_matches = []
                             return {
                                 'error': 0,
                                 'stats': stats,
-                                'matches_processed': len(existing_matches),
+                                'matches_processed': len(existing_match_ids),
                                 'new_matches': 0,
                                 'processed_matches': cached_matches
                             }
@@ -3640,11 +3688,11 @@ class HaloAPIClient:
                         print("Token refresh failed, cannot continue")
                         return {"error": 4, "message": "Authentication failed - unable to refresh tokens"}
                 
-                if cached_data and existing_matches:
+                if cached_data and existing_match_ids:
                     # Reuse cached rows and only fetch details for uncached match IDs.
                     uncached_match_ids = [
                         match.get('MatchId') for match in all_matches
-                        if match.get('MatchId') and match.get('MatchId') not in existing_matches
+                        if match.get('MatchId') and match.get('MatchId') not in existing_match_ids
                     ]
                     # Targeted repair: also refetch known-failed match IDs. Their
                     # details were never saved, so they aren't in existing_matches;
@@ -3657,7 +3705,7 @@ class HaloAPIClient:
                                 seen.add(mid)
                     print(f"Processing {len(uncached_match_ids)} uncached matches from {len(all_matches)} listed matches")
                     matches_to_fetch = [(match_id, xuid) for match_id in uncached_match_ids]
-                    all_processed_matches = list(existing_matches.values())
+                    all_processed_matches = list((await load_full_matches()).values())
                 else:
                     # Full fetch: process all matches
                     print(f"Found {len(all_matches)} total matches in history")
@@ -3666,13 +3714,14 @@ class HaloAPIClient:
                     matches_to_analyze = all_matches[:matches_to_process] if matches_to_process < 999999 else all_matches
                     
                     # Process matches we haven't seen before
-                    all_processed_matches = list(existing_matches.values()) if existing_matches else []
+                    all_processed_matches = (list((await load_full_matches()).values())
+                                             if existing_match_ids else [])
                     
                     # Find matches that need processing
                     matches_to_fetch = []
                     for match in matches_to_analyze:
                         match_id = match.get('MatchId')
-                        if match_id not in existing_matches:
+                        if match_id not in existing_match_ids:
                             matches_to_fetch.append((match_id, xuid))
                 
                 print(f"Fetching {len(matches_to_fetch)} match details with rolling queue...")

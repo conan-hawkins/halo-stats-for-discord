@@ -131,7 +131,8 @@ class PlayerStatsCacheV2:
             print(f"Error saving stats for {xuid}: {e}")
             return False
     
-    def load_player_stats(self, xuid: str, stat_type: str, gamertag: str = None) -> Optional[Dict]:
+    def load_player_stats(self, xuid: str, stat_type: str, gamertag: str = None,
+                          include_matches: bool = True) -> Optional[Dict]:
         """
         Load player stats from database
         Reconstructs the format expected by existing code
@@ -148,7 +149,8 @@ class PlayerStatsCacheV2:
             conn = self.db._get_connection()
             cursor = conn.cursor()
             
-            print(f"[CACHE] Loading stats for xuid={xuid}, gamertag={gamertag}, stat_type={stat_type}")
+            print(f"[CACHE] Loading stats for xuid={xuid}, gamertag={gamertag}, "
+                  f"stat_type={stat_type}, include_matches={include_matches}")
             
             # Find player by XUID or gamertag
             player_xuid = xuid
@@ -174,13 +176,36 @@ class PlayerStatsCacheV2:
             print(f"[CACHE] Found player: {player['gamertag']}, last_processed={player['last_processed_at']}")
             
             # Get processed matches for this player (for "overall", get ALL matches regardless of ranked status)
-            matches = self.get_player_processed_matches(player_xuid, "overall")  # Always get all matches first
-            
-            if not matches:
-                print(f"[CACHE] No matches found for player {player['gamertag']}")
-                return None
-            
-            print(f"[CACHE] Found {len(matches)} total matches for {player['gamertag']}")
+            #
+            # This is the expensive half of a cache load, and on a cold page
+            # cache it dominates everything else: the JOIN onto `matches` costs
+            # roughly one random seek per match, measured at ~17ms/match on the
+            # spinning disk the DB lives on (0.2ms warm - a 75x difference).
+            # A 696-match player took 16.4s here; a 1194-match player 25.0s.
+            #
+            # Callers that only need to know WHICH matches are cached - a
+            # freshness check looking for the boundary between new and known -
+            # pass include_matches=False and get the id set instead, which
+            # touches one index and no medals: 0.03s against 12s.
+            if include_matches:
+                matches = self.get_player_processed_matches(player_xuid, "overall")
+
+                if not matches:
+                    print(f"[CACHE] No matches found for player {player['gamertag']}")
+                    return None
+
+                print(f"[CACHE] Found {len(matches)} total matches for {player['gamertag']}")
+                match_ids = {m['match_id'] for m in matches}
+            else:
+                matches = []
+                match_ids = self.get_cached_match_id_set(player_xuid)
+
+                if not match_ids:
+                    print(f"[CACHE] No matches found for player {player['gamertag']}")
+                    return None
+
+                print(f"[CACHE] Found {len(match_ids)} cached match ids for "
+                      f"{player['gamertag']} (index only)")
             
             # Reconstruct the expected format with ALL matches
             # (stats filtering happens in _calculate_stats_from_matches based on stat_type)
@@ -195,7 +220,12 @@ class PlayerStatsCacheV2:
                 # caller can retry exactly those (targeted repair) instead of a
                 # full re-crawl. Empty list => no known repair targets.
                 'failed_matches': list(self.get_failed_match_ids(player_xuid)),
-                'processed_matches': matches
+                # Empty when include_matches=False; use `match_ids` for
+                # membership and counts, and re-load with include_matches=True
+                # if the full rows are genuinely needed.
+                'processed_matches': matches,
+                'match_ids': match_ids,
+                'matches_included': include_matches,
             }
 
             return stats_data
@@ -204,6 +234,20 @@ class PlayerStatsCacheV2:
             print(f"Error loading stats for {xuid}: {e}")
             return None
     
+    def get_cached_match_id_set(self, xuid: str) -> set:
+        """Which matches are cached for this player - ids only.
+
+        Deliberately does NOT join `matches`. get_player_processed_matches has
+        to, for start_time ordering and the match columns, and that join is
+        what makes it seek once per match on a cold cache. Membership is all a
+        boundary check needs, and this answers it from one index: measured 0.03s
+        where the full load took 12s for the same player.
+        """
+        conn = self.db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT match_id FROM player_match WHERE xuid = ?", (xuid,))
+        return {row[0] for row in cursor.fetchall()}
+
     def get_player_processed_matches(self, xuid: str, stat_type: str = "overall", 
                                       limit: int = None) -> List[Dict]:
         """
