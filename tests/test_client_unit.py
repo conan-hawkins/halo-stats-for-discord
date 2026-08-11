@@ -2911,3 +2911,119 @@ async def test_long_history_still_reaches_full_width(monkeypatch):
     overshoot = len([s for s in starts if s // 25 >= pages])
     assert overshoot <= 25, f"overshoot {overshoot} exceeds max_in_flight"
     assert len(starts) <= pages + 25
+
+
+def _install_latency_fake(monkeypatch, pages, latency=0.02, jitter=True):
+    """Fake HTTP with NON-UNIFORM latency, and a slot() that records concurrency.
+
+    The jitter matters. An earlier slow-start bug widened the window only when a
+    whole batch of in-flight pages drained together - which uniform fake latency
+    made happen every time, hiding it. Real completions arrive one at a time, so
+    the batch never drained and the window stuck at 8 of a possible 25.
+    """
+    import random
+    from contextlib import asynccontextmanager
+    from src.api import client as client_module
+
+    state = {"inflight": 0, "peak": 0, "starts": []}
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status = 200
+            self._payload = payload
+            self.headers = {}
+
+        async def __aenter__(self):
+            await asyncio.sleep(latency * (random.uniform(0.4, 1.6) if jitter else 1.0))
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self):
+            return self._payload
+
+        async def text(self):
+            return ""
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def get(self, url, headers=None):
+            start = int(url.split("start=")[1].split("&")[0])
+            state["starts"].append(start)
+            page = start // 25
+            results = ([] if page >= pages
+                       else [{"MatchId": f"m{page}-{j}"} for j in range(25)])
+            return _Resp({"Results": results})
+
+    class _Limiter:
+        async def wait_if_needed(self, account_index=None, bucket=None):
+            return 0
+
+        def set_backoff(self, **kwargs):
+            return None
+
+        def slot(self, account_index=None, bucket=None):
+            @asynccontextmanager
+            async def _cm():
+                if bucket == client_module.BUCKET_MATCH_LIST:
+                    state["inflight"] += 1
+                    state["peak"] = max(state["peak"], state["inflight"])
+                    try:
+                        yield 0
+                    finally:
+                        state["inflight"] -= 1
+                else:
+                    yield 0
+            return _cm()
+
+    monkeypatch.setattr(client_module, "halo_stats_rate_limiter", _Limiter())
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda *a, **k: _Session())
+    monkeypatch.setattr(client_module.aiohttp, "TCPConnector", lambda *a, **k: object())
+    monkeypatch.setattr(client_module.aiohttp, "ClientTimeout", lambda *a, **k: object())
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pages,min_peak,max_peak", [
+    (3,   1,  4),    # short history: must NOT open to full width
+    (200, 20, 25),   # long history: must reach it despite jittered completions
+])
+async def test_slow_start_window_reaches_full_width_under_jitter(monkeypatch, pages, min_peak, max_peak):
+    """Ramping must not cost throughput on large histories.
+
+    This asserts CONCURRENCY, not request count. The original slow-start test
+    only counted requests, which stayed correct while the window was stuck at 8
+    - the crawl still read every page, just 3x slower. Peak in-flight is the
+    property that actually matters here.
+    """
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]   # max_in_flight 25
+
+    state = _install_latency_fake(monkeypatch, pages)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert len({s // 25 for s in state["starts"] if s // 25 < pages}) == pages
+    assert min_peak <= state["peak"] <= max_peak, (
+        f"{pages}-page history peaked at {state['peak']} concurrent page requests, "
+        f"expected {min_peak}-{max_peak}"
+    )

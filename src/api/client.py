@@ -3558,12 +3558,15 @@ class HaloAPIClient:
                     # avoids the cold-start burst that provokes 429s for large
                     # histories too, so it is not a straight trade.
                     window = min(SLOW_START_PAGES, max_in_flight)
-                    round_remaining = 0
-                    # Spans the whole round, not one asyncio.wait() return:
-                    # FIRST_COMPLETED wakes as soon as any single page lands, so a
-                    # per-wake flag would be reset before the round finished and
-                    # the window would widen on partial evidence.
-                    round_all_full = True
+                    # Consecutive full pages since the window last grew. Counting
+                    # pages rather than "rounds" on purpose: an earlier version
+                    # waited for a whole batch of in-flight pages to drain before
+                    # widening, which only happens if they finish together. Real
+                    # latency jitters, so completions arrive one at a time, the
+                    # batch never drained, and the window stuck at 8 of a possible
+                    # 25 - a 3x throughput loss on exactly the large histories the
+                    # wide window exists for.
+                    consecutive_full = 0
 
                     def _enqueue_up_to_window():
                         """Top the queue up to `window`. Returns pages started."""
@@ -3578,7 +3581,7 @@ class HaloAPIClient:
                         return started
 
                     if not got_empty_page and not got_401_error:
-                        round_remaining = _enqueue_up_to_window()
+                        _enqueue_up_to_window()
 
                     # Process with rolling queue - as one completes, start another
                     while pending_tasks:
@@ -3591,17 +3594,16 @@ class HaloAPIClient:
                                 got_401_error = True
                                 break
                             elif page is _PAGE_FETCH_FAILED:
+                                consecutive_full = 0
                                 # Page listing failed after retries. Do NOT treat
                                 # this as end-of-history: record it for the repair
                                 # pass and keep enqueuing subsequent pages so a
                                 # single transient failure can't truncate the crawl.
                                 #
-                                # It does not count as evidence of more history
-                                # either, so it must not widen the window - but it
-                                # must not stall the ramp forever, hence it only
-                                # withholds the growth for this round.
+                                # It is not evidence of more history either, so it
+                                # resets the run of full pages rather than
+                                # counting toward the next widening.
                                 failed_page_nums.append(page_num)
-                                round_all_full = False
                             elif page and len(page) > 0:
                                 all_matches.extend(page)
 
@@ -3609,7 +3611,9 @@ class HaloAPIClient:
                                 # comment on the first-page handler), but it is not
                                 # evidence to widen on either.
                                 if len(page) < PAGE_SIZE:
-                                    round_all_full = False
+                                    consecutive_full = 0
+                                else:
+                                    consecutive_full += 1
 
                                 # For bounded requests, stop enqueuing once enough matches are gathered.
                                 if bounded_fetch and len(all_matches) >= matches_to_process:
@@ -3617,9 +3621,7 @@ class HaloAPIClient:
                             else:
                                 # Genuine empty page - real end of history, stop starting new requests
                                 got_empty_page = True
-                                round_all_full = False
-
-                            round_remaining -= 1
+                                consecutive_full = 0
 
                         if got_401_error:
                             # Cancel remaining tasks
@@ -3627,17 +3629,15 @@ class HaloAPIClient:
                                 t.cancel()
                             break
 
-                        # Widen only when a whole round came back full, i.e. the
-                        # history demonstrably extends past everything requested.
-                        if round_remaining <= 0:
-                            if round_all_full and not got_empty_page:
-                                window = min(window * 2, max_in_flight)
-                            round_remaining = 0
-                            round_all_full = True          # start the next round clean
-                            round_remaining = _enqueue_up_to_window()
-                        else:
-                            # Mid-round: keep the pipe full without widening.
-                            round_remaining += _enqueue_up_to_window()
+                        # Widen once the history has demonstrably extended past a
+                        # full window's worth of pages. Independent of how the
+                        # completions happened to be batched.
+                        if (consecutive_full >= window and not got_empty_page
+                                and window < max_in_flight):
+                            window = min(window * 2, max_in_flight)
+                            consecutive_full = 0
+
+                        _enqueue_up_to_window()
 
                         # Progress update
                         if len(all_matches) % 500 == 0 and len(all_matches) > 0:
