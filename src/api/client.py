@@ -157,6 +157,11 @@ class HaloAPIClient:
     PROFILE_BATCH_URL = "https://profile.svc.halowaypoint.com/users"
     # Hard ceiling, measured: 100 ids returns 200, 101 returns 400.
     PROFILE_BATCH_MAX = 100
+    # Extra requests allowed to isolate bad ids within one chunk. Isolating a
+    # single bad id out of 100 costs ~7; a chunk needing far more than that is
+    # mostly invalid, and chasing it costs more requests than resolving the ids
+    # one by one would have.
+    PROFILE_ISOLATION_BUDGET = 16
     DISCOVERY_UGC_URL = "https://discovery-infiniteugc.svc.halowaypoint.com"
     USER_AGENT = "HaloWaypoint/2021.01.10.01"
     # Zero-network fast path for known ranked playlist asset IDs. Asset IDs
@@ -1164,39 +1169,71 @@ class HaloAPIClient:
 
         A 400 means one member of the batch is unacceptable, not that the
         request shape is wrong - a single well-formed but nonexistent XUID
-        rejects all 100 of its companions (measured). Recursive halving finds
-        the offender in ~log2(n) requests and still resolves everyone else,
+        rejects all 100 of its companions (measured). Halving finds the
+        offender in ~log2(n) requests and still resolves everyone else,
         instead of discarding a whole chunk for one bad id.
+
+        BUT the split is budgeted, because "one bad id" is an assumption, not a
+        guarantee. Splitting a chunk that is *mostly* invalid degenerates into
+        roughly one request per id - measured live at ~100 requests for a
+        100-id chunk of nonexistent ids, which promptly 429'd. That is strictly
+        worse than the single-id path this replaced, so the isolation gives up
+        and leaves the remainder unresolved rather than pursuing every last id.
+
+        Iterative rather than recursive so the budget is a plain counter and
+        the queue depth cannot surprise us.
         """
         if not chunk:
             return {}
 
-        mapping, status = await self._fetch_profile_batch(chunk)
-        if mapping is not None:
-            # Ids the endpoint answered 200 for but did not mention do not
-            # exist as far as it is concerned. Remember them so they cannot
-            # poison a later batch.
-            for xuid in chunk:
-                if xuid not in mapping:
-                    self._unresolvable_xuids.add(xuid)
-            return mapping
+        resolved: Dict[str, str] = {}
+        queue: List[List[str]] = [chunk]
+        # Isolating a single bad id out of 100 costs ~7 extra requests. This
+        # covers a few of those and still bounds the pathological case.
+        isolation_budget = self.PROFILE_ISOLATION_BUDGET
 
-        if status == 400:
-            if len(chunk) == 1:
-                self._unresolvable_xuids.add(chunk[0])
-                print(f"[PROFILE] xuid {chunk[0]} rejected by the batch endpoint; "
-                      f"excluded from further batches this session")
-                return {}
-            mid = len(chunk) // 2
-            left = await self._resolve_chunk(chunk[:mid])
-            right = await self._resolve_chunk(chunk[mid:])
-            return {**left, **right}
+        while queue:
+            current = queue.pop(0)
+            mapping, status = await self._fetch_profile_batch(current)
 
-        # 401/429/timeout: transient. Leave these ids unresolved so the caller
-        # can fall back or retry - do NOT mark them unresolvable.
-        print(f"[PROFILE] Batch of {len(chunk)} failed with status {status}; "
-              f"leaving unresolved")
-        return {}
+            if mapping is not None:
+                # Ids the endpoint answered 200 for but did not mention do not
+                # exist as far as it is concerned. Remember them so they cannot
+                # poison a later batch.
+                for xuid in current:
+                    if xuid not in mapping:
+                        self._unresolvable_xuids.add(xuid)
+                resolved.update(mapping)
+                continue
+
+            if status == 400:
+                if len(current) == 1:
+                    self._unresolvable_xuids.add(current[0])
+                    print(f"[PROFILE] xuid {current[0]} rejected by the batch "
+                          f"endpoint; excluded from further batches this session")
+                    continue
+
+                if isolation_budget <= 0:
+                    remaining = len(current) + sum(len(q) for q in queue)
+                    print(f"[PROFILE] Isolation budget spent; leaving {remaining} "
+                          f"id(s) unresolved rather than issuing one request each")
+                    break
+
+                isolation_budget -= 1
+                mid = len(current) // 2
+                queue.insert(0, current[mid:])
+                queue.insert(0, current[:mid])
+                continue
+
+            # 401/429/timeout: transient, and says nothing about the ids. Do
+            # NOT mark them unresolvable. Splitting further under a 429 would
+            # only add requests to an endpoint already asking us to slow down,
+            # so abandon the whole isolation walk here.
+            print(f"[PROFILE] Batch of {len(current)} failed with status {status}; "
+                  f"leaving unresolved")
+            break
+
+        return resolved
 
     # =========================================================================
     # XBOX PRIVACY

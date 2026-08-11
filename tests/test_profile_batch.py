@@ -166,6 +166,64 @@ def test_one_bad_id_does_not_cost_the_rest_their_gamertags(monkeypatch):
     assert len(requests) < 8
 
 
+def test_a_mostly_invalid_chunk_does_not_degenerate_into_one_request_per_id(monkeypatch):
+    # Found in live testing: a chunk of 100 nonexistent ids split all the way
+    # down to singletons, issuing ~100 requests and then 429ing. That is worse
+    # than the single-id path this replaced, so the isolation is budgeted.
+    def handler(xuids):
+        # Every id is bad, so every batch 400s no matter how it is split.
+        return _FakeResponse(400, "Bad Request")
+
+    _, requests, _ = _install(monkeypatch, handler)
+
+    client = _client()
+    resolved = asyncio.run(client.resolve_xuids_batch([str(i) for i in range(100)]))
+
+    assert resolved == {}
+    # 1 initial + at most PROFILE_ISOLATION_BUDGET splits, each adding one
+    # extra request beyond the one it replaces.
+    assert len(requests) <= 2 * client.PROFILE_ISOLATION_BUDGET + 1
+    assert len(requests) < 100, "isolation walked the whole chunk id by id"
+
+
+def test_rate_limiting_stops_the_isolation_walk_instead_of_deepening_it(monkeypatch):
+    # Splitting under a 429 adds requests to an endpoint already asking us to
+    # slow down. The walk must abandon, and must not poison any id.
+    calls = {"n": 0}
+
+    def handler(xuids):
+        calls["n"] += 1
+        # First call 400s to trigger a split; everything after is rate limited.
+        return _FakeResponse(400 if calls["n"] == 1 else 429, "")
+
+    _, requests, _ = _install(monkeypatch, handler)
+
+    client = _client()
+    resolved = asyncio.run(client.resolve_xuids_batch([str(i) for i in range(20)]))
+
+    assert resolved == {}
+    assert client._unresolvable_xuids == set()
+    assert len(requests) <= 3, f"kept splitting under 429: {len(requests)} requests"
+
+
+def test_one_bad_id_is_still_isolated_within_the_budget(monkeypatch):
+    # The budget must not break the case it was built for.
+    bad = "77"
+
+    def handler(xuids):
+        return _FakeResponse(400, "Bad Request") if bad in xuids else _ok(xuids)
+
+    _, requests, _ = _install(monkeypatch, handler)
+
+    client = _client()
+    ids = [str(i) for i in range(100)]
+    resolved = asyncio.run(client.resolve_xuids_batch(ids))
+
+    assert len(resolved) == 99
+    assert bad in client._unresolvable_xuids
+    assert len(requests) <= client.PROFILE_ISOLATION_BUDGET + 1
+
+
 def test_a_poisoned_id_is_not_resent_on_later_calls(monkeypatch):
     bad = "9999"
 
