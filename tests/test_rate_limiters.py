@@ -53,7 +53,7 @@ def test_xbox_rate_limiter_round_robin_and_backoff(monkeypatch):
     monkeypatch.setattr(rate_limiters.time, "time", lambda: 100.0)
 
     assert limiter.get_best_account() == 0
-    limiter.set_backoff(0, 20)
+    limiter.set_backoff(account_index=0, seconds=20)
     assert limiter.get_best_account() == 1
 
 

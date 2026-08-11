@@ -77,10 +77,17 @@ class XboxProfileRateLimiter:
         
         return min_wait_idx
     
-    def set_backoff(self, account_index: int, seconds: float) -> None:
+    def set_backoff(self, *, account_index: int, seconds: float) -> None:
         """
         Set backoff time for an account after receiving 429.
-        
+
+        KEYWORD-ONLY, deliberately. This class and HaloStatsRateLimiter used to
+        take these two arguments in opposite orders - (account_index, seconds)
+        here, (seconds, account_index) there. Both are numbers, so transposing
+        them raised nothing: you would set a 0-second backoff on account 30 and
+        the only symptom would be a limiter that quietly stopped backing off.
+        Naming them at every call site makes the order irrelevant.
+
         Args:
             account_index: Account to set backoff for
             seconds: Seconds to wait before retrying
@@ -392,10 +399,14 @@ class HaloStatsRateLimiter:
                 semaphore.release()
 
 
-    def set_backoff(self, seconds: float, account_index: Optional[int] = None) -> None:
+    def set_backoff(self, *, seconds: float, account_index: Optional[int] = None) -> None:
         """
         Set a backoff period after receiving a 429 response.
-        
+
+        KEYWORD-ONLY - see XboxProfileRateLimiter.set_backoff. That class takes
+        the same two numbers in the opposite order, and a silent transposition
+        would disable backoff rather than raise.
+
         Args:
             seconds: Number of seconds to wait before resuming requests
             account_index: Specific account to backoff, or None for global backoff

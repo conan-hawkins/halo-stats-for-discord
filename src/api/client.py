@@ -1229,7 +1229,7 @@ class HaloAPIClient:
                                 backoff_wait = 30 * (2 ** attempt)
 
                             if self.xbox_accounts:
-                                xbox_profile_rate_limiter.set_backoff(account_idx, backoff_wait)
+                                xbox_profile_rate_limiter.set_backoff(account_index=account_idx, seconds=backoff_wait)
                                 print(f"⚠️ Rate limited (429) for XUID {xuid} on account {account_idx + 1} - {current_requests}/{max_requests} requests")
                                 print(f"   Attempt {attempt + 1}/{max_retries}, backoff {backoff_wait:.0f}s (limiter-managed)")
 
@@ -2332,7 +2332,7 @@ class HaloAPIClient:
                             elif response.status == 429:
                                 retry_after = response.headers.get('Retry-After')
                                 wait_time = int(retry_after) if retry_after and retry_after.isdigit() else 3
-                                halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                                halo_stats_rate_limiter.set_backoff(seconds=wait_time, account_index=account_index)
                                 last_status = 'error'
                                 continue
                             else:
@@ -2465,7 +2465,7 @@ class HaloAPIClient:
                                 wait_time = 2 ** retry + 3  # 4s, 7s
                         
                             # Set backoff for THIS account only
-                            halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                            halo_stats_rate_limiter.set_backoff(seconds=wait_time, account_index=account_index)
                             print(f"⚠️ Match {match_id}: Rate limited (429) on account {account_index}, switching account...")
                         
                             # Get a different account and retry. wait_if_needed()
@@ -2747,7 +2747,7 @@ class HaloAPIClient:
                                 # Rate limited - wait and retry
                                 retry_after = response.headers.get('Retry-After', '5')
                                 wait_time = int(retry_after) if retry_after.isdigit() else 5
-                                halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                                halo_stats_rate_limiter.set_backoff(seconds=wait_time, account_index=account_index)
                                 await asyncio.sleep(1)
                                 continue
                             else:
@@ -2999,11 +2999,11 @@ class HaloAPIClient:
                                         wait_time = 30 * (2 ** rate_limit_retry)
                                 
                                     # Set backoff for THIS account
-                                    halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                                    halo_stats_rate_limiter.set_backoff(seconds=wait_time, account_index=account_index)
                                 
                                     # Also set a shorter global backoff to slow down ALL requests
                                     global_backoff = 5 * (rate_limit_retry + 1)  # 5s, 10s, 15s, 20s, 25s
-                                    halo_stats_rate_limiter.set_backoff(global_backoff, account_index=None)
+                                    halo_stats_rate_limiter.set_backoff(seconds=global_backoff, account_index=None)
                                 
                                     print(f"⚠️ Rate limited (429) at page {start_pos} on account {account_index}, waiting {wait_time}s (attempt {rate_limit_retry + 1}/{max_rate_limit_retries})...")
                                 

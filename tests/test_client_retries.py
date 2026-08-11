@@ -52,7 +52,7 @@ async def test_get_match_stats_retries_429_with_account_backoff(monkeypatch):
         return idx
 
     monkeypatch.setattr(client_module.halo_stats_rate_limiter, "wait_if_needed", fake_wait_if_needed)
-    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "set_backoff", lambda seconds, account_index=None: backoffs.append((seconds, account_index)))
+    monkeypatch.setattr(client_module.halo_stats_rate_limiter, "set_backoff", lambda *, seconds, account_index=None: backoffs.append((seconds, account_index)))
     monkeypatch.setattr(client, "get_next_spartan_token", lambda idx=None: f"tok-{idx}")
 
     stats_payload = {
@@ -390,7 +390,7 @@ async def test_get_friends_list_429_then_success(monkeypatch):
     monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", fake_acquire)
     monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "release", lambda: None)
     backoffs = []
-    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "set_backoff", lambda idx, sec: backoffs.append((idx, sec)))
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "set_backoff", lambda *, account_index, seconds: backoffs.append((account_index, seconds)))
 
     sleeps = []
 
@@ -459,7 +459,7 @@ async def test_get_friends_list_retry_drops_fixed_account_hint(monkeypatch):
 
     monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "acquire", fake_acquire)
     monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "release", lambda: None)
-    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "set_backoff", lambda idx, sec: None)
+    monkeypatch.setattr(client_module.xbox_profile_rate_limiter, "set_backoff", lambda *, account_index, seconds: None)
 
     async def fake_sleep(_seconds):
         return None
