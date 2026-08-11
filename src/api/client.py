@@ -3567,6 +3567,7 @@ class HaloAPIClient:
                     # about a second on a crawl that runs for minutes - and it
                     # avoids the cold-start burst that provokes 429s for large
                     # histories too, so it is not a straight trade.
+                    last_progress_logged = 0
                     window = min(SLOW_START_PAGES, max_in_flight)
                     # Consecutive full pages since the window last grew. Counting
                     # pages rather than "rounds" on purpose: an earlier version
@@ -3649,8 +3650,18 @@ class HaloAPIClient:
 
                         _enqueue_up_to_window()
 
-                        # Progress update
-                        if len(all_matches) % 500 == 0 and len(all_matches) > 0:
+                        # Progress update, once per milestone.
+                        #
+                        # This used to fire whenever the count HAPPENED to sit on
+                        # a multiple of 500, and it sits outside the completion
+                        # loop, so a stalled crawl reprinted the same line on
+                        # every asyncio.wait() return - "Fetched 8500 matches so
+                        # far..." twenty-five times while nothing was arriving.
+                        # A repeated progress line reads as progress, which is
+                        # exactly backwards, and it disguised a stall for
+                        # minutes.
+                        if len(all_matches) - last_progress_logged >= 500:
+                            last_progress_logged = len(all_matches) - (len(all_matches) % 500)
                             print(f"   Fetched {len(all_matches)} matches so far...")
 
                     # In-crawl repair pass: retry any pages that failed mid-crawl,
@@ -3662,17 +3673,34 @@ class HaloAPIClient:
                     if failed_page_nums and not got_401_error:
                         print(f"Repairing {len(failed_page_nums)} failed page(s) from full crawl...")
                         still_failed = []
-                        for fp in failed_page_nums:
-                            repaired = await fetch_match_page(session, fp * PAGE_SIZE, PAGE_SIZE)
-                            if repaired is None:
-                                got_401_error = True
+
+                        # Concurrent, bounded by the same window the crawl uses.
+                        #
+                        # This was a serial for-loop, one page at a time, each
+                        # with its own retry ladder: 162 pages took six minutes
+                        # on a single large crawl. The requests are independent
+                        # and the rate limiter already paces them, so serialising
+                        # bought nothing - it just meant a repair could take
+                        # longer than the crawl it was repairing.
+                        repair_width = max(1, min(window, max_in_flight))
+                        for i in range(0, len(failed_page_nums), repair_width):
+                            chunk = failed_page_nums[i:i + repair_width]
+                            results = await asyncio.gather(*(
+                                fetch_match_page(session, fp * PAGE_SIZE, PAGE_SIZE)
+                                for fp in chunk
+                            ))
+                            for fp, repaired in zip(chunk, results):
+                                if repaired is None:
+                                    got_401_error = True
+                                elif repaired is _PAGE_FETCH_FAILED:
+                                    still_failed.append(fp)
+                                elif repaired:
+                                    all_matches.extend(repaired)
+                                # A genuine empty page here just means that offset
+                                # is now past end-of-history; nothing to add, not
+                                # a failure.
+                            if got_401_error:
                                 break
-                            if repaired is _PAGE_FETCH_FAILED:
-                                still_failed.append(fp)
-                            elif repaired:
-                                all_matches.extend(repaired)
-                            # A genuine empty page here just means that offset is now
-                            # past end-of-history; nothing to add, not a failure.
                         if still_failed:
                             page_fetch_incomplete = True
                             print(f"⚠️ {len(still_failed)} page(s) still failed after repair; "
