@@ -1244,6 +1244,134 @@ class HaloAPIClient:
         return resolved
 
     # =========================================================================
+    # SERVICE RECORD (halostats.svc)
+    # =========================================================================
+
+    # Match types the service record is published for. "campaign" is NOT one of
+    # them - it 404s, unlike these three.
+    SERVICE_RECORD_TYPES = ("Matchmade", "Custom", "Local")
+
+    async def get_service_record(self, xuid: str, match_type: str = "Matchmade",
+                                 season_id: Optional[str] = None,
+                                 game_variant_category: Optional[int] = None,
+                                 is_ranked: Optional[bool] = None,
+                                 playlist_asset_id: Optional[str] = None
+                                 ) -> Optional[Dict]:
+        """Whole-career aggregates for a player in one ~300ms request.
+
+        This is 343's own accounting, NOT a summary of the match list, and the
+        two disagree: for one measured player the service record reported 474
+        matchmade games where /matches/count said 476 and the match list held
+        528. So it is a display and reconciliation source only - it can never
+        be used to decide whether a crawl has seen the whole history.
+
+        Filters apply to Matchmade only, and only in the combinations the API
+        accepts. `is_ranked` partitions cleanly (measured: 156 = 10 ranked +
+        146 unranked) and is the cheapest true answer to "how has this player
+        done in ranked".
+
+        Returns the raw payload, or None on any failure.
+        """
+        if match_type not in self.SERVICE_RECORD_TYPES:
+            raise ValueError(
+                f"match_type must be one of {self.SERVICE_RECORD_TYPES}, got {match_type!r}"
+            )
+
+        params: List[Tuple[str, str]] = []
+        if match_type == "Matchmade":
+            if season_id:
+                params.append(("seasonId", season_id))
+            if game_variant_category is not None:
+                params.append(("gameVariantCategory", str(game_variant_category)))
+            if is_ranked is not None:
+                params.append(("isRanked", "true" if is_ranked else "false"))
+            if playlist_asset_id:
+                params.append(("playlistAssetId", playlist_asset_id))
+
+        url = f"{self.STATS_URL}/hi/players/xuid({xuid})/{match_type}/servicerecord"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+
+        try:
+            async with halo_stats_rate_limiter.slot(bucket=BUCKET_MATCH_STATS) as account_index:
+                spartan_token = self.get_next_spartan_token(account_index)
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
+                if not spartan_token:
+                    return None
+
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json",
+                }
+
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            halo_stats_rate_limiter.note_result(
+                                BUCKET_MATCH_STATS, rate_limited=False)
+                            payload = await response.json()
+                            return payload if isinstance(payload, dict) else None
+
+                        if response.status == 429:
+                            halo_stats_rate_limiter.note_result(
+                                BUCKET_MATCH_STATS, rate_limited=True)
+                            retry_after = _parse_retry_after(response.headers.get('Retry-After'))
+                            halo_stats_rate_limiter.set_backoff(
+                                account_index=account_index, seconds=retry_after or 5.0
+                            )
+                        else:
+                            print(f"[SERVICE RECORD] {match_type} returned {response.status} "
+                                  f"for {xuid}")
+                        return None
+
+        except Exception as e:
+            print(f"[SERVICE RECORD] Request failed for {xuid}: {e}")
+            return None
+
+    async def get_service_record_summary(self, xuid: str,
+                                         match_type: str = "Matchmade"
+                                         ) -> Optional[Dict]:
+        """Flatten a service record into the shape the bot's stats use.
+
+        Deliberately mirrors the keys calculate_comprehensive_stats produces
+        (kd_ratio, win_rate, ...) so a caller can show these in the same place,
+        plus a 'source' marker so the two can never be mistaken for each other.
+        """
+        record = await self.get_service_record(xuid, match_type)
+        if not record:
+            return None
+
+        core = record.get("CoreStats") or {}
+        kills = core.get("Kills") or 0
+        deaths = core.get("Deaths") or 0
+        assists = core.get("Assists") or 0
+        games = record.get("MatchesCompleted") or 0
+        wins = record.get("Wins") or 0
+
+        kd = round(kills / deaths, 2) if deaths else float(kills)
+        kda = round((kills + (assists / 3)) - deaths, 2)
+
+        return {
+            'games_played': games,
+            'total_kills': kills,
+            'total_deaths': deaths,
+            'total_assists': assists,
+            'wins': wins,
+            'losses': record.get("Losses") or 0,
+            'ties': record.get("Ties") or 0,
+            'kd_ratio': kd,
+            'kda': kda,
+            'avg_kda': round(kda / games, 2) if games else 0,
+            'win_rate': f"{round(wins / games * 100, 1) if games else 0}%",
+            'time_played': record.get("TimePlayed"),
+            'source': 'servicerecord',
+        }
+
+    # =========================================================================
     # SKILL / CSR (skill.svc)
     # =========================================================================
 
@@ -1472,6 +1600,41 @@ class HaloAPIClient:
             'csr_all_time_max': live.get('all_time_max'),
             'csr_source': 'skill.svc',
         }
+
+    async def _attach_service_record(self, xuid: str, stats: Dict,
+                                     history_visibility: Optional[str] = None) -> Dict:
+        """Give a player with nothing computed yet something true to show.
+
+        A player the bot has never crawled has games_played == 0 until the
+        crawl finishes, which for a long history is minutes. One ~300ms request
+        can say "this player has 474 matchmade games at a 52% win rate" in the
+        meantime.
+
+        Attached under a separate 'service_record' key rather than merged into
+        the computed stats, because the two genuinely disagree - 343's
+        accounting and the match list do not match - and silently blending them
+        would make the difference look like a bug in the crawl.
+
+        Skipped when the account is private: the service record would 404 or
+        mislead, and "private" is already the more useful answer.
+        """
+        if not isinstance(stats, dict) or stats.get('games_played'):
+            return stats
+        if history_visibility == "private":
+            return stats
+
+        try:
+            summary = await self.get_service_record_summary(xuid)
+        except Exception as e:
+            print(f"[SERVICE RECORD] Summary failed for {xuid}: {e}")
+            return stats
+
+        if not summary or not summary.get('games_played'):
+            return stats
+
+        print(f"[SERVICE RECORD] {xuid} has {summary['games_played']} matchmade "
+              f"games per 343's own accounting, while the crawl has none yet")
+        return {**stats, 'service_record': summary}
 
     # =========================================================================
     # XBOX PRIVACY
@@ -4420,6 +4583,8 @@ class HaloAPIClient:
                     selected_stats = overall_stats
 
                 selected_stats = await self._fill_missing_csr(xuid, stat_type, selected_stats)
+                selected_stats = await self._attach_service_record(
+                    xuid, selected_stats, history_visibility)
 
                 # Stamp only when full history was verified: bounded fetches
                 # never proved the history is complete, so they must not let
