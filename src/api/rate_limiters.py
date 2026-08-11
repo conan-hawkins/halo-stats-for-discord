@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 BUCKET_MATCH_LIST = "match_list"    # /matches?start=..  - the tighter one
 BUCKET_MATCH_STATS = "match_stats"  # /matches/{id}/stats - the roomier one
 BUCKET_PROFILE = "profile"          # profile.svc /users?xuids= - 100 ids per call
+BUCKET_SKILL = "skill"              # skill.svc csrs / match skill - batched by player
 DEFAULT_BUCKET = "default"
 
 # AIMD constants for the adaptive per-bucket rate. Conservative on the way down
@@ -567,3 +568,9 @@ halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_STATS, 6, floor=1.5, ceilin
 # so this starts low and adapts upward on clean responses rather than guessing
 # high against real Xbox accounts.
 halo_stats_rate_limiter.set_bucket_rate(BUCKET_PROFILE, 1, floor=0.25, ceiling=2)
+
+# skill.svc batches by player within a single match or playlist, so the request
+# count is driven by matches/playlists rather than by roster size. Starts at the
+# same conservative rate as profile for the same reason - no measured 429
+# ceiling exists for it - and adapts from there.
+halo_stats_rate_limiter.set_bucket_rate(BUCKET_SKILL, 1, floor=0.25, ceiling=3)

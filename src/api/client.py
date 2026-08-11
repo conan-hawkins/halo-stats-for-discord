@@ -56,6 +56,7 @@ from src.api.rate_limiters import (
     BUCKET_MATCH_LIST,
     BUCKET_MATCH_STATS,
     BUCKET_PROFILE,
+    BUCKET_SKILL,
     halo_stats_rate_limiter,
 )
 from src.api.utils import (
@@ -163,6 +164,13 @@ class HaloAPIClient:
     # one by one would have.
     PROFILE_ISOLATION_BUDGET = 16
     DISCOVERY_UGC_URL = "https://discovery-infiniteugc.svc.halowaypoint.com"
+    # Real CSR and MMR. The match-stats payload does not reliably carry CSR -
+    # _extract_csr_and_tier finds it so rarely that match_participants.csr is
+    # almost entirely null - so this is the only actual source for it.
+    SKILL_URL = "https://skill.svc.halowaypoint.com"
+    # "No CSR data for this player here" is reported as -1, not as an error or
+    # a null, on both skill endpoints (measured).
+    SKILL_NO_DATA = -1
     USER_AGENT = "HaloWaypoint/2021.01.10.01"
     # Zero-network fast path for known ranked playlist asset IDs. Asset IDs
     # rotate across seasons, so this static set is only a best-effort
@@ -1234,6 +1242,236 @@ class HaloAPIClient:
             break
 
         return resolved
+
+    # =========================================================================
+    # SKILL / CSR (skill.svc)
+    # =========================================================================
+
+    async def _fetch_skill(self, url: str, xuids: List[str],
+                           extra_params: Optional[List[Tuple[str, str]]] = None
+                           ) -> Optional[List[Dict]]:
+        """GET a skill.svc endpoint for a set of players. None on any failure.
+
+        Both skill endpoints take repeated `players=xuid(...)` params and answer
+        with {"Value": [{"Id": "xuid(...)", "Result": {...}}, ...]}, so one
+        request covers a whole match roster or a whole comparison group.
+        """
+        if not xuids:
+            return None
+
+        params: List[Tuple[str, str]] = [("players", f"xuid({x})") for x in xuids]
+        if extra_params:
+            params.extend(extra_params)
+        full_url = f"{url}?{urlencode(params)}"
+
+        try:
+            async with halo_stats_rate_limiter.slot(bucket=BUCKET_SKILL) as account_index:
+                spartan_token = self.get_next_spartan_token(account_index)
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
+                if not spartan_token:
+                    return None
+
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json",
+                }
+
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(full_url, headers=headers) as response:
+                        if response.status == 200:
+                            halo_stats_rate_limiter.note_result(BUCKET_SKILL, rate_limited=False)
+                            payload = await response.json()
+                            value = payload.get("Value") if isinstance(payload, dict) else None
+                            return value if isinstance(value, list) else None
+
+                        if response.status == 429:
+                            halo_stats_rate_limiter.note_result(BUCKET_SKILL, rate_limited=True)
+                            retry_after = _parse_retry_after(response.headers.get('Retry-After'))
+                            halo_stats_rate_limiter.set_backoff(
+                                account_index=account_index, seconds=retry_after or 5.0
+                            )
+                        # 404 means the playlist has no CSR concept (a social
+                        # playlist), which is a normal answer, not a fault.
+                        elif response.status != 404:
+                            print(f"[SKILL] {url} returned {response.status}")
+                        return None
+
+        except Exception as e:
+            print(f"[SKILL] Request failed: {e}")
+            return None
+
+    @staticmethod
+    def _unwrap_player_id(entry: Dict) -> Optional[str]:
+        """'xuid(123)' -> '123'. Results are keyed by the wrapped form."""
+        raw = entry.get("Id") if isinstance(entry, dict) else None
+        if not isinstance(raw, str):
+            return None
+        match = re.search(r'\d+', raw)
+        return match.group(0) if match else None
+
+    async def get_playlist_csr(self, playlist_id: str, xuids: List[str],
+                               season_id: Optional[str] = None) -> Dict[str, Dict]:
+        """Current CSR for many players in one playlist, in a single request.
+
+        This is the cheap path: it answers "what rank is this player now"
+        without touching match history at all.
+
+        Returns {xuid: {'csr', 'tier', 'sub_tier', 'season_max', 'all_time_max'}}
+        for players who have a CSR here. Players with no data in this playlist
+        are OMITTED rather than returned with -1, so callers can treat presence
+        as meaning.
+        """
+        unique = [str(x) for x in dict.fromkeys(xuids) if x]
+        if not unique or not playlist_id:
+            return {}
+
+        extra = [("season", season_id)] if season_id else None
+        results = await self._fetch_skill(
+            f"{self.SKILL_URL}/hi/playlist/{playlist_id}/csrs", unique, extra
+        )
+        if not results:
+            return {}
+
+        out: Dict[str, Dict] = {}
+        for entry in results:
+            xuid = self._unwrap_player_id(entry)
+            result = entry.get("Result") if isinstance(entry, dict) else None
+            if not xuid or not isinstance(result, dict):
+                continue
+
+            current = result.get("Current") or {}
+            csr = current.get("Value")
+            # -1 is "no CSR here", not a rank. Returning it would show players
+            # as rank -1 on every social playlist they have ever touched.
+            if not isinstance(csr, (int, float)) or csr <= self.SKILL_NO_DATA:
+                continue
+
+            out[xuid] = {
+                'csr': csr,
+                'tier': current.get("Tier") or None,
+                'sub_tier': current.get("SubTier"),
+                'season_max': (result.get("SeasonMax") or {}).get("Value"),
+                'all_time_max': (result.get("AllTimeMax") or {}).get("Value"),
+            }
+        return out
+
+    async def get_match_skill(self, match_id: str, xuids: List[str]) -> Dict[str, Dict]:
+        """CSR movement and team MMR for the players of one match.
+
+        One request covers the whole roster, so this costs one extra request
+        per match regardless of how many players are being recorded.
+
+        Returns {xuid: {'pre_csr', 'post_csr', 'tier', 'sub_tier', 'team_mmr',
+        'team_id', 'expected_kills', 'expected_deaths'}}.
+        """
+        unique = [str(x) for x in dict.fromkeys(xuids) if x]
+        if not unique or not match_id:
+            return {}
+
+        results = await self._fetch_skill(
+            f"{self.SKILL_URL}/hi/matches/{match_id}/skill", unique
+        )
+        if not results:
+            return {}
+
+        out: Dict[str, Dict] = {}
+        for entry in results:
+            xuid = self._unwrap_player_id(entry)
+            result = entry.get("Result") if isinstance(entry, dict) else None
+            if not xuid or not isinstance(result, dict):
+                continue
+
+            recap = result.get("RankRecap") or {}
+            pre = (recap.get("PreMatchCsr") or {}).get("Value")
+            post_block = recap.get("PostMatchCsr") or {}
+            post = post_block.get("Value")
+            performances = result.get("StatPerformances") or {}
+
+            def _expected(stat: str) -> Optional[float]:
+                block = performances.get(stat)
+                return block.get("Expected") if isinstance(block, dict) else None
+
+            # An unranked match reports 0/0 rather than omitting the recap, so
+            # normalise those to None instead of storing a CSR of zero.
+            out[xuid] = {
+                'pre_csr': pre if isinstance(pre, (int, float)) and pre > 0 else None,
+                'post_csr': post if isinstance(post, (int, float)) and post > 0 else None,
+                'tier': post_block.get("Tier") or None,
+                'sub_tier': post_block.get("SubTier"),
+                'team_mmr': result.get("TeamMmr"),
+                'team_id': result.get("TeamId"),
+                'expected_kills': _expected("Kills"),
+                'expected_deaths': _expected("Deaths"),
+            }
+        return out
+
+    async def get_current_csr(self, xuid: str,
+                              playlist_ids: Optional[List[str]] = None
+                              ) -> Optional[Dict]:
+        """Best current CSR for one player across the ranked playlists.
+
+        Used as the authoritative source for a player's rank, in place of
+        scraping match payloads that mostly do not carry it. Queries playlists
+        in order and stops at the first hit, so an active ranked player
+        normally costs one request.
+
+        Returns the CSR dict (plus 'playlist_id') or None if the player has no
+        ranked CSR anywhere in the list.
+        """
+        candidates = list(playlist_ids or CORE_RANKED_PLAYLIST_IDS)
+        for playlist_id in candidates:
+            found = await self.get_playlist_csr(playlist_id, [str(xuid)])
+            entry = found.get(str(xuid))
+            if entry:
+                return {**entry, 'playlist_id': playlist_id}
+        return None
+
+    # Stat types whose whole point is the rank, and therefore the only ones
+    # worth spending a skill.svc request on when the match data has no CSR.
+    CSR_ENRICHED_STAT_TYPES = {"ranked", "core_ranked", "rotational_ranked"}
+
+    async def _fill_missing_csr(self, xuid: str, stat_type: str,
+                                stats: Dict) -> Dict:
+        """Fall back to skill.svc when the match data carried no CSR.
+
+        `estimated_csr` is scraped from match payloads that mostly do not
+        contain it - match_participants.csr is almost entirely null - so for a
+        ranked request the rank is usually simply missing. skill.svc has it.
+
+        Deliberately narrow. Only ranked stat types pay for this, and only when
+        the scrape found nothing, so an ordinary `#stats` command costs no
+        extra requests. A failure here leaves the existing (empty) value alone
+        rather than failing the command: a missing rank is a much smaller
+        problem than no stats at all.
+        """
+        if stat_type not in self.CSR_ENRICHED_STAT_TYPES:
+            return stats
+        if not isinstance(stats, dict) or stats.get('estimated_csr') is not None:
+            return stats
+
+        try:
+            live = await self.get_current_csr(xuid)
+        except Exception as e:
+            print(f"[SKILL] CSR lookup failed for {xuid}: {e}")
+            return stats
+
+        if not live:
+            return stats
+
+        print(f"[SKILL] Live CSR for {xuid}: {live.get('csr')} {live.get('tier')}")
+        return {
+            **stats,
+            'estimated_csr': live.get('csr'),
+            'csr_tier': live.get('tier'),
+            'csr_sub_tier': live.get('sub_tier'),
+            'csr_season_max': live.get('season_max'),
+            'csr_all_time_max': live.get('all_time_max'),
+            'csr_source': 'skill.svc',
+        }
 
     # =========================================================================
     # XBOX PRIVACY
@@ -4180,6 +4418,8 @@ class HaloAPIClient:
                     selected_stats = social_stats
                 else:
                     selected_stats = overall_stats
+
+                selected_stats = await self._fill_missing_csr(xuid, stat_type, selected_stats)
 
                 # Stamp only when full history was verified: bounded fetches
                 # never proved the history is complete, so they must not let
