@@ -726,17 +726,17 @@ async def test_calculate_comprehensive_stats_bounded_fetch_stops_at_required_pag
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1041,17 +1041,17 @@ async def test_calculate_comprehensive_stats_full_history_incremental_topup(monk
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1156,17 +1156,17 @@ async def test_calculate_comprehensive_stats_full_history_without_total_hint_use
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1278,17 +1278,17 @@ async def test_calculate_comprehensive_stats_full_history_probe_detects_uncached
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1402,17 +1402,17 @@ async def test_calculate_comprehensive_stats_ignores_ambiguous_count_hint_and_pr
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1531,17 +1531,17 @@ async def test_calculate_comprehensive_stats_full_history_falls_back_when_gap_no
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1751,17 +1751,17 @@ async def test_calculate_comprehensive_stats_full_history_no_new_matches_uses_pr
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1831,17 +1831,17 @@ async def test_calculate_comprehensive_stats_new_matches_reads_summary_after_sav
     client.stats_cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -1981,17 +1981,17 @@ async def test_incomplete_cache_forces_refetch_instead_of_bounded_short_circuit(
     db.insert_player_match(xuid, match)
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -2202,17 +2202,17 @@ async def test_no_new_matches_stamps_freshness_and_skips_api_on_repeat(monkeypat
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None
@@ -2335,17 +2335,17 @@ def _install_fake_http(monkeypatch, page_handler):
     from src.api import client as client_module
 
     class _FakeRateLimiter:
-        async def wait_if_needed(self, force_account=None):
+        async def wait_if_needed(self, force_account=None, bucket=None):
             return 0
 
         @asynccontextmanager
-        async def slot(self, force_account=None):
+        async def slot(self, force_account=None, bucket=None):
             # The real slot() holds a semaphore permit across the request and
             # delegates pacing to wait_if_needed(). Tests care about neither,
             # but the shape has to match or callers get AttributeError - which
             # fetch_match_page swallows into _PAGE_FETCH_FAILED, so the symptom
             # is a silently empty crawl rather than a visible error.
-            yield await self.wait_if_needed(force_account)
+            yield await self.wait_if_needed(force_account, bucket)
 
         def set_backoff(self, seconds, account_index=None):
             return None

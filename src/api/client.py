@@ -52,6 +52,8 @@ from src.api.rate_limiters import (
     XboxProfileRateLimiter,
     HaloStatsRateLimiter,
     xbox_profile_rate_limiter,
+    BUCKET_MATCH_LIST,
+    BUCKET_MATCH_STATS,
     halo_stats_rate_limiter,
 )
 from src.api.utils import (
@@ -2449,7 +2451,7 @@ class HaloAPIClient:
         """
         try:
             # Apply per-account rate limiting and get the account to use
-            async with halo_stats_rate_limiter.slot() as account_index:
+            async with halo_stats_rate_limiter.slot(bucket=BUCKET_MATCH_STATS) as account_index:
             
                 # Use specific account's Spartan token
                 spartan_token = self.get_next_spartan_token(account_index)
@@ -2508,7 +2510,7 @@ class HaloAPIClient:
                             # rather than slot(): we are already inside the slot
                             # taken above, so this re-paces onto a fresh account
                             # without taking (and leaking) a second permit.
-                            account_index = await halo_stats_rate_limiter.wait_if_needed()
+                            account_index = await halo_stats_rate_limiter.wait_if_needed(bucket=BUCKET_MATCH_STATS)
                             spartan_token = self.get_next_spartan_token(account_index)
                             if isinstance(spartan_token, dict) and 'token' in spartan_token:
                                 spartan_token = spartan_token['token']
@@ -2519,7 +2521,7 @@ class HaloAPIClient:
                             # Server error - retry with different account
                             if retry < max_retries - 1:
                                 await asyncio.sleep(0.3)
-                                account_index = await halo_stats_rate_limiter.wait_if_needed()
+                                account_index = await halo_stats_rate_limiter.wait_if_needed(bucket=BUCKET_MATCH_STATS)
                                 spartan_token = self.get_next_spartan_token(account_index)
                                 if isinstance(spartan_token, dict) and 'token' in spartan_token:
                                     spartan_token = spartan_token['token']
@@ -2725,7 +2727,7 @@ class HaloAPIClient:
                 matches_url = f"https://halostats.svc.halowaypoint.com/hi/players/xuid({xuid})/matches?start=0&count=1"
                 
                 # Get account and headers
-                async with halo_stats_rate_limiter.slot() as account_index:
+                async with halo_stats_rate_limiter.slot(bucket=BUCKET_MATCH_LIST) as account_index:
                     spartan_token = self.get_next_spartan_token(account_index)
                     if not spartan_token:
                         return (False, None)
@@ -2815,7 +2817,7 @@ class HaloAPIClient:
         try:
             stats_url = f"https://halostats.svc.halowaypoint.com/hi/matches/{match_id}/stats"
             
-            async with halo_stats_rate_limiter.slot() as account_index:
+            async with halo_stats_rate_limiter.slot(bucket=BUCKET_MATCH_STATS) as account_index:
                 spartan_token = self.get_next_spartan_token(account_index)
                 if isinstance(spartan_token, dict) and 'token' in spartan_token:
                     spartan_token = spartan_token['token']
@@ -3006,7 +3008,7 @@ class HaloAPIClient:
                 
                 try:
                     # Apply per-account rate limiting and get the account to use
-                    async with halo_stats_rate_limiter.slot(force_account) as account_index:
+                    async with halo_stats_rate_limiter.slot(force_account, bucket=BUCKET_MATCH_LIST) as account_index:
                     
                         # Get headers for the specific account
                         headers = get_headers_for_account(account_index)
@@ -3238,7 +3240,7 @@ class HaloAPIClient:
                             # Fetch first page payload once to get API total-count metadata if present.
                             try:
                                 first_page_url = f"https://halostats.svc.halowaypoint.com/hi/players/xuid({xuid})/matches?start=0&count={PAGE_SIZE}"
-                                async with halo_stats_rate_limiter.slot() as account_index:
+                                async with halo_stats_rate_limiter.slot(bucket=BUCKET_MATCH_LIST) as account_index:
                                     first_headers = get_headers_for_account(account_index)
                                     async with session.get(first_page_url, headers=first_headers) as first_response:
                                         if first_response.status == 200:

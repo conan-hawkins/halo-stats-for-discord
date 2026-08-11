@@ -10,6 +10,12 @@ import time
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
+# Endpoint families paced independently. Halo limits them separately and very
+# differently - see HaloStatsRateLimiter.set_bucket_rate for the measurements.
+BUCKET_MATCH_LIST = "match_list"    # /matches?start=..  - the tighter one
+BUCKET_MATCH_STATS = "match_stats"  # /matches/{id}/stats - the roomier one
+DEFAULT_BUCKET = "default"
+
 
 class XboxProfileRateLimiter:
     """
@@ -178,11 +184,20 @@ class HaloStatsRateLimiter:
         self.base_rate = requests_per_second_per_account
         self.num_accounts = 1  # Will be updated when accounts are loaded
         self._semaphore: Optional[asyncio.Semaphore] = None  # Created when accounts are set
-        # Monotonic timestamp of the next permitted send per account. This, not
-        # _account_last_request, is what actually paces: it is advanced at CLAIM
-        # time, so a caller that is still sleeping has already consumed its slot
-        # and the next caller is handed a later one.
-        self._next_free: Dict[int, float] = {}
+        # Monotonic timestamp of the next permitted send, keyed by
+        # (bucket, account). This, not _account_last_request, is what actually
+        # paces: it is advanced at CLAIM time, so a caller that is still
+        # sleeping has already consumed its slot and the next caller is handed
+        # a later one.
+        #
+        # Keyed by BUCKET because Halo's endpoints do not share a limit. The
+        # match-stats endpoint serves 50 req/s clean; the matches-list endpoint
+        # 429s half its requests at 30 and peaks around 15. One global rate has
+        # to satisfy the tighter of the two, which throttles the endpoint that
+        # is 87% of a crawl to protect the one that is 13%.
+        self._next_free: Dict[tuple, float] = {}
+        # Per-bucket requests/sec/account; falls back to base_rate.
+        self._bucket_rates: Dict[str, float] = {}
         self._account_last_request: Dict[int, float] = {}  # Per-account last request time
         self._account_backoff: Dict[int, float] = {}  # Per-account backoff until timestamp
         self.lock = asyncio.Lock()
@@ -210,8 +225,6 @@ class HaloStatsRateLimiter:
                 self._account_last_request[i] = 0.0
             if i not in self._account_backoff:
                 self._account_backoff[i] = 0.0
-            if i not in self._next_free:
-                self._next_free[i] = 0.0
         print(f"📊 Rate limiter updated: {self.num_accounts} accounts = {max_concurrent} max concurrent requests")
     
     @property
@@ -225,6 +238,22 @@ class HaloStatsRateLimiter:
         # Each account can do base_rate requests per second
         # e.g., 8 req/sec = 0.125s between requests per account
         return 1.0 / self.base_rate
+
+    def set_bucket_rate(self, bucket: str, requests_per_second_per_account: float) -> None:
+        """Give one endpoint family its own pace.
+
+        Buckets exist because Halo's endpoints are limited independently, and
+        measured very differently: match-stats served 60/60 requests clean at
+        15, 30 AND 50 req/s, while matches-list 429'd 50% of requests at 30 and
+        was fastest overall at 15 - slower settings beat faster ones there
+        because the retry churn costs more than the pacing saves.
+        """
+        self._bucket_rates[bucket] = float(requests_per_second_per_account)
+
+    def min_interval_for(self, bucket: Optional[str]) -> float:
+        """Minimum gap between requests on one account within one bucket."""
+        rate = self._bucket_rates.get(bucket or DEFAULT_BUCKET, self.base_rate)
+        return 1.0 / rate if rate > 0 else 0.0
     
     def get_best_account(self) -> int:
         """
@@ -250,7 +279,8 @@ class HaloStatsRateLimiter:
         
         return best_account
     
-    async def wait_if_needed(self, account_index: Optional[int] = None) -> int:
+    async def wait_if_needed(self, account_index: Optional[int] = None,
+                             bucket: Optional[str] = None) -> int:
         """
         Claim this account's next send slot, waiting until it comes due.
 
@@ -276,7 +306,7 @@ class HaloStatsRateLimiter:
         Returns:
             The account index to use for this request.
         """
-        send_at, selected_index = await self._claim_send_slot(account_index)
+        send_at, selected_index = await self._claim_send_slot(account_index, bucket)
 
         delay = send_at - time.monotonic()
         if delay > 0:
@@ -284,7 +314,8 @@ class HaloStatsRateLimiter:
 
         return selected_index
 
-    async def _claim_send_slot(self, account_index: Optional[int] = None):
+    async def _claim_send_slot(self, account_index: Optional[int] = None,
+                               bucket: Optional[str] = None):
         """Reserve the next send slot atomically. Returns (send_at, account).
 
         `send_at` is a monotonic deadline. Backoffs are wall-clock (set_backoff
@@ -297,24 +328,32 @@ class HaloStatsRateLimiter:
             now_wall = time.time()
             now_mono = time.monotonic()
 
+            key_bucket = bucket or DEFAULT_BUCKET
             global_remaining = max(0.0, self._global_backoff_until - now_wall)
-            selected_index = self._select_account(account_index, now_wall, now_mono)
+            selected_index = self._select_account(
+                account_index, now_wall, now_mono, key_bucket
+            )
+            # Backoff stays per-ACCOUNT, not per-bucket: a 429 says that token
+            # is hot, and Halo's own limits are keyed to the account. Only the
+            # pacing is split.
             account_remaining = max(
                 0.0, self._account_backoff.get(selected_index, 0.0) - now_wall
             )
 
+            key = (key_bucket, selected_index)
             earliest = now_mono + max(global_remaining, account_remaining)
-            send_at = max(earliest, self._next_free.get(selected_index, 0.0))
+            send_at = max(earliest, self._next_free.get(key, 0.0))
 
             # Consume the slot now, while still holding the lock. Everything
             # above is a read; this is the line that makes the claim exclusive.
-            self._next_free[selected_index] = send_at + self.min_interval_per_account
+            self._next_free[key] = send_at + self.min_interval_for(key_bucket)
             self._account_last_request[selected_index] = now_wall
 
         return send_at, selected_index
 
     def _select_account(
-        self, account_index: Optional[int], now_wall: float, now_mono: float
+        self, account_index: Optional[int], now_wall: float, now_mono: float,
+        bucket: str = DEFAULT_BUCKET
     ) -> int:
         """Pick the account whose next slot comes soonest. Caller holds the lock.
 
@@ -339,7 +378,8 @@ class HaloStatsRateLimiter:
                 0.0, self._account_backoff.get(idx, 0.0) - now_wall
             )
             available_at = max(
-                now_mono + backoff_remaining, self._next_free.get(idx, 0.0)
+                now_mono + backoff_remaining,
+                self._next_free.get((bucket, idx), 0.0),
             )
             if best_at is None or available_at < best_at:
                 best_at = available_at
@@ -347,7 +387,8 @@ class HaloStatsRateLimiter:
         return best_index
 
     @asynccontextmanager
-    async def slot(self, account_index: Optional[int] = None):
+    async def slot(self, account_index: Optional[int] = None,
+                   bucket: Optional[str] = None):
         """Hold a concurrency permit for the whole request. Use this to fetch.
 
             async with halo_stats_rate_limiter.slot() as account:
@@ -388,7 +429,7 @@ class HaloStatsRateLimiter:
             if task is not None:
                 self._permit_holders.add(task)
         try:
-            yield await self.wait_if_needed(account_index)
+            yield await self.wait_if_needed(account_index, bucket)
         finally:
             if not reentrant:
                 if task is not None:
@@ -422,21 +463,22 @@ class HaloStatsRateLimiter:
 # =============================================================================
 xbox_profile_rate_limiter = XboxProfileRateLimiter()
 
-# 6 req/sec per account = 30/sec across the deployed 5 accounts.
+# Base rate for anything without its own bucket. Deliberately the conservative
+# of the two measured endpoints.
+halo_stats_rate_limiter = HaloStatsRateLimiter(requests_per_second_per_account=3)
+
+# Per-endpoint pacing, from measurement rather than guesswork. Halo limits these
+# independently, so one global rate had to satisfy the tighter of the two and
+# throttled the endpoint that is 87% of a crawl to protect the one that is 13%.
 #
-# Raised from 3 on evidence, not optimism. The match-stats endpoint is ~87% of a
-# crawl's requests, and a read-only sweep of it returned 60/60 HTTP 200 at each
-# of 15, 30 and 50 req/s - zero 429s at any of them. A 1154-match crawl had
-# already sustained 15/s with no 429s at all.
+# matches-list, 40 pages, effective throughput by configured rate:
+#     30/s -> 4.33 pages/s, 50% of requests 429
+#     15/s -> 6.92 pages/s, 16% 429      <- best; retry churn dominates above it
+#     10/s -> 5.70 pages/s, 29% 429
+#      5/s -> 4.86 pages/s,  0% 429      <- no 429s, but we are the bottleneck
 #
-# Deliberately NOT set to the 50/s that also measured clean. These are real Xbox
-# accounts and the downside of being wrong is losing them, not a slow page, so
-# this takes the 2x that is well inside measured-safe territory rather than the
-# 3.3x at the edge of it.
-#
-# The matches-LIST endpoint is the tighter of the two and does 429 at these
-# rates - but only ~13% of a crawl's requests, and since the backoff now honours
-# the server's own `Retry-After: 1` those cost about a second each. Splitting
-# the limiter into per-endpoint buckets is the better long-term shape; this is
-# the version supported by the measurements in hand.
-halo_stats_rate_limiter = HaloStatsRateLimiter(requests_per_second_per_account=6)
+# match-stats, 60 requests per trial: 60/60 HTTP 200 at 15, 30 AND 50 req/s.
+# Set to 30, not 50: these are real Xbox accounts and the cost of being wrong
+# is losing them, so this stays inside measured-safe rather than at its edge.
+halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_LIST, 3)    # 15/s across 5 accounts
+halo_stats_rate_limiter.set_bucket_rate(BUCKET_MATCH_STATS, 6)   # 30/s across 5 accounts

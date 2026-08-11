@@ -148,3 +148,61 @@ async def test_slot_releases_permit_when_body_raises():
 
     assert limiter._semaphore._value == 5, "a raising body leaked a permit"
     assert limiter._permit_holders == set()
+
+
+@pytest.mark.asyncio
+async def test_buckets_pace_independently():
+    """Endpoints with different limits must not throttle each other.
+
+    Halo limits matches-list and match-stats separately: match-stats served
+    60/60 clean at 50 req/s, while matches-list 429'd half its requests at 30
+    and peaked around 15. A single global rate has to satisfy the tighter of
+    the two, which throttles the endpoint that is ~87% of a crawl to protect
+    the one that is ~13%.
+    """
+    from src.api.rate_limiters import BUCKET_MATCH_LIST, BUCKET_MATCH_STATS
+
+    limiter = HaloStatsRateLimiter(requests_per_second_per_account=1)
+    limiter.set_num_accounts(1)                       # one account, so pacing is visible
+    limiter.set_bucket_rate(BUCKET_MATCH_LIST, 1)     # 1.0s apart
+    limiter.set_bucket_rate(BUCKET_MATCH_STATS, 20)   # 0.05s apart
+
+    assert limiter.min_interval_for(BUCKET_MATCH_LIST) == 1.0
+    assert limiter.min_interval_for(BUCKET_MATCH_STATS) == 0.05
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    # Five fast-bucket claims must NOT be held up by the slow bucket's pace.
+    await asyncio.gather(*(limiter.wait_if_needed(bucket=BUCKET_MATCH_STATS)
+                           for _ in range(5)))
+    fast_elapsed = loop.time() - t0
+    assert fast_elapsed < 0.5, (
+        f"stats bucket paced at the list bucket's rate: {fast_elapsed:.2f}s"
+    )
+
+    # And the slow bucket still is slow - the split did not just remove pacing.
+    t1 = loop.time()
+    await asyncio.gather(*(limiter.wait_if_needed(bucket=BUCKET_MATCH_LIST)
+                           for _ in range(3)))
+    slow_elapsed = loop.time() - t1
+    assert slow_elapsed >= 1.8, f"list bucket lost its pacing: {slow_elapsed:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_bucket_backoff_is_shared_per_account():
+    """A 429 benches the ACCOUNT, not just the bucket.
+
+    The token is what Halo rate-limits, so a refusal on one endpoint is
+    evidence about the account as a whole. Only pacing is split.
+    """
+    from src.api.rate_limiters import BUCKET_MATCH_LIST, BUCKET_MATCH_STATS
+
+    limiter = HaloStatsRateLimiter(requests_per_second_per_account=1000)
+    limiter.set_num_accounts(2)
+    limiter.set_backoff(seconds=30, account_index=0)
+
+    # Even in the other bucket, account 0 is avoided while backed off.
+    picks = {await limiter.wait_if_needed(bucket=BUCKET_MATCH_STATS) for _ in range(6)}
+    assert picks == {1}, f"backed-off account used in another bucket: {picks}"
+    picks = {await limiter.wait_if_needed(bucket=BUCKET_MATCH_LIST) for _ in range(6)}
+    assert picks == {1}
