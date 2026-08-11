@@ -585,3 +585,80 @@ def test_page_listing_backoff_honours_retry_after():
 
     # No header: fall back to our own escalation, not to zero.
     assert wait_for(None, 0) == RATE_LIMIT_BASE_BACKOFF
+
+
+@pytest.mark.asyncio
+async def test_refresh_survives_the_caller_giving_up():
+    """A caller walking away must not kill the crawl.
+
+    The site aborts at 250s and the API at 235s, but a first crawl of a player
+    with thousands of matches runs far longer than either - so the request that
+    starts one always walks away from it. Awaiting a task normally forwards the
+    awaiter's cancellation into it, which killed the crawl (silently, since
+    CancelledError is a BaseException and _do_refresh only catches Exception).
+    Observed live: a 10,000-match crawl went quiet mid-run and saved nothing.
+    """
+    import asyncio
+    from src.web import internal_api
+
+    internal_api._inflight_lock = asyncio.Lock()
+    internal_api._inflight.clear()
+    internal_api._global_fetch_times.clear()
+
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def slow_refresh(gamertag, xuid):
+        started.set()
+        await asyncio.sleep(0.3)          # stands in for a long crawl
+        finished.set()
+        return {"error": 0, "cache_info": "Processed 5 matches (5 new)"}
+
+    internal_api._do_refresh = slow_refresh
+
+    caller = asyncio.create_task(internal_api._refresh_coalesced("Big", "x"))
+    await started.wait()
+    caller.cancel()                        # the browser/API gives up
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    # The crawl itself must still be running, and must still complete.
+    await asyncio.wait_for(finished.wait(), timeout=2)
+    assert finished.is_set(), "crawl was killed when its caller gave up"
+
+    inflight = internal_api._inflight.get("big")
+    assert inflight is not None, "a surviving crawl must stay registered"
+    await inflight
+    assert inflight.done()
+
+
+@pytest.mark.asyncio
+async def test_surviving_crawl_is_not_duplicated_by_the_next_caller():
+    """The in-flight entry must outlive a cancelled awaiter, or the next
+    request starts a second crawl of the same player alongside the first."""
+    import asyncio
+    from src.web import internal_api
+
+    internal_api._inflight_lock = asyncio.Lock()
+    internal_api._inflight.clear()
+    internal_api._global_fetch_times.clear()
+
+    starts = []
+
+    async def slow_refresh(gamertag, xuid):
+        starts.append(gamertag)
+        await asyncio.sleep(0.3)
+        return {"error": 0, "cache_info": "Processed 1 matches (1 new)"}
+
+    internal_api._do_refresh = slow_refresh
+
+    first = asyncio.create_task(internal_api._refresh_coalesced("Big", "x"))
+    await asyncio.sleep(0.05)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    # A second caller arrives while the first crawl is still going.
+    second = await internal_api._refresh_coalesced("Big", "x")
+    assert second["error"] == 0
+    assert starts == ["Big"], f"crawl started {len(starts)} times: {starts}"

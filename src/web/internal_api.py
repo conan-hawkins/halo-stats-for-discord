@@ -89,6 +89,23 @@ async def _do_refresh(gamertag: str, xuid: str | None) -> dict:
             return {"error": 4, "message": f"Refresh failed: {e}"}
 
 
+def _log_refresh_task_end(task: asyncio.Task) -> None:
+    """Say something when a refresh ends abnormally.
+
+    _do_refresh catches Exception, but CancelledError is a BaseException and
+    slips straight past it, so a cancelled crawl used to vanish with no log at
+    all - the bot simply went quiet mid-crawl and nothing was ever saved. A
+    background task that can die silently is a background task you cannot
+    debug.
+    """
+    if task.cancelled():
+        print("⚠ Refresh task was CANCELLED before it finished - nothing saved.")
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"⚠ Refresh task died with {type(exc).__name__}: {exc}")
+
+
 async def _refresh_coalesced(gamertag: str, xuid: str | None) -> dict:
     """One in-flight fetch per gamertag; concurrent callers await the same task.
     The global fetch cap is consumed only when a NEW fetch is actually started,
@@ -102,12 +119,24 @@ async def _refresh_coalesced(gamertag: str, xuid: str | None) -> dict:
             if not _fetch_cap_ok_and_consume():
                 return {"_rate_limited": True}
             task = asyncio.create_task(_do_refresh(gamertag, xuid))
+            task.add_done_callback(_log_refresh_task_end)
             _inflight[key] = task
     try:
-        return await task
+        # SHIELDED. Awaiting a task normally forwards the awaiter's
+        # cancellation into it, so a caller giving up would kill the crawl -
+        # and with coalescing, kill it for every other caller too. The website
+        # aborts at 250s and the API at 235s, while a first crawl of a player
+        # with ~10,000 matches takes far longer than either, so the request
+        # that starts such a crawl is guaranteed to walk away from it. It has
+        # to keep running: the whole "it may still finish in the background"
+        # contract, and the site's "Still updating..." state, depend on it.
+        return await asyncio.shield(task)
     finally:
         async with _inflight_lock:
-            if _inflight.get(key) is task:
+            # Only retire it if it really finished. Popping a still-running
+            # task would let the next caller start a SECOND crawl of the same
+            # player alongside the first.
+            if _inflight.get(key) is task and task.done():
                 _inflight.pop(key, None)
 
 
