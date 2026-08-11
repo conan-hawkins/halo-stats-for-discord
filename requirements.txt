@@ -11,13 +11,11 @@
 #     docker compose exec bot pip freeze
 #
 # Deliberately NOT included, because they are absent from the running image too:
-#   pillow      - medal sprite-sheet cropping (src/api/medal_icons.py)
 #   matplotlib  - social-graph plots
 #   networkx    - social-graph analysis
-# All three are imported lazily INSIDE functions, so the bot starts and runs
-# without them; only those specific features raise ImportError. Adding them is a
-# behaviour change and should be a separate, deliberate commit - not something
-# bundled into the containerisation.
+# Both are imported lazily INSIDE functions, so the bot starts and runs without
+# them; only those features raise ImportError. Adding them is a behaviour change
+# and belongs in its own commit, not bundled into the containerisation.
 
 # --- direct ---
 discord.py==2.7.1
@@ -28,6 +26,16 @@ python-dotenv==1.2.2
 # otherwise try to `pip install` it into the container at runtime, which fails
 # as a non-root user.
 portalocker==3.2.0
+
+# ADDED - not present in the pre-container image. Medal sprite-sheet cropping
+# (src/api/medal_icons.py) imports it lazily, so its absence was silent: icon
+# warming raised ImportError on every on_ready and /mnt/hdd/halo-bot/data/
+# medal_icons/ has 0 PNGs as a result. The website serves those files from
+# GET /api/medals/{id}/icon.png, so without this the medals page is permanently
+# text-only. cp311 manylinux wheel exists, so no compiler is needed.
+# On first startup after this lands, the bot downloads the Waypoint sheet once
+# and crops ~150 icons.
+pillow==12.1.1
 
 # --- transitive ---
 aiohappyeyeballs==2.7.1
