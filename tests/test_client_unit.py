@@ -2821,3 +2821,93 @@ async def test_visibility_not_checked_when_history_exists(monkeypatch):
     assert result["error"] == 0
     assert called == [], "privacy check should not run when matches were found"
     assert result["history_visibility"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pages,max_requests", [
+    (4, 10),     # 83-match player: was 25 requests, 21 of them past the end
+    (10, 22),
+])
+async def test_short_history_does_not_fan_out_to_full_width(monkeypatch, pages, max_requests):
+    """A short history must not pay for the full 25-page window.
+
+    The crawl cannot size itself up front - the endpoint returns no total at any
+    offset - so it discovers the end by asking. It should ask in widening
+    rounds rather than opening at max_in_flight, or a 4-page player spends 21
+    requests on matches that do not exist.
+    """
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]   # max_in_flight 25
+
+    def page_handler(start):
+        page_num = start // 25
+        if page_num >= pages:
+            return 200, []
+        return 200, [{"MatchId": f"m{page_num}-{j}"} for j in range(25)]
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    # Every real page was still read - the saving must not cost coverage.
+    assert len({s // 25 for s in starts if s // 25 < pages}) == pages
+    assert len(starts) <= max_requests, (
+        f"{pages}-page history cost {len(starts)} requests: {sorted(starts)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_history_still_reaches_full_width(monkeypatch):
+    """The ramp must not tax players with large histories.
+
+    They are the reason the wide window exists. Slow-start costs them a few
+    round-trips of warm-up; it must not cost them throughput, and the total
+    request count must stay close to the number of pages that actually exist.
+    """
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+    pages = 60          # 1500 matches
+
+    def page_handler(start):
+        page_num = start // 25
+        if page_num >= pages:
+            return 200, []
+        return 200, [{"MatchId": f"m{page_num}-{j}"} for j in range(25)]
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    # All 60 real pages read...
+    assert len({s // 25 for s in starts if s // 25 < pages}) == pages
+    # ...and the overshoot past the end stays bounded by the window, not by a
+    # second full-width fan-out.
+    overshoot = len([s for s in starts if s // 25 >= pages])
+    assert overshoot <= 25, f"overshoot {overshoot} exceeds max_in_flight"
+    assert len(starts) <= pages + 25

@@ -83,6 +83,19 @@ from src.api.xuid_cache import (
 # _PAGE_FETCH_FAILED` before any truthiness / len() check.
 _PAGE_FETCH_FAILED = object()
 
+# How many page listings the full crawl asks for before it has any evidence of
+# how long the history is. It doubles from here, up to max_in_flight.
+#
+# The endpoint returns no total at ANY offset - the payload is only
+# {Start, Count, ResultCount, Links}, where Count is the page size we asked for
+# and ResultCount is the size of the page returned (verified live). So the crawl
+# cannot size itself up front and has to discover the end by asking.
+#
+# 4 is one round-trip per account at the deployed 5 accounts, minus the page
+# already spent on page 0. Low enough that a short history wastes almost
+# nothing, high enough that a long one is at full width within ~3 rounds.
+SLOW_START_PAGES = 4
+
 
 # =============================================================================
 # HALO API CLIENT
@@ -3441,17 +3454,48 @@ class HaloAPIClient:
                             if bounded_fetch and len(all_matches) >= matches_to_process:
                                 got_empty_page = True
 
-                    # Only now, knowing there IS more history, open the throttle.
+                    # --- ramp the window, don't jump to it --------------------
+                    # Knowing there IS more history says nothing about how much.
+                    # Opening straight to max_in_flight (25 at 5 accounts) asks
+                    # for matches 100-625 of a player who might have 83: measured
+                    # on an 83-match crawl, 21 of the 25 page requests were aimed
+                    # past the end, 14 of them came back 429, and the resulting
+                    # backoff was ~70 of the run's 79.8 seconds.
+                    #
+                    # So widen only on evidence, TCP slow-start style: begin
+                    # narrow and double after every round in which every page came
+                    # back full. A short history stops the growth almost at once;
+                    # a long one reaches full width in ~3 rounds, which costs
+                    # about a second on a crawl that runs for minutes - and it
+                    # avoids the cold-start burst that provokes 429s for large
+                    # histories too, so it is not a straight trade.
+                    window = min(SLOW_START_PAGES, max_in_flight)
+                    round_remaining = 0
+                    # Spans the whole round, not one asyncio.wait() return:
+                    # FIRST_COMPLETED wakes as soon as any single page lands, so a
+                    # per-wake flag would be reset before the round finished and
+                    # the window would widen on partial evidence.
+                    round_all_full = True
+
+                    def _enqueue_up_to_window():
+                        """Top the queue up to `window`. Returns pages started."""
+                        nonlocal current_page
+                        started = 0
+                        while (len(pending_tasks) < window
+                               and current_page < max_pages
+                               and not got_empty_page):
+                            pending_tasks.add(asyncio.create_task(fetch_and_track(current_page)))
+                            current_page += 1
+                            started += 1
+                        return started
+
                     if not got_empty_page and not got_401_error:
-                        for i in range(1, min(max_in_flight, max_pages)):
-                            task = asyncio.create_task(fetch_and_track(i))
-                            pending_tasks.add(task)
-                            current_page = i + 1
+                        round_remaining = _enqueue_up_to_window()
 
                     # Process with rolling queue - as one completes, start another
                     while pending_tasks:
                         done, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
-                        
+
                         for task in done:
                             page_num, page = task.result()
 
@@ -3463,32 +3507,49 @@ class HaloAPIClient:
                                 # this as end-of-history: record it for the repair
                                 # pass and keep enqueuing subsequent pages so a
                                 # single transient failure can't truncate the crawl.
+                                #
+                                # It does not count as evidence of more history
+                                # either, so it must not widen the window - but it
+                                # must not stall the ramp forever, hence it only
+                                # withholds the growth for this round.
                                 failed_page_nums.append(page_num)
-                                if current_page < max_pages and not got_empty_page:
-                                    new_task = asyncio.create_task(fetch_and_track(current_page))
-                                    pending_tasks.add(new_task)
-                                    current_page += 1
+                                round_all_full = False
                             elif page and len(page) > 0:
                                 all_matches.extend(page)
+
+                                # A short page is NOT end-of-history here (see the
+                                # comment on the first-page handler), but it is not
+                                # evidence to widen on either.
+                                if len(page) < PAGE_SIZE:
+                                    round_all_full = False
 
                                 # For bounded requests, stop enqueuing once enough matches are gathered.
                                 if bounded_fetch and len(all_matches) >= matches_to_process:
                                     got_empty_page = True
-
-                                # Start next page request immediately
-                                if current_page < max_pages and not got_empty_page:
-                                    new_task = asyncio.create_task(fetch_and_track(current_page))
-                                    pending_tasks.add(new_task)
-                                    current_page += 1
                             else:
                                 # Genuine empty page - real end of history, stop starting new requests
                                 got_empty_page = True
+                                round_all_full = False
+
+                            round_remaining -= 1
 
                         if got_401_error:
                             # Cancel remaining tasks
                             for t in pending_tasks:
                                 t.cancel()
                             break
+
+                        # Widen only when a whole round came back full, i.e. the
+                        # history demonstrably extends past everything requested.
+                        if round_remaining <= 0:
+                            if round_all_full and not got_empty_page:
+                                window = min(window * 2, max_in_flight)
+                            round_remaining = 0
+                            round_all_full = True          # start the next round clean
+                            round_remaining = _enqueue_up_to_window()
+                        else:
+                            # Mid-round: keep the pipe full without widening.
+                            round_remaining += _enqueue_up_to_window()
 
                         # Progress update
                         if len(all_matches) % 500 == 0 and len(all_matches) > 0:
