@@ -3276,18 +3276,73 @@ class HaloAPIClient:
 
                     # Use asyncio queue for rolling concurrency
                     pending_tasks = set()
-                    
+
                     async def fetch_and_track(page_num):
                         """Fetch a page and return (page_num, results)"""
                         results = await fetch_match_page(session, page_num * PAGE_SIZE, PAGE_SIZE)
                         return page_num, results
-                    
-                    # Start initial batch of requests
-                    for i in range(min(max_in_flight, max_pages)):
-                        task = asyncio.create_task(fetch_and_track(i))
-                        pending_tasks.add(task)
-                    current_page = max_in_flight
-                    
+
+                    # --- page 0 goes out ALONE, before the rolling queue ------
+                    # Seeding the queue with max_in_flight pages up front asks
+                    # "what is on page 600?" before knowing whether page 0 has
+                    # anything at all. For a player with no visible history that
+                    # is 25 simultaneous requests, ~20 of which 429; each then
+                    # burns its own 30/60/120s ladder AND writes a shared
+                    # per-account backoff that every other caller then waits on.
+                    # Measured: ~92s of self-inflicted rate limiting to discover
+                    # a player has zero matches. One cheap request answers it.
+                    #
+                    # It also makes the short-history case free: a player with
+                    # fewer than PAGE_SIZE matches is fully read by this request.
+                    current_page = 1
+                    if max_pages <= 0:
+                        # Caller asked for zero matches. Not the same as "no
+                        # history" - do not let it look like one.
+                        got_empty_page = True
+                    else:
+                        first_page = await fetch_match_page(session, 0, PAGE_SIZE)
+
+                        if first_page is None:
+                            got_401_error = True
+                        elif first_page is _PAGE_FETCH_FAILED:
+                            # Page 0 exhausted every retry and account rotation,
+                            # so the endpoint is not merely slow. Crawling 24 more
+                            # pages into that would add load and still be unusable.
+                            #
+                            # Abandon the crawl WITHOUT queueing page 0 for repair:
+                            # a repair that succeeded would hand us page 0 alone
+                            # and we would save 25 matches as though that were the
+                            # whole history. Marking the cache incomplete instead
+                            # makes the next full-history check re-crawl.
+                            print("Page 0 fetch failed after retries; abandoning crawl and marking cache incomplete")
+                            page_fetch_incomplete = True
+                            got_empty_page = True
+                        elif not first_page:
+                            # 200 with no results. Note "visible": a private
+                            # account is byte-identical to a player with no games
+                            # at this endpoint, so this is NOT yet proof of an
+                            # empty history - only that we cannot see one.
+                            got_empty_page = True
+                            print("First page empty - no visible match history, skipping crawl")
+                        else:
+                            all_matches.extend(first_page)
+                            # Deliberately NOT treating a short page as
+                            # end-of-history here. The incremental path does
+                            # (reached_history_end on len(page) < PAGE_SIZE), but
+                            # the full crawl stops only on a genuinely EMPTY page
+                            # so that a short page mid-history cannot silently
+                            # truncate it - see
+                            # test_full_crawl_page_failure_does_not_truncate.
+                            if bounded_fetch and len(all_matches) >= matches_to_process:
+                                got_empty_page = True
+
+                    # Only now, knowing there IS more history, open the throttle.
+                    if not got_empty_page and not got_401_error:
+                        for i in range(1, min(max_in_flight, max_pages)):
+                            task = asyncio.create_task(fetch_and_track(i))
+                            pending_tasks.add(task)
+                            current_page = i + 1
+
                     # Process with rolling queue - as one completes, start another
                     while pending_tasks:
                         done, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)

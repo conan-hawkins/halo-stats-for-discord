@@ -2467,3 +2467,108 @@ async def test_incomplete_cache_unknown_gap_forces_full_recrawl(monkeypatch, tmp
     assert max(starts) >= 50
     # The re-crawl completed cleanly (no gap), clearing the incomplete flag.
     assert client.stats_cache.load_player_stats(xuid, "overall", "G")["incomplete_data"] is False
+
+
+@pytest.mark.asyncio
+async def test_empty_first_page_costs_exactly_one_request(monkeypatch):
+    """A player with no VISIBLE match history must cost one request, not a fan-out.
+
+    Regression test for the 429 storm: the full crawl used to seed the rolling
+    queue with max_in_flight (25, at 5 accounts) pages before knowing whether
+    page 0 had anything, so a player with no visible history fired ~25 requests
+    at once. Most 429'd, each then burned its own 30/60/120s backoff ladder AND
+    wrote a shared per-account backoff every other caller waited behind - ~92s
+    of self-inflicted rate limiting to learn the player has no matches.
+    """
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    # 5 accounts is the deployed shape, and what made max_in_flight 25.
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+
+    def page_handler(start):
+        return 200, []          # 200-with-no-results, at every offset
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert result["matches_processed"] == 0
+    # The whole point: page 0 only. No speculative pages 25..600.
+    assert starts == [0], f"expected a single request, got {len(starts)}: {starts}"
+
+
+@pytest.mark.asyncio
+async def test_non_empty_first_page_still_fans_out(monkeypatch):
+    """The single-request path must not throttle a player who DOES have history."""
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+
+    def page_handler(start):
+        page_num = start // 25
+        if page_num >= 4:
+            return 200, []
+        return 200, [{"MatchId": f"m{page_num}"}]
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert {m["match_id"] for m in result["processed_matches"]} == {"m0", "m1", "m2", "m3"}
+    # Page 0 went out alone first, then the queue opened up beyond it.
+    assert starts[0] == 0
+    assert max(starts) >= 75
+
+
+@pytest.mark.asyncio
+async def test_page_zero_hard_failure_marks_incomplete_without_crawling(monkeypatch):
+    """If page 0 fails every retry, don't crawl into a failing endpoint - and
+    don't save an empty history as though it were real."""
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+
+    def page_handler(start):
+        if start == 0:
+            return 503, []      # immediate _PAGE_FETCH_FAILED, no retry sleeps
+        return 200, [{"MatchId": f"m{start // 25}"}]
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+
+    saved = {}
+    monkeypatch.setattr(
+        client, "save_stats_cache",
+        lambda xuid, stat_type, stats_data, gamertag=None: saved.update(data=stats_data),
+    )
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert starts == [0], f"expected no crawl past the failed page 0, got {starts}"
+    # Marked incomplete so the next full-history check re-crawls from scratch,
+    # rather than treating "we couldn't read it" as "there is nothing there".
+    assert saved["data"]["incomplete_data"] is True
