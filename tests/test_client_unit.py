@@ -3027,3 +3027,51 @@ async def test_slow_start_window_reaches_full_width_under_jitter(monkeypatch, pa
         f"{pages}-page history peaked at {state['peak']} concurrent page requests, "
         f"expected {min_peak}-{max_peak}"
     )
+
+
+@pytest.mark.asyncio
+async def test_crawl_terminates_when_pages_past_the_end_refuse_instead_of_emptying(monkeypatch):
+    """A crawl must end even if the end-of-history page never returns empty.
+
+    Only a 200-with-no-results used to stop the crawl. A request past the end of
+    a history can just as easily come back 429, which is correctly NOT treated
+    as end-of-history - so the crawl kept walking toward the 999999-page
+    ceiling. Observed live on a ~10,000-match player: ten minutes and roughly
+    4,000 pages past the last real data, every one refused, never terminating.
+    """
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+    real_pages = 8
+
+    def page_handler(start):
+        page_num = start // 25
+        if page_num < real_pages:
+            return 200, [{"MatchId": f"m{page_num}-{j}"} for j in range(25)]
+        return 503, []          # past the end: refuses rather than emptying
+
+    starts = _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await asyncio.wait_for(
+        client.calculate_comprehensive_stats(
+            xuid="x", stat_type="overall", gamertag="G",
+            matches_to_process=None, force_full_fetch=False,
+        ),
+        timeout=30,
+    )
+
+    assert result["error"] == 0
+    # All real pages were still read...
+    assert len({s // 25 for s in starts if s // 25 < real_pages}) == real_pages
+    # ...and it stopped instead of marching to the ceiling.
+    assert max(starts) // 25 < 200, f"crawl ran to page {max(starts) // 25}"
+    assert len(starts) < 250, f"crawl issued {len(starts)} requests"
+

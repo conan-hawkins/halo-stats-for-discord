@@ -98,6 +98,13 @@ _PAGE_FETCH_FAILED = object()
 # nothing, high enough that a long one is at full width within ~3 rounds.
 SLOW_START_PAGES = 4
 
+# How many consecutive pages may yield nothing before the crawl concludes it has
+# run off the end of the history. Empty pages already stop it; this covers the
+# case where the pages past the end come back 429 instead, which a single
+# transient failure must not trigger - hence a run, and never fewer than the
+# current window.
+BARREN_PAGES_BEFORE_STOP = 12
+
 # Page-listing 429 backoff. Halo answers these with `Retry-After: 1` (measured
 # live), so the base is small and the server's own hint acts as a floor; the
 # exponential term only bites when it keeps refusing the same page.
@@ -3567,6 +3574,10 @@ class HaloAPIClient:
                     # 25 - a 3x throughput loss on exactly the large histories the
                     # wide window exists for.
                     consecutive_full = 0
+                    # Pages in a row that yielded nothing - empty OR failed. The
+                    # terminator for a crawl whose end-of-history page refuses
+                    # instead of coming back empty.
+                    consecutive_barren = 0
 
                     def _enqueue_up_to_window():
                         """Top the queue up to `window`. Returns pages started."""
@@ -3595,6 +3606,7 @@ class HaloAPIClient:
                                 break
                             elif page is _PAGE_FETCH_FAILED:
                                 consecutive_full = 0
+                                consecutive_barren += 1
                                 # Page listing failed after retries. Do NOT treat
                                 # this as end-of-history: record it for the repair
                                 # pass and keep enqueuing subsequent pages so a
@@ -3610,6 +3622,7 @@ class HaloAPIClient:
                                 # A short page is NOT end-of-history here (see the
                                 # comment on the first-page handler), but it is not
                                 # evidence to widen on either.
+                                consecutive_barren = 0
                                 if len(page) < PAGE_SIZE:
                                     consecutive_full = 0
                                 else:
@@ -3628,6 +3641,30 @@ class HaloAPIClient:
                             for t in pending_tasks:
                                 t.cancel()
                             break
+
+                        # An empty page is not the ONLY way to reach the end.
+                        #
+                        # Only a 200-with-no-results used to stop the crawl. But
+                        # a request past the end of the history can just as
+                        # easily come back 429, and a 429 is (correctly) not
+                        # end-of-history - so the crawl kept walking. Observed
+                        # live on a ~10,000-match player: ten minutes and 4,000
+                        # pages past the last real data, every one 429, heading
+                        # for the 999999-page ceiling and never terminating.
+                        #
+                        # A sustained run of pages yielding nothing means we are
+                        # off the end, whether they came back empty or refused.
+                        # One failure still cannot truncate a crawl - it takes a
+                        # whole window's worth in a row, and the pages are still
+                        # queued for repair, which marks the cache incomplete so
+                        # the next full check re-crawls.
+                        if (not got_empty_page
+                                and consecutive_barren >= max(BARREN_PAGES_BEFORE_STOP, window)):
+                            print(f"Stopping crawl: {consecutive_barren} consecutive pages "
+                                  f"returned no data (past end of history, or upstream "
+                                  f"refusing) - marking cache incomplete")
+                            got_empty_page = True
+                            page_fetch_incomplete = True
 
                         # Widen once the history has demonstrably extended past a
                         # full window's worth of pages. Independent of how the
