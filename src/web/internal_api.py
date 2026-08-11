@@ -158,16 +158,22 @@ async def handle_refresh(request: web.Request) -> web.Response:
         m = _CACHE_INFO_RE.search(result.get("cache_info", "") or "")
         if m:
             matches_processed, new_matches = int(m.group(1)), int(m.group(2))
-        return web.json_response(
-            {
-                "ok": True,
-                "refreshed": True,
-                "matches_processed": matches_processed,
-                "new_matches": new_matches,
-                "age_seconds": 0,
-            },
-            status=200,
-        )
+        # Only set when the history came back empty, and only to a value we
+        # actually established: "private" (Xbox says we may not view this
+        # player's game history) or "no_games" (we may, and there are none).
+        # Absent means we could not tell - the website must then stay vague
+        # rather than accuse a real account of being empty.
+        payload = {
+            "ok": True,
+            "refreshed": True,
+            "matches_processed": matches_processed,
+            "new_matches": new_matches,
+            "age_seconds": 0,
+        }
+        visibility = result.get("history_visibility")
+        if visibility in ("private", "no_games"):
+            payload["reason"] = visibility
+        return web.json_response(payload, status=200)
     if error == 2:
         return web.json_response(
             {"ok": False, "error_code": 2, "message": result.get("message", "gamertag not found")},

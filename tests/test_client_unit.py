@@ -2572,3 +2572,152 @@ async def test_page_zero_hard_failure_marks_incomplete_without_crawling(monkeypa
     # Marked incomplete so the next full-history check re-crawls from scratch,
     # rather than treating "we couldn't read it" as "there is nothing there".
     assert saved["data"]["incomplete_data"] is True
+
+
+def _install_fake_privacy(monkeypatch, status, payload):
+    """Fake the Xbox privacy permission/validate POST.
+
+    Returns the list of JSON bodies posted, so tests can assert on exactly what
+    was asked for (notably: one permission, not several).
+    """
+    from src.api import client as client_module
+
+    posted = []
+
+    class _FakePrivacySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            posted.append(json)
+            return _RepairFakeResponse(status, payload)
+
+    monkeypatch.setattr(client_module.aiohttp, "ClientSession", lambda *a, **k: _FakePrivacySession())
+    monkeypatch.setattr(client_module.aiohttp, "ClientTimeout", lambda *a, **k: object())
+    return posted
+
+
+def _privacy_payload(is_allowed, reason="NotAllowed"):
+    """Shape verified live against privacy.xboxlive.com (contract-version 2).
+
+    Note there is NO permission name echoed back - entries are positional.
+    """
+    entry = {"isAllowed": is_allowed}
+    if not is_allowed:
+        entry["reasons"] = [{"reason": reason}]
+    return {"responses": [{"user": {"xuid": "x"}, "permissions": [entry]}]}
+
+
+@pytest.mark.asyncio
+async def test_can_view_game_history_detects_private(monkeypatch):
+    client = HaloAPIClient()
+    client.xbox_accounts = [{"token": "t", "uhs": "u"}]
+    posted = _install_fake_privacy(monkeypatch, 200, _privacy_payload(False))
+
+    assert await client.can_view_game_history("2535410071175507") is False
+    # Exactly one permission: the response is positional and does not name the
+    # permission, so asking for several makes the mapping guesswork.
+    assert posted[0]["permissions"] == ["ViewTargetGameHistory"]
+
+
+@pytest.mark.asyncio
+async def test_can_view_game_history_detects_public(monkeypatch):
+    client = HaloAPIClient()
+    client.xbox_accounts = [{"token": "t", "uhs": "u"}]
+    _install_fake_privacy(monkeypatch, 200, _privacy_payload(True))
+
+    assert await client.can_view_game_history("2533274853686153") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,payload", [
+    (403, {}),                                  # upstream refused
+    (200, {}),                                  # no responses key
+    (200, {"responses": []}),                   # empty responses
+    (200, {"responses": [{"permissions": []}]}),  # no permission entries
+    (200, {"responses": [{"permissions": [{}]}]}),  # no isAllowed field
+])
+async def test_can_view_game_history_returns_none_when_unsure(monkeypatch, status, payload):
+    """Never guess. A failure must be None ("don't know"), never False
+    ("private") - accusing a real account of being private is worse than
+    showing a vaguer message."""
+    client = HaloAPIClient()
+    client.xbox_accounts = [{"token": "t", "uhs": "u"}]
+    _install_fake_privacy(monkeypatch, status, payload)
+
+    assert await client.can_view_game_history("x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visible,expected", [
+    (False, "private"),
+    (True, "no_games"),
+    (None, None),
+])
+async def test_empty_history_reports_why(monkeypatch, visible, expected):
+    """An empty history must say WHICH kind of empty it is, so the website can
+    tell 'this account is private' from 'this player has no games'."""
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+
+    _install_fake_http(monkeypatch, lambda start: (200, []))
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def _visibility(xuid):
+        return visible
+
+    monkeypatch.setattr(client, "can_view_game_history", _visibility)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert result["matches_processed"] == 0
+    assert result["history_visibility"] == expected
+
+
+@pytest.mark.asyncio
+async def test_visibility_not_checked_when_history_exists(monkeypatch):
+    """The privacy call is a real Xbox request - don't spend it on players whose
+    history we can already see."""
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.spartan_accounts = [{"token": f"t{i}"} for i in range(5)]
+
+    def page_handler(start):
+        return (200, [{"MatchId": "m0"}]) if start == 0 else (200, [])
+
+    _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    called = []
+
+    async def _visibility(xuid):
+        called.append(xuid)
+        return False
+
+    monkeypatch.setattr(client, "can_view_game_history", _visibility)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="x", stat_type="overall", gamertag="G",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert called == [], "privacy check should not run when matches were found"
+    assert result["history_visibility"] is None

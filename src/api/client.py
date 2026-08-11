@@ -1002,9 +1002,93 @@ class HaloAPIClient:
         return None
     
     # =========================================================================
+    # XBOX PRIVACY
+    # =========================================================================
+
+    async def can_view_game_history(self, xuid: str) -> Optional[bool]:
+        """Are we permitted to see this player's game history?
+
+        True = permitted, False = Xbox privacy blocks us, None = could not tell.
+
+        Exists because the Halo match-history endpoint cannot answer it. A
+        private account and a player who has genuinely never played return the
+        SAME response there - HTTP 200 with an empty Results array and
+        ResultCount 0 (verified live against both). So an empty history is not
+        evidence of an empty history, and the only way to tell them apart is to
+        ask Xbox Live directly.
+
+        Deliberately requests exactly ONE permission: the contract-version 2
+        response does NOT echo the permission name back, so entries are matched
+        to the request purely by position. Asking for one thing makes that
+        impossible to get wrong.
+
+        Never raises, and returns None rather than guessing on any failure -
+        the caller must degrade to a vaguer message, not assert "private".
+        """
+        url = "https://privacy.xboxlive.com/users/me/permission/validate"
+        payload = {"permissions": ["ViewTargetGameHistory"], "users": [{"xuid": str(xuid)}]}
+
+        release_rate_limiter = False
+        try:
+            if self.xbox_accounts:
+                account_idx = await xbox_profile_rate_limiter.acquire()
+                release_rate_limiter = True
+                account = (self.xbox_accounts[account_idx]
+                           if account_idx < len(self.xbox_accounts) else self.xbox_accounts[0])
+                xbox_token, uhs = account.get("token"), account.get("uhs")
+            else:
+                cache = safe_read_json(TOKEN_CACHE_FILE, default={})
+                xsts_xbox = cache.get("xsts_xbox") or {}
+                xbox_token, uhs = xsts_xbox.get("token"), xsts_xbox.get("uhs")
+
+            if not xbox_token or not uhs:
+                print("[PRIVACY] No Xbox Live token available; visibility unknown")
+                return None
+
+            headers = {
+                "Authorization": f"XBL3.0 x={uhs};{xbox_token}",
+                "x-xbl-contract-version": "2",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    if response.status != 200:
+                        print(f"[PRIVACY] permission/validate returned {response.status}; "
+                              f"visibility unknown")
+                        return None
+                    data = await response.json()
+
+            responses = data.get("responses") or []
+            if not responses:
+                return None
+            permissions = responses[0].get("permissions") or []
+            if not permissions:
+                return None
+
+            allowed = permissions[0].get("isAllowed")
+            if not isinstance(allowed, bool):
+                return None
+
+            if not allowed:
+                reasons = [r.get("reason") for r in (permissions[0].get("reasons") or [])]
+                print(f"[PRIVACY] Game history not viewable for xuid={xuid} "
+                      f"(reasons: {', '.join(filter(None, reasons)) or 'unspecified'})")
+            return allowed
+
+        except Exception as e:
+            print(f"[PRIVACY] Visibility check failed for xuid={xuid}: {e}")
+            return None
+        finally:
+            if release_rate_limiter:
+                xbox_profile_rate_limiter.release()
+
+    # =========================================================================
     # XBOX FRIENDS LIST
     # =========================================================================
-    
+
     async def get_friends_list(
         self, 
         xuid: str, 
@@ -3005,6 +3089,11 @@ class HaloAPIClient:
             # Marks the cache incomplete so the next full-history check re-crawls.
             page_fetch_incomplete = False
 
+            # Why an empty history is empty: "private" | "no_games" | None.
+            # None means we did not need to ask, or asking failed - callers must
+            # treat it as "don't know", never as "no_games".
+            history_visibility = None
+
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 # Decide fetching strategy: incremental vs full refetch
                 # Force full fetch ignores cache completely.
@@ -3076,8 +3165,15 @@ class HaloAPIClient:
                             # 1. Player has 0 matches (first page, valid scenario)
                             # 2. Reached end of matches (later page)
                             if page_num == 0:
-                                # First page empty = player has no match history, not an error
-                                print(f"Player has no match history")
+                                # First page empty = no VISIBLE match history.
+                                # Indistinguishable from a private account here,
+                                # so ask Xbox Live which one it actually is.
+                                print(f"Player has no visible match history")
+                                visible = await self.can_view_game_history(xuid)
+                                if visible is False:
+                                    history_visibility = "private"
+                                elif visible is True:
+                                    history_visibility = "no_games"
                                 reached_history_end = True
                                 break
                             # A later genuine empty page also means end-of-history.
@@ -3321,9 +3417,15 @@ class HaloAPIClient:
                             # 200 with no results. Note "visible": a private
                             # account is byte-identical to a player with no games
                             # at this endpoint, so this is NOT yet proof of an
-                            # empty history - only that we cannot see one.
+                            # empty history - only that we cannot see one. One
+                            # Xbox Live call settles which it is.
                             got_empty_page = True
                             print("First page empty - no visible match history, skipping crawl")
+                            visible = await self.can_view_game_history(xuid)
+                            if visible is False:
+                                history_visibility = "private"
+                            elif visible is True:
+                                history_visibility = "no_games"
                         else:
                             all_matches.extend(first_page)
                             # Deliberately NOT treating a short page as
@@ -3703,7 +3805,8 @@ class HaloAPIClient:
                     'stats': selected_stats,
                     'matches_processed': selected_stats['games_played'],
                     'new_matches': new_matches_processed,
-                    'processed_matches': all_processed_matches
+                    'processed_matches': all_processed_matches,
+                    'history_visibility': history_visibility,
                     }
                     
         except Exception as e:
@@ -3742,7 +3845,10 @@ class HaloAPIClient:
                 "stats_list": stats_list,
                 "gamertag": gamertag,
                 "stat_type": stat_type,
-                "cache_info": f"Processed {api_data.get('matches_processed', 0)} matches ({api_data.get('new_matches', 0)} new)"
+                "cache_info": f"Processed {api_data.get('matches_processed', 0)} matches ({api_data.get('new_matches', 0)} new)",
+                # "private" | "no_games" | None. Only ever set when the history
+                # came back empty; None means "we don't know", not "no games".
+                "history_visibility": api_data.get('history_visibility'),
             }
         
         return {
