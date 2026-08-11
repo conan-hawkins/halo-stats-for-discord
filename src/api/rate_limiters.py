@@ -421,4 +421,22 @@ class HaloStatsRateLimiter:
 # GLOBAL RATE LIMITER INSTANCES
 # =============================================================================
 xbox_profile_rate_limiter = XboxProfileRateLimiter()
-halo_stats_rate_limiter = HaloStatsRateLimiter(requests_per_second_per_account=3)  # 3 req/sec per account (conservative)
+
+# 6 req/sec per account = 30/sec across the deployed 5 accounts.
+#
+# Raised from 3 on evidence, not optimism. The match-stats endpoint is ~87% of a
+# crawl's requests, and a read-only sweep of it returned 60/60 HTTP 200 at each
+# of 15, 30 and 50 req/s - zero 429s at any of them. A 1154-match crawl had
+# already sustained 15/s with no 429s at all.
+#
+# Deliberately NOT set to the 50/s that also measured clean. These are real Xbox
+# accounts and the downside of being wrong is losing them, not a slow page, so
+# this takes the 2x that is well inside measured-safe territory rather than the
+# 3.3x at the edge of it.
+#
+# The matches-LIST endpoint is the tighter of the two and does 429 at these
+# rates - but only ~13% of a crawl's requests, and since the backoff now honours
+# the server's own `Retry-After: 1` those cost about a second each. Splitting
+# the limiter into per-endpoint buckets is the better long-term shape; this is
+# the version supported by the measurements in hand.
+halo_stats_rate_limiter = HaloStatsRateLimiter(requests_per_second_per_account=6)
