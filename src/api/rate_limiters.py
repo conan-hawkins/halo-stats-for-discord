@@ -7,6 +7,7 @@ accessing Xbox Profile and Halo Stats APIs.
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 
@@ -139,29 +140,51 @@ class HaloStatsRateLimiter:
     has its own rate limit window, allowing parallel requests across different
     accounts while respecting individual account limits.
     
+    Two separate limits, enforced by two separate mechanisms:
+
+      RATE  - `wait_if_needed()` claims a per-account send slot. Claiming writes
+              the reservation back under the lock BEFORE sleeping, so N callers
+              get N distinct send times instead of all waiting for the same one.
+      COUNT - `slot()` holds a semaphore permit for the whole request. This is
+              the only correct way to bound in-flight requests; a permit taken
+              and dropped inside `wait_if_needed()` bounds nothing, because the
+              request has not happened yet when it is dropped.
+
+    Callers issuing a request MUST use `slot()`. `wait_if_needed()` on its own
+    only paces - see its docstring.
+
     Attributes:
         base_rate (int): Base requests per second per account
         num_accounts (int): Number of authenticated accounts
-        _semaphore (asyncio.Semaphore): Controls concurrent requests
-        _account_last_request (dict): Per-account last request timestamps
+        _semaphore (asyncio.Semaphore): Bounds in-flight requests, via slot()
+        _next_free (dict): Per-account monotonic time the next send may go out
+        _account_last_request (dict): Per-account last claim time (observability)
         _account_backoff (dict): Per-account backoff timestamps (after 429)
     """
     def __init__(self, requests_per_second_per_account: int = 10):
         """
         Initialize the rate limiter.
-        
+
         Args:
             requests_per_second_per_account: Base rate limit per account
         """
         self.base_rate = requests_per_second_per_account
         self.num_accounts = 1  # Will be updated when accounts are loaded
         self._semaphore: Optional[asyncio.Semaphore] = None  # Created when accounts are set
+        # Monotonic timestamp of the next permitted send per account. This, not
+        # _account_last_request, is what actually paces: it is advanced at CLAIM
+        # time, so a caller that is still sleeping has already consumed its slot
+        # and the next caller is handed a later one.
+        self._next_free: Dict[int, float] = {}
         self._account_last_request: Dict[int, float] = {}  # Per-account last request time
         self._account_backoff: Dict[int, float] = {}  # Per-account backoff until timestamp
         self.lock = asyncio.Lock()
         self._global_backoff_until = 0.0  # Global backoff (all accounts hit limit)
         self._current_account_index = 0  # For selecting accounts
-    
+        # Tasks currently holding a semaphore permit, so a nested slot() in the
+        # same task reuses it instead of deadlocking on a second one.
+        self._permit_holders: set = set()
+
     def set_num_accounts(self, num_accounts: int) -> None:
         """
         Update the number of accounts for rate limit scaling.
@@ -180,6 +203,8 @@ class HaloStatsRateLimiter:
                 self._account_last_request[i] = 0.0
             if i not in self._account_backoff:
                 self._account_backoff[i] = 0.0
+            if i not in self._next_free:
+                self._next_free[i] = 0.0
         print(f"📊 Rate limiter updated: {self.num_accounts} accounts = {max_concurrent} max concurrent requests")
     
     @property
@@ -220,119 +245,153 @@ class HaloStatsRateLimiter:
     
     async def wait_if_needed(self, account_index: Optional[int] = None) -> int:
         """
-        Apply rate limiting before making a request.
-        
+        Claim this account's next send slot, waiting until it comes due.
+
+        PACING ONLY - this does not bound concurrency and never touches the
+        semaphore. A caller that is about to issue a request must go through
+        `slot()`, which holds a permit across the request itself.
+
+        The claim is written back under the lock BEFORE the wait, which is the
+        whole point. The previous implementation read the account's last-send
+        time in one locked block and stamped it in a LATER one, with the sleep
+        in between - so every caller that arrived before the first one stamped
+        read the same stale timestamp, computed the same delay, and woke up
+        together. Measured: 20 of 25 callers issued within the same 0.1ms, all
+        on one account. Reserving up front means N callers get N distinct slots.
+
+        The sleep stays OUTSIDE the lock: holding it across an await would
+        serialise every other caller behind this one's cooldown.
+
         Args:
-            account_index: Optional specific account to use. If None, selects best available.
-        
+            account_index: Preferred account. Honoured when it is not in
+                backoff; otherwise the soonest-available account is used.
+
         Returns:
-            The account index that should be used for this request.
+            The account index to use for this request.
         """
-        # Create default semaphore if not initialized
+        send_at, selected_index = await self._claim_send_slot(account_index)
+
+        delay = send_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        return selected_index
+
+    async def _claim_send_slot(self, account_index: Optional[int] = None):
+        """Reserve the next send slot atomically. Returns (send_at, account).
+
+        `send_at` is a monotonic deadline. Backoffs are wall-clock (set_backoff
+        uses time.time(), and callers/tests depend on that), so they are
+        converted to a remaining duration here and folded into the monotonic
+        timeline. Durations must never be measured on the wall clock: an NTP
+        step would otherwise skew every pending wait.
+        """
+        async with self.lock:
+            now_wall = time.time()
+            now_mono = time.monotonic()
+
+            global_remaining = max(0.0, self._global_backoff_until - now_wall)
+            selected_index = self._select_account(account_index, now_wall, now_mono)
+            account_remaining = max(
+                0.0, self._account_backoff.get(selected_index, 0.0) - now_wall
+            )
+
+            earliest = now_mono + max(global_remaining, account_remaining)
+            send_at = max(earliest, self._next_free.get(selected_index, 0.0))
+
+            # Consume the slot now, while still holding the lock. Everything
+            # above is a read; this is the line that makes the claim exclusive.
+            self._next_free[selected_index] = send_at + self.min_interval_per_account
+            self._account_last_request[selected_index] = now_wall
+
+        return send_at, selected_index
+
+    def _select_account(
+        self, account_index: Optional[int], now_wall: float, now_mono: float
+    ) -> int:
+        """Pick the account whose next slot comes soonest. Caller holds the lock.
+
+        Ties cannot persist: claiming an account pushes its _next_free forward,
+        so the following caller sees a different soonest account and the load
+        spreads by construction. The old "longest idle wins, strict >" rule had
+        the opposite property - immediately after a burst every account was
+        equally idle, the comparison never advanced past index 0, and the whole
+        herd piled onto one account.
+        """
+        count = max(1, self.num_accounts)
+
+        if account_index is not None:
+            preferred = int(account_index) % count
+            if now_wall >= self._account_backoff.get(preferred, 0.0):
+                return preferred
+
+        best_index = 0
+        best_at = None
+        for idx in range(count):
+            backoff_remaining = max(
+                0.0, self._account_backoff.get(idx, 0.0) - now_wall
+            )
+            available_at = max(
+                now_mono + backoff_remaining, self._next_free.get(idx, 0.0)
+            )
+            if best_at is None or available_at < best_at:
+                best_at = available_at
+                best_index = idx
+        return best_index
+
+    @asynccontextmanager
+    async def slot(self, account_index: Optional[int] = None):
+        """Hold a concurrency permit for the whole request. Use this to fetch.
+
+            async with halo_stats_rate_limiter.slot() as account:
+                async with session.get(url, headers=headers_for(account)) as r:
+                    ...
+
+        The permit is taken before pacing and released only after the caller's
+        block finishes, so `num_accounts * 5` finally means what it says. The
+        previous code acquired and released inside wait_if_needed(), which
+        returns before the request is made - measured peak was 55 concurrent
+        against a cap of 25.
+
+        Re-selecting an account inside the block (a 429 retry switching
+        accounts) should call `wait_if_needed()` directly: it re-paces without
+        taking a second permit, so a retry loop cannot leak one.
+
+        RE-ENTRANT PER TASK. fetch_match_page() retries by calling itself from
+        inside its own slot, so a nested slot() in the same task must not take
+        a second permit: 25 concurrent pages each recursing 5 deep would need
+        125 permits, wait forever on 25, and deadlock the crawl. A task issues
+        one request at a time, so one permit per task is the correct unit. The
+        nested call still re-paces, it just reuses the permit it already holds.
+        """
         if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(5)
-        
-        # Acquire semaphore (limits concurrent requests)
-        await self._semaphore.acquire()
-        
+            self._semaphore = asyncio.Semaphore(max(1, self.num_accounts) * 5)
+
         try:
-            selected_index: Optional[int] = None
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
 
-            async with self.lock:
-                now = time.time()
-                global_wait = max(0.0, self._global_backoff_until - now)
+        # Fall back to non-reentrant when there is no task identity to key on.
+        reentrant = task is not None and task in self._permit_holders
 
-            if global_wait > 0:
-                print(f"⏳ Global rate limit backoff: waiting {global_wait:.1f}s...")
-                await asyncio.sleep(global_wait)
-
-            async with self.lock:
-                now = time.time()
-
-                preferred_index: Optional[int] = None
-                if account_index is not None:
-                    preferred_index = int(account_index) % max(1, self.num_accounts)
-
-                if preferred_index is not None and now >= self._account_backoff.get(preferred_index, 0):
-                    selected_index = preferred_index
-                else:
-                    selected_index = None
-                    longest_idle = float('-inf')
-                    for idx in range(self.num_accounts):
-                        if now < self._account_backoff.get(idx, 0):
-                            continue
-                        idle = now - self._account_last_request.get(idx, 0)
-                        if idle > longest_idle:
-                            longest_idle = idle
-                            selected_index = idx
-
-                account_wait = 0.0
-                if selected_index is None:
-                    # All accounts are currently in backoff.
-                    selected_index = min(
-                        range(self.num_accounts),
-                        key=lambda idx: self._account_backoff.get(idx, 0),
-                    )
-                    account_wait = max(0.0, self._account_backoff.get(selected_index, 0) - now)
-
-            if account_wait > 0:
-                print(f"⏳ All accounts in backoff, waiting {account_wait:.1f}s...")
-                await asyncio.sleep(account_wait)
-
-            async with self.lock:
-                now = time.time()
-
-                # Re-check selected account availability after wait and prefer alternatives if needed.
-                backoff_wait = 0.0
-                selected_backoff_until = self._account_backoff.get(selected_index, 0)
-                if now < selected_backoff_until:
-                    fallback_index = None
-                    longest_idle = float('-inf')
-                    for idx in range(self.num_accounts):
-                        if now < self._account_backoff.get(idx, 0):
-                            continue
-                        idle = now - self._account_last_request.get(idx, 0)
-                        if idle > longest_idle:
-                            longest_idle = idle
-                            fallback_index = idx
-                    if fallback_index is not None:
-                        selected_index = fallback_index
-                    else:
-                        backoff_wait = max(0.0, selected_backoff_until - now)
-
-                # Enforce per-account pacing; if possible, switch to an account already out of cooldown.
-                min_interval = self.min_interval_per_account
-                last_request = self._account_last_request.get(selected_index, 0.0)
-                elapsed = now - last_request
-
-                if elapsed < min_interval:
-                    replacement_index = None
-                    longest_idle = float('-inf')
-                    for idx in range(self.num_accounts):
-                        if idx == selected_index:
-                            continue
-                        if now < self._account_backoff.get(idx, 0):
-                            continue
-                        idle = now - self._account_last_request.get(idx, 0.0)
-                        if idle >= min_interval and idle > longest_idle:
-                            longest_idle = idle
-                            replacement_index = idx
-                    if replacement_index is not None:
-                        selected_index = replacement_index
-                        elapsed = now - self._account_last_request.get(selected_index, 0.0)
-
-                spacing_wait = max(backoff_wait, max(0.0, min_interval - elapsed))
-
-            if spacing_wait > 0:
-                await asyncio.sleep(spacing_wait)
-
-            async with self.lock:
-                self._account_last_request[selected_index] = time.time()
-                return selected_index
+        semaphore = self._semaphore
+        if not reentrant:
+            await semaphore.acquire()
+            if task is not None:
+                self._permit_holders.add(task)
+        try:
+            yield await self.wait_if_needed(account_index)
         finally:
-            # Release semaphore after request setup
-            self._semaphore.release()
-    
+            if not reentrant:
+                if task is not None:
+                    self._permit_holders.discard(task)
+                # Release the object we acquired, not self._semaphore: a
+                # concurrent set_num_accounts() swaps in a new semaphore, and
+                # releasing that one would hand out a permit nobody took.
+                semaphore.release()
+
+
     def set_backoff(self, seconds: float, account_index: Optional[int] = None) -> None:
         """
         Set a backoff period after receiving a 429 response.

@@ -2292,58 +2292,58 @@ class HaloAPIClient:
         Never raises. Always returns {'public_name', 'is_ranked', 'resolution_status'}.
         """
         try:
-            account_index = await halo_stats_rate_limiter.wait_if_needed()
-            spartan_token = self.get_next_spartan_token(account_index)
-            if isinstance(spartan_token, dict) and 'token' in spartan_token:
-                spartan_token = spartan_token['token']
+            async with halo_stats_rate_limiter.slot() as account_index:
+                spartan_token = self.get_next_spartan_token(account_index)
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
 
-            headers = {
-                "Authorization": f"Spartan {spartan_token}",
-                "x-343-authorization-spartan": spartan_token,
-                "User-Agent": self.user_agent,
-                "Accept": "application/json",
-            }
-            # Not required (confirmed 200 without it live) but sent
-            # opportunistically for consistency with get_player_stats' headers.
-            if self.clearance_token and self.clearance_token != "skip":
-                headers["x-343-authorization-clearance"] = self.clearance_token
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json",
+                }
+                # Not required (confirmed 200 without it live) but sent
+                # opportunistically for consistency with get_player_stats' headers.
+                if self.clearance_token and self.clearance_token != "skip":
+                    headers["x-343-authorization-clearance"] = self.clearance_token
 
-            urls = []
-            if version_id:
-                urls.append(f"{self.DISCOVERY_UGC_URL}/hi/playlists/{asset_id}/versions/{version_id}")
-            urls.append(f"{self.DISCOVERY_UGC_URL}/hi/playlists/{asset_id}")
+                urls = []
+                if version_id:
+                    urls.append(f"{self.DISCOVERY_UGC_URL}/hi/playlists/{asset_id}/versions/{version_id}")
+                urls.append(f"{self.DISCOVERY_UGC_URL}/hi/playlists/{asset_id}")
 
-            last_status = 'error'
-            for url in urls:
-                try:
-                    async with session.get(url, headers=headers) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            public_name = str(data.get('PublicName') or '').strip()
-                            return {
-                                'public_name': public_name or None,
-                                'is_ranked': bool(self.RANKED_NAME_RE.search(public_name.lower())),
-                                'is_pve': self._public_name_is_pve(public_name),
-                                'resolution_status': 'resolved',
-                            }
-                        elif response.status == 404:
-                            last_status = 'not_found'
-                            continue
-                        elif response.status == 429:
-                            retry_after = response.headers.get('Retry-After')
-                            wait_time = int(retry_after) if retry_after and retry_after.isdigit() else 3
-                            halo_stats_rate_limiter.set_backoff(wait_time, account_index)
-                            last_status = 'error'
-                            continue
-                        else:
-                            last_status = 'error'
-                            continue
-                except Exception as e:
-                    print(f"[PLAYLIST] Error resolving {asset_id}: {e}")
-                    last_status = 'error'
-                    continue
+                last_status = 'error'
+                for url in urls:
+                    try:
+                        async with session.get(url, headers=headers) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                public_name = str(data.get('PublicName') or '').strip()
+                                return {
+                                    'public_name': public_name or None,
+                                    'is_ranked': bool(self.RANKED_NAME_RE.search(public_name.lower())),
+                                    'is_pve': self._public_name_is_pve(public_name),
+                                    'resolution_status': 'resolved',
+                                }
+                            elif response.status == 404:
+                                last_status = 'not_found'
+                                continue
+                            elif response.status == 429:
+                                retry_after = response.headers.get('Retry-After')
+                                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else 3
+                                halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                                last_status = 'error'
+                                continue
+                            else:
+                                last_status = 'error'
+                                continue
+                    except Exception as e:
+                        print(f"[PLAYLIST] Error resolving {asset_id}: {e}")
+                        last_status = 'error'
+                        continue
 
-            return {'public_name': None, 'is_ranked': False, 'is_pve': False, 'resolution_status': last_status}
+                return {'public_name': None, 'is_ranked': False, 'is_pve': False, 'resolution_status': last_status}
         except Exception as e:
             print(f"[PLAYLIST] Error resolving {asset_id}: {e}")
             return {'public_name': None, 'is_ranked': False, 'is_pve': False, 'resolution_status': 'error'}
@@ -2413,73 +2413,65 @@ class HaloAPIClient:
         """
         try:
             # Apply per-account rate limiting and get the account to use
-            account_index = await halo_stats_rate_limiter.wait_if_needed()
+            async with halo_stats_rate_limiter.slot() as account_index:
             
-            # Use specific account's Spartan token
-            spartan_token = self.get_next_spartan_token(account_index)
-            if not spartan_token:
-                return None
+                # Use specific account's Spartan token
+                spartan_token = self.get_next_spartan_token(account_index)
+                if not spartan_token:
+                    return None
                 
-            if isinstance(spartan_token, dict) and 'token' in spartan_token:
-                spartan_token = spartan_token['token']
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
             
-            headers = {
-                "Authorization": f"Spartan {spartan_token}",
-                "x-343-authorization-spartan": spartan_token,
-                "User-Agent": self.user_agent,
-                "Accept": "application/json"
-            }
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json"
+                }
             
-            stats_url = f"https://halostats.svc.halowaypoint.com/hi/matches/{match_id}/stats"
+                stats_url = f"https://halostats.svc.halowaypoint.com/hi/matches/{match_id}/stats"
             
-            # Retry logic for transient 500 and 429 errors
-            max_retries = 2
-            max_rate_limit_retries = 3
-            stats_data = None
+                # Retry logic for transient 500 and 429 errors
+                max_retries = 2
+                max_rate_limit_retries = 3
+                stats_data = None
             
-            for retry in range(max_retries):
-                async with session.get(stats_url, headers=headers) as response:
-                    if response.status == 200:
-                        try:
-                            stats_data = await response.json()
-                        except Exception as json_error:
-                            print(f"Match {match_id}: JSON parsing error - {json_error}")
-                            return None
-                        
-                        # Check if API returned None or invalid data
-                        if stats_data is None or not isinstance(stats_data, dict):
-                            print(f"Match {match_id}: API returned invalid data (None or not a dict)")
-                            return None
-                        
-                        # Success - break out of retry loop
-                        break
-                    elif response.status == 429:
-                        # Rate limited - set backoff for this specific account
-                        retry_after = response.headers.get('Retry-After')
-                        if retry_after:
+                for retry in range(max_retries):
+                    async with session.get(stats_url, headers=headers) as response:
+                        if response.status == 200:
                             try:
-                                wait_time = int(retry_after)
-                            except ValueError:
-                                wait_time = 2 ** retry + 3
-                        else:
-                            wait_time = 2 ** retry + 3  # 4s, 7s
+                                stats_data = await response.json()
+                            except Exception as json_error:
+                                print(f"Match {match_id}: JSON parsing error - {json_error}")
+                                return None
                         
-                        # Set backoff for THIS account only
-                        halo_stats_rate_limiter.set_backoff(wait_time, account_index)
-                        print(f"⚠️ Match {match_id}: Rate limited (429) on account {account_index}, switching account...")
+                            # Check if API returned None or invalid data
+                            if stats_data is None or not isinstance(stats_data, dict):
+                                print(f"Match {match_id}: API returned invalid data (None or not a dict)")
+                                return None
                         
-                        # Get a different account and retry
-                        account_index = await halo_stats_rate_limiter.wait_if_needed()
-                        spartan_token = self.get_next_spartan_token(account_index)
-                        if isinstance(spartan_token, dict) and 'token' in spartan_token:
-                            spartan_token = spartan_token['token']
-                        headers["Authorization"] = f"Spartan {spartan_token}"
-                        headers["x-343-authorization-spartan"] = spartan_token
-                        continue
-                    elif response.status == 500:
-                        # Server error - retry with different account
-                        if retry < max_retries - 1:
-                            await asyncio.sleep(0.3)
+                            # Success - break out of retry loop
+                            break
+                        elif response.status == 429:
+                            # Rate limited - set backoff for this specific account
+                            retry_after = response.headers.get('Retry-After')
+                            if retry_after:
+                                try:
+                                    wait_time = int(retry_after)
+                                except ValueError:
+                                    wait_time = 2 ** retry + 3
+                            else:
+                                wait_time = 2 ** retry + 3  # 4s, 7s
+                        
+                            # Set backoff for THIS account only
+                            halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                            print(f"⚠️ Match {match_id}: Rate limited (429) on account {account_index}, switching account...")
+                        
+                            # Get a different account and retry. wait_if_needed()
+                            # rather than slot(): we are already inside the slot
+                            # taken above, so this re-paces onto a fresh account
+                            # without taking (and leaking) a second permit.
                             account_index = await halo_stats_rate_limiter.wait_if_needed()
                             spartan_token = self.get_next_spartan_token(account_index)
                             if isinstance(spartan_token, dict) and 'token' in spartan_token:
@@ -2487,158 +2479,169 @@ class HaloAPIClient:
                             headers["Authorization"] = f"Spartan {spartan_token}"
                             headers["x-343-authorization-spartan"] = spartan_token
                             continue
+                        elif response.status == 500:
+                            # Server error - retry with different account
+                            if retry < max_retries - 1:
+                                await asyncio.sleep(0.3)
+                                account_index = await halo_stats_rate_limiter.wait_if_needed()
+                                spartan_token = self.get_next_spartan_token(account_index)
+                                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                                    spartan_token = spartan_token['token']
+                                headers["Authorization"] = f"Spartan {spartan_token}"
+                                headers["x-343-authorization-spartan"] = spartan_token
+                                continue
+                            else:
+                                # Max retries reached
+                                return None
                         else:
-                            # Max retries reached
+                            # Other error - don't retry
                             return None
-                    else:
-                        # Other error - don't retry
-                        return None
             
-            # Process the successful response (stats_data is set if status was 200)
-            if not stats_data:
-                return None
+                # Process the successful response (stats_data is set if status was 200)
+                if not stats_data:
+                    return None
                 
-            players = stats_data.get('Players', [])
-            if not players:
-                # No player data in response
-                return None
+                players = stats_data.get('Players', [])
+                if not players:
+                    # No player data in response
+                    return None
             
-            # Extract XUIDs of all players in the match
-            player_xuids = []
-            all_participants = []
-            for p in players:
-                player_id = p.get('PlayerId', '')
-                # Extract XUID from format: 'xuid(2533274924643541)'
-                if 'xuid(' in player_id:
-                    xuid_str = player_id.replace('xuid(', '').replace(')', '')
-                    player_xuids.append(xuid_str)
+                # Extract XUIDs of all players in the match
+                player_xuids = []
+                all_participants = []
+                for p in players:
+                    player_id = p.get('PlayerId', '')
+                    # Extract XUID from format: 'xuid(2533274924643541)'
+                    if 'xuid(' in player_id:
+                        xuid_str = player_id.replace('xuid(', '').replace(')', '')
+                        player_xuids.append(xuid_str)
 
-                    participant_team_stats = p.get('PlayerTeamStats', [])
-                    participant_stats_obj = {}
-                    participant_core_stats = {}
-                    if participant_team_stats and isinstance(participant_team_stats, list):
-                        first_team_stats = participant_team_stats[0] if participant_team_stats else {}
-                        if isinstance(first_team_stats, dict):
-                            participant_stats_obj = first_team_stats.get('Stats') or {}
-                    if isinstance(participant_stats_obj, dict):
-                        participant_core_stats = participant_stats_obj.get('CoreStats') or {}
+                        participant_team_stats = p.get('PlayerTeamStats', [])
+                        participant_stats_obj = {}
+                        participant_core_stats = {}
+                        if participant_team_stats and isinstance(participant_team_stats, list):
+                            first_team_stats = participant_team_stats[0] if participant_team_stats else {}
+                            if isinstance(first_team_stats, dict):
+                                participant_stats_obj = first_team_stats.get('Stats') or {}
+                        if isinstance(participant_stats_obj, dict):
+                            participant_core_stats = participant_stats_obj.get('CoreStats') or {}
 
-                    explicit_team_id = (
-                        p.get('TeamId')
-                        or p.get('TeamID')
-                        or p.get('teamId')
-                        or p.get('team_id')
-                    )
-                    if explicit_team_id is None and participant_team_stats and isinstance(participant_team_stats, list):
-                        first_team_stats = participant_team_stats[0] if participant_team_stats else {}
-                        if isinstance(first_team_stats, dict):
-                            explicit_team_id = (
-                                first_team_stats.get('TeamId')
-                                or first_team_stats.get('TeamID')
-                                or first_team_stats.get('teamId')
-                                or first_team_stats.get('team_id')
+                        explicit_team_id = (
+                            p.get('TeamId')
+                            or p.get('TeamID')
+                            or p.get('teamId')
+                            or p.get('team_id')
+                        )
+                        if explicit_team_id is None and participant_team_stats and isinstance(participant_team_stats, list):
+                            first_team_stats = participant_team_stats[0] if participant_team_stats else {}
+                            if isinstance(first_team_stats, dict):
+                                explicit_team_id = (
+                                    first_team_stats.get('TeamId')
+                                    or first_team_stats.get('TeamID')
+                                    or first_team_stats.get('teamId')
+                                    or first_team_stats.get('team_id')
+                                )
+
+                        participant_outcome = int(p.get('Outcome', 0) or 0)
+                        inferred_team_id = None
+                        if explicit_team_id is None and participant_outcome:
+                            inferred_team_id = f"outcome:{participant_outcome}"
+
+                        participant_csr, participant_csr_tier = self._extract_csr_and_tier(p)
+
+                        all_participants.append(
+                            {
+                                'xuid': xuid_str,
+                                'gamertag': p.get('Gamertag') or p.get('PlayerName') or p.get('DisplayName'),
+                                'outcome': participant_outcome,
+                                'team_id': str(explicit_team_id) if explicit_team_id is not None else None,
+                                'inferred_team_id': inferred_team_id,
+                                'kills': participant_core_stats.get('Kills', 0),
+                                'deaths': participant_core_stats.get('Deaths', 0),
+                                'assists': participant_core_stats.get('Assists', 0),
+                                'csr': participant_csr,
+                                'csr_tier': participant_csr_tier,
+                            }
+                        )
+            
+                # Find our player's stats
+                for player in players:
+                    player_id = player.get('PlayerId', '')
+                    if str(player_xuid) in str(player_id):
+                        team_stats = player.get('PlayerTeamStats', [])
+                        if team_stats and len(team_stats) > 0:
+                            # Safely extract nested stats with None checks
+                            stats_obj = team_stats[0].get('Stats')
+                            if not stats_obj or not isinstance(stats_obj, dict):
+                                return None
+                            
+                            core_stats = stats_obj.get('CoreStats', {})
+                            if not core_stats or not isinstance(core_stats, dict):
+                                return None
+                        
+                            match_info = stats_data.get('MatchInfo', {})
+                            if not match_info or not isinstance(match_info, dict):
+                                return None
+                        
+                            # Extract playlist information with None checks
+                            playlist_info = match_info.get('Playlist')
+                            if playlist_info and isinstance(playlist_info, dict):
+                                playlist_asset_id = playlist_info.get('AssetId')
+                                playlist_version_id = playlist_info.get('VersionId')
+                            else:
+                                playlist_asset_id = None
+                                playlist_version_id = None
+                        
+                            # Extract map information with None checks
+                            map_info = match_info.get('MapVariant')
+                            if map_info and isinstance(map_info, dict):
+                                map_asset_id = map_info.get('AssetId')
+                                map_version_id = map_info.get('VersionId')
+                            else:
+                                map_asset_id = None
+                                map_version_id = None
+                        
+                            metadata_is_ranked, metadata_is_pve = await self._lookup_or_resolve_playlist_ranked(
+                                playlist_asset_id, playlist_version_id, session
+                            )
+                            match_category, is_ranked, category_source = self._classify_match_category(
+                                playlist_asset_id=playlist_asset_id,
+                                playlist_version_id=playlist_version_id,
+                                playlist_info=playlist_info,
+                                match_info=match_info,
+                                metadata_is_ranked=metadata_is_ranked,
+                                metadata_is_pve=metadata_is_pve,
                             )
 
-                    participant_outcome = int(p.get('Outcome', 0) or 0)
-                    inferred_team_id = None
-                    if explicit_team_id is None and participant_outcome:
-                        inferred_team_id = f"outcome:{participant_outcome}"
+                            # Build match data with playlist information, map, and player XUIDs
+                            csr, csr_tier = self._extract_csr_and_tier(player)
 
-                    participant_csr, participant_csr_tier = self._extract_csr_and_tier(p)
-
-                    all_participants.append(
-                        {
-                            'xuid': xuid_str,
-                            'gamertag': p.get('Gamertag') or p.get('PlayerName') or p.get('DisplayName'),
-                            'outcome': participant_outcome,
-                            'team_id': str(explicit_team_id) if explicit_team_id is not None else None,
-                            'inferred_team_id': inferred_team_id,
-                            'kills': participant_core_stats.get('Kills', 0),
-                            'deaths': participant_core_stats.get('Deaths', 0),
-                            'assists': participant_core_stats.get('Assists', 0),
-                            'csr': participant_csr,
-                            'csr_tier': participant_csr_tier,
-                        }
-                    )
+                            match_data = {
+                                'match_id': match_id,
+                                'outcome': player.get('Outcome', 0),  # 2=Win, 3=Loss, 4=DNF
+                                'kills': core_stats.get('Kills', 0),
+                                'deaths': core_stats.get('Deaths', 0),
+                                'assists': core_stats.get('Assists', 0),
+                                'start_time': match_info.get('StartTime', ''),
+                                'duration': match_info.get('Duration', 'Unknown'),
+                                'medals': core_stats.get('Medals', []),
+                                'playlist_id': playlist_asset_id,
+                                'playlist_version': playlist_version_id,
+                                'is_ranked': is_ranked,
+                                'match_category': match_category,
+                                'category_source': category_source,
+                                'csr': csr,
+                                'csr_tier': csr_tier,
+                                'map_id': map_asset_id,
+                                'map_version': map_version_id,
+                                'players': player_xuids,
+                                'all_participants': all_participants,
+                            }
+                            return match_data
             
-            # Find our player's stats
-            for player in players:
-                player_id = player.get('PlayerId', '')
-                if str(player_xuid) in str(player_id):
-                    team_stats = player.get('PlayerTeamStats', [])
-                    if team_stats and len(team_stats) > 0:
-                        # Safely extract nested stats with None checks
-                        stats_obj = team_stats[0].get('Stats')
-                        if not stats_obj or not isinstance(stats_obj, dict):
-                            return None
-                            
-                        core_stats = stats_obj.get('CoreStats', {})
-                        if not core_stats or not isinstance(core_stats, dict):
-                            return None
-                        
-                        match_info = stats_data.get('MatchInfo', {})
-                        if not match_info or not isinstance(match_info, dict):
-                            return None
-                        
-                        # Extract playlist information with None checks
-                        playlist_info = match_info.get('Playlist')
-                        if playlist_info and isinstance(playlist_info, dict):
-                            playlist_asset_id = playlist_info.get('AssetId')
-                            playlist_version_id = playlist_info.get('VersionId')
-                        else:
-                            playlist_asset_id = None
-                            playlist_version_id = None
-                        
-                        # Extract map information with None checks
-                        map_info = match_info.get('MapVariant')
-                        if map_info and isinstance(map_info, dict):
-                            map_asset_id = map_info.get('AssetId')
-                            map_version_id = map_info.get('VersionId')
-                        else:
-                            map_asset_id = None
-                            map_version_id = None
-                        
-                        metadata_is_ranked, metadata_is_pve = await self._lookup_or_resolve_playlist_ranked(
-                            playlist_asset_id, playlist_version_id, session
-                        )
-                        match_category, is_ranked, category_source = self._classify_match_category(
-                            playlist_asset_id=playlist_asset_id,
-                            playlist_version_id=playlist_version_id,
-                            playlist_info=playlist_info,
-                            match_info=match_info,
-                            metadata_is_ranked=metadata_is_ranked,
-                            metadata_is_pve=metadata_is_pve,
-                        )
-
-                        # Build match data with playlist information, map, and player XUIDs
-                        csr, csr_tier = self._extract_csr_and_tier(player)
-
-                        match_data = {
-                            'match_id': match_id,
-                            'outcome': player.get('Outcome', 0),  # 2=Win, 3=Loss, 4=DNF
-                            'kills': core_stats.get('Kills', 0),
-                            'deaths': core_stats.get('Deaths', 0),
-                            'assists': core_stats.get('Assists', 0),
-                            'start_time': match_info.get('StartTime', ''),
-                            'duration': match_info.get('Duration', 'Unknown'),
-                            'medals': core_stats.get('Medals', []),
-                            'playlist_id': playlist_asset_id,
-                            'playlist_version': playlist_version_id,
-                            'is_ranked': is_ranked,
-                            'match_category': match_category,
-                            'category_source': category_source,
-                            'csr': csr,
-                            'csr_tier': csr_tier,
-                            'map_id': map_asset_id,
-                            'map_version': map_version_id,
-                            'players': player_xuids,
-                            'all_participants': all_participants,
-                        }
-                        return match_data
-            
-            # If we get here, player wasn't found in match
-            # This can happen if the match data is incomplete
-            return None
+                # If we get here, player wasn't found in match
+                # This can happen if the match data is incomplete
+                return None
         except Exception as e:
             print(f"Error getting match stats for {match_id}: {e}")
         
@@ -2686,73 +2689,73 @@ class HaloAPIClient:
                 matches_url = f"https://halostats.svc.halowaypoint.com/hi/players/xuid({xuid})/matches?start=0&count=1"
                 
                 # Get account and headers
-                account_index = await halo_stats_rate_limiter.wait_if_needed()
-                spartan_token = self.get_next_spartan_token(account_index)
-                if not spartan_token:
-                    return (False, None)
+                async with halo_stats_rate_limiter.slot() as account_index:
+                    spartan_token = self.get_next_spartan_token(account_index)
+                    if not spartan_token:
+                        return (False, None)
                     
-                if isinstance(spartan_token, dict) and 'token' in spartan_token:
-                    spartan_token = spartan_token['token']
+                    if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                        spartan_token = spartan_token['token']
                 
-                headers = {
-                    "Authorization": f"Spartan {spartan_token}",
-                    "x-343-authorization-spartan": spartan_token,
-                    "User-Agent": self.user_agent,
-                    "Accept": "application/json"
-                }
+                    headers = {
+                        "Authorization": f"Spartan {spartan_token}",
+                        "x-343-authorization-spartan": spartan_token,
+                        "User-Agent": self.user_agent,
+                        "Accept": "application/json"
+                    }
                 
-                # Retry logic for 401/429
-                max_account_retries = len(self.spartan_accounts) if self.spartan_accounts else 1
-                for attempt in range(max_account_retries):
-                    async with session.get(matches_url, headers=headers) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            results = data.get('Results', [])
+                    # Retry logic for 401/429
+                    max_account_retries = len(self.spartan_accounts) if self.spartan_accounts else 1
+                    for attempt in range(max_account_retries):
+                        async with session.get(matches_url, headers=headers) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                results = data.get('Results', [])
                             
-                            if not results:
-                                # No matches = not a Halo player (or brand new)
+                                if not results:
+                                    # No matches = not a Halo player (or brand new)
+                                    return (False, None)
+                            
+                                # Get the first (most recent) match ID
+                                match_id = results[0].get('MatchId')
+                                if not match_id:
+                                    return (False, None)
+                            
+                                # Step 2: Fetch match stats to get the date
+                                last_match_date = await self._get_match_date(match_id, session)
+                            
+                                if last_match_date is None:
+                                    # Couldn't get date, assume not recent
+                                    return (False, None)
+                            
+                                # Check if match is after cutoff
+                                is_recent = _normalize_utc_naive(last_match_date) >= _normalize_utc_naive(cutoff_date)
+                                return (is_recent, last_match_date)
+                            
+                            elif response.status == 401:
+                                # Rotate to next account
+                                account_index = (account_index + 1) % max_account_retries
+                                spartan_token = self.get_next_spartan_token(account_index)
+                                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                                    spartan_token = spartan_token['token']
+                                headers["Authorization"] = f"Spartan {spartan_token}"
+                                headers["x-343-authorization-spartan"] = spartan_token
+                                await asyncio.sleep(0.3)
+                                continue
+                            
+                            elif response.status == 429:
+                                # Rate limited - wait and retry
+                                retry_after = response.headers.get('Retry-After', '5')
+                                wait_time = int(retry_after) if retry_after.isdigit() else 5
+                                halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                                await asyncio.sleep(1)
+                                continue
+                            else:
+                                # Other error
                                 return (False, None)
-                            
-                            # Get the first (most recent) match ID
-                            match_id = results[0].get('MatchId')
-                            if not match_id:
-                                return (False, None)
-                            
-                            # Step 2: Fetch match stats to get the date
-                            last_match_date = await self._get_match_date(match_id, session)
-                            
-                            if last_match_date is None:
-                                # Couldn't get date, assume not recent
-                                return (False, None)
-                            
-                            # Check if match is after cutoff
-                            is_recent = _normalize_utc_naive(last_match_date) >= _normalize_utc_naive(cutoff_date)
-                            return (is_recent, last_match_date)
-                            
-                        elif response.status == 401:
-                            # Rotate to next account
-                            account_index = (account_index + 1) % max_account_retries
-                            spartan_token = self.get_next_spartan_token(account_index)
-                            if isinstance(spartan_token, dict) and 'token' in spartan_token:
-                                spartan_token = spartan_token['token']
-                            headers["Authorization"] = f"Spartan {spartan_token}"
-                            headers["x-343-authorization-spartan"] = spartan_token
-                            await asyncio.sleep(0.3)
-                            continue
-                            
-                        elif response.status == 429:
-                            # Rate limited - wait and retry
-                            retry_after = response.headers.get('Retry-After', '5')
-                            wait_time = int(retry_after) if retry_after.isdigit() else 5
-                            halo_stats_rate_limiter.set_backoff(wait_time, account_index)
-                            await asyncio.sleep(1)
-                            continue
-                        else:
-                            # Other error
-                            return (False, None)
                 
-                # Exhausted retries
-                return (False, None)
+                    # Exhausted retries
+                    return (False, None)
                 
         except Exception as e:
             print(f"[API] Error checking Halo activity for {xuid}: {e}")
@@ -2776,40 +2779,40 @@ class HaloAPIClient:
         try:
             stats_url = f"https://halostats.svc.halowaypoint.com/hi/matches/{match_id}/stats"
             
-            account_index = await halo_stats_rate_limiter.wait_if_needed()
-            spartan_token = self.get_next_spartan_token(account_index)
-            if isinstance(spartan_token, dict) and 'token' in spartan_token:
-                spartan_token = spartan_token['token']
+            async with halo_stats_rate_limiter.slot() as account_index:
+                spartan_token = self.get_next_spartan_token(account_index)
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
             
-            headers = {
-                "Authorization": f"Spartan {spartan_token}",
-                "x-343-authorization-spartan": spartan_token,
-                "User-Agent": self.user_agent,
-                "Accept": "application/json"
-            }
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json"
+                }
             
-            async with session.get(stats_url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    match_info = data.get('MatchInfo', {})
-                    start_time_str = match_info.get('StartTime', '')
+                async with session.get(stats_url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        match_info = data.get('MatchInfo', {})
+                        start_time_str = match_info.get('StartTime', '')
                     
-                    if start_time_str:
-                        # Parse ISO format: "2025-12-15T18:30:00.000Z"
-                        # Handle various formats
-                        try:
-                            # Remove 'Z' and parse
-                            if start_time_str.endswith('Z'):
-                                start_time_str = start_time_str[:-1]
-                            # Handle milliseconds if present
-                            if '.' in start_time_str:
-                                return datetime.fromisoformat(start_time_str.split('.')[0])
-                            return datetime.fromisoformat(start_time_str)
-                        except ValueError:
-                            return None
-                    return None
-                else:
-                    return None
+                        if start_time_str:
+                            # Parse ISO format: "2025-12-15T18:30:00.000Z"
+                            # Handle various formats
+                            try:
+                                # Remove 'Z' and parse
+                                if start_time_str.endswith('Z'):
+                                    start_time_str = start_time_str[:-1]
+                                # Handle milliseconds if present
+                                if '.' in start_time_str:
+                                    return datetime.fromisoformat(start_time_str.split('.')[0])
+                                return datetime.fromisoformat(start_time_str)
+                            except ValueError:
+                                return None
+                        return None
+                    else:
+                        return None
                     
         except Exception as e:
             print(f"[API] Error getting match date for {match_id}: {e}")
@@ -2967,78 +2970,78 @@ class HaloAPIClient:
                 
                 try:
                     # Apply per-account rate limiting and get the account to use
-                    account_index = await halo_stats_rate_limiter.wait_if_needed(force_account)
+                    async with halo_stats_rate_limiter.slot(force_account) as account_index:
                     
-                    # Get headers for the specific account
-                    headers = get_headers_for_account(account_index)
-                    async with session.get(matches_url, headers=headers) as response:
-                        if start_pos == 0:
-                            print(f"Fetching matches for XUID: {xuid} (gamertag: {gamertag or 'unknown'})")
-                        
-                        if response.status == 200:
-                            match_data = await response.json()
-                            results = match_data.get('Results', [])
+                        # Get headers for the specific account
+                        headers = get_headers_for_account(account_index)
+                        async with session.get(matches_url, headers=headers) as response:
                             if start_pos == 0:
-                                print(f"   First page: {len(results)} matches found")
-                            return results
-                        elif response.status == 429:
-                            # Rate limited - use proper exponential backoff to avoid ban
-                            if rate_limit_retry < max_rate_limit_retries:
-                                # Check for Retry-After header (API may specify wait time)
-                                retry_after = response.headers.get('Retry-After')
-                                if retry_after:
-                                    try:
-                                        wait_time = max(int(retry_after), 30)  # Minimum 30s
-                                    except ValueError:
-                                        wait_time = 30 * (2 ** rate_limit_retry)  # 30s, 60s, 120s, 240s, 480s
+                                print(f"Fetching matches for XUID: {xuid} (gamertag: {gamertag or 'unknown'})")
+                        
+                            if response.status == 200:
+                                match_data = await response.json()
+                                results = match_data.get('Results', [])
+                                if start_pos == 0:
+                                    print(f"   First page: {len(results)} matches found")
+                                return results
+                            elif response.status == 429:
+                                # Rate limited - use proper exponential backoff to avoid ban
+                                if rate_limit_retry < max_rate_limit_retries:
+                                    # Check for Retry-After header (API may specify wait time)
+                                    retry_after = response.headers.get('Retry-After')
+                                    if retry_after:
+                                        try:
+                                            wait_time = max(int(retry_after), 30)  # Minimum 30s
+                                        except ValueError:
+                                            wait_time = 30 * (2 ** rate_limit_retry)  # 30s, 60s, 120s, 240s, 480s
+                                    else:
+                                        # Conservative exponential backoff: 30s, 60s, 120s, 240s, 480s
+                                        wait_time = 30 * (2 ** rate_limit_retry)
+                                
+                                    # Set backoff for THIS account
+                                    halo_stats_rate_limiter.set_backoff(wait_time, account_index)
+                                
+                                    # Also set a shorter global backoff to slow down ALL requests
+                                    global_backoff = 5 * (rate_limit_retry + 1)  # 5s, 10s, 15s, 20s, 25s
+                                    halo_stats_rate_limiter.set_backoff(global_backoff, account_index=None)
+                                
+                                    print(f"⚠️ Rate limited (429) at page {start_pos} on account {account_index}, waiting {wait_time}s (attempt {rate_limit_retry + 1}/{max_rate_limit_retries})...")
+                                
+                                    # Actually WAIT the backoff time before retrying
+                                    await asyncio.sleep(wait_time)
+                                
+                                    # Retry with same account (it's now had time to cool down)
+                                    return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry, error_retry, rate_limit_retry + 1, force_account=account_index)
                                 else:
-                                    # Conservative exponential backoff: 30s, 60s, 120s, 240s, 480s
-                                    wait_time = 30 * (2 ** rate_limit_retry)
-                                
-                                # Set backoff for THIS account
-                                halo_stats_rate_limiter.set_backoff(wait_time, account_index)
-                                
-                                # Also set a shorter global backoff to slow down ALL requests
-                                global_backoff = 5 * (rate_limit_retry + 1)  # 5s, 10s, 15s, 20s, 25s
-                                halo_stats_rate_limiter.set_backoff(global_backoff, account_index=None)
-                                
-                                print(f"⚠️ Rate limited (429) at page {start_pos} on account {account_index}, waiting {wait_time}s (attempt {rate_limit_retry + 1}/{max_rate_limit_retries})...")
-                                
-                                # Actually WAIT the backoff time before retrying
-                                await asyncio.sleep(wait_time)
-                                
-                                # Retry with same account (it's now had time to cool down)
-                                return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry, error_retry, rate_limit_retry + 1, force_account=account_index)
+                                    print(f"❌ Rate limit exceeded after {max_rate_limit_retries} retries at page {start_pos}")
+                                    return _PAGE_FETCH_FAILED  # Failure, not end-of-history
+                            elif response.status == 401:
+                                # Try rotating to next account instead of refreshing tokens
+                                if account_retry < max_account_retries:
+                                    print(f"401 error, rotating to next account (attempt {account_retry + 1}/{max_account_retries})...")
+                                    # get_headers() will automatically use next account due to round-robin
+                                    await asyncio.sleep(0.5)  # Small delay before retry
+                                    return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry + 1, error_retry, rate_limit_retry)
+                                else:
+                                    print(f"401 Unauthorized after trying all accounts - need token refresh")
+                                    text = await response.text()
+                                    print(f"   Response: {text[:200]}")
+                                    # Signal that we got 401 error after trying all accounts
+                                    return None
+                            elif response.status == 500:
+                                # Server error - retry with different account
+                                if error_retry < max_error_retries:
+                                    await asyncio.sleep(0.3)
+                                    # Will automatically get a different account via rate limiter
+                                    return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry, error_retry + 1, rate_limit_retry, force_account=None)
+                                else:
+                                    # Max retries reached - failure, not end-of-history
+                                    return _PAGE_FETCH_FAILED
                             else:
-                                print(f"❌ Rate limit exceeded after {max_rate_limit_retries} retries at page {start_pos}")
-                                return _PAGE_FETCH_FAILED  # Failure, not end-of-history
-                        elif response.status == 401:
-                            # Try rotating to next account instead of refreshing tokens
-                            if account_retry < max_account_retries:
-                                print(f"401 error, rotating to next account (attempt {account_retry + 1}/{max_account_retries})...")
-                                # get_headers() will automatically use next account due to round-robin
-                                await asyncio.sleep(0.5)  # Small delay before retry
-                                return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry + 1, error_retry, rate_limit_retry)
-                            else:
-                                print(f"401 Unauthorized after trying all accounts - need token refresh")
+                                print(f"Unexpected status: {response.status}")
                                 text = await response.text()
                                 print(f"   Response: {text[:200]}")
-                                # Signal that we got 401 error after trying all accounts
-                                return None
-                        elif response.status == 500:
-                            # Server error - retry with different account
-                            if error_retry < max_error_retries:
-                                await asyncio.sleep(0.3)
-                                # Will automatically get a different account via rate limiter
-                                return await fetch_match_page(session, start_pos, page_size, retry_count, account_retry, error_retry + 1, rate_limit_retry, force_account=None)
-                            else:
-                                # Max retries reached - failure, not end-of-history
                                 return _PAGE_FETCH_FAILED
-                        else:
-                            print(f"Unexpected status: {response.status}")
-                            text = await response.text()
-                            print(f"   Response: {text[:200]}")
-                            return _PAGE_FETCH_FAILED
                 except OSError as e:
                     # Handle Windows semaphore timeout errors (WinError 121)
                     if 'semaphore timeout' in str(e).lower() or 'WinError 121' in str(e):
@@ -3184,21 +3187,21 @@ class HaloAPIClient:
                             # Fetch first page payload once to get API total-count metadata if present.
                             try:
                                 first_page_url = f"https://halostats.svc.halowaypoint.com/hi/players/xuid({xuid})/matches?start=0&count={PAGE_SIZE}"
-                                account_index = await halo_stats_rate_limiter.wait_if_needed()
-                                first_headers = get_headers_for_account(account_index)
-                                async with session.get(first_page_url, headers=first_headers) as first_response:
-                                    if first_response.status == 200:
-                                        first_payload = await first_response.json()
-                                        extracted_hint, hint_source, hint_reliable = extract_total_matches_count(first_payload)
-                                        total_matches_hint_source = hint_source
-                                        total_matches_hint_reliable = hint_reliable
-                                        total_matches_hint = extracted_hint if hint_reliable else None
-                                        if hint_source:
-                                            print(
-                                                f"Total-count hint key={hint_source}, value={extracted_hint}, reliable={hint_reliable}"
-                                            )
-                                        else:
-                                            print("Total-count hint unavailable in first-page payload")
+                                async with halo_stats_rate_limiter.slot() as account_index:
+                                    first_headers = get_headers_for_account(account_index)
+                                    async with session.get(first_page_url, headers=first_headers) as first_response:
+                                        if first_response.status == 200:
+                                            first_payload = await first_response.json()
+                                            extracted_hint, hint_source, hint_reliable = extract_total_matches_count(first_payload)
+                                            total_matches_hint_source = hint_source
+                                            total_matches_hint_reliable = hint_reliable
+                                            total_matches_hint = extracted_hint if hint_reliable else None
+                                            if hint_source:
+                                                print(
+                                                    f"Total-count hint key={hint_source}, value={extracted_hint}, reliable={hint_reliable}"
+                                                )
+                                            else:
+                                                print("Total-count hint unavailable in first-page payload")
                             except Exception:
                                 # Total-count hint is optional; ignore extraction failures.
                                 total_matches_hint = None
