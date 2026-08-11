@@ -538,3 +538,50 @@ async def test_get_friends_of_friends_distributes_across_all_accounts(monkeypatc
 
     assert result["error"] is None
     assert set(seen_account_indexes) == {0, 1, 2, 3, 4}
+
+
+def test_parse_retry_after():
+    from src.api.client import _parse_retry_after
+
+    assert _parse_retry_after("1") == 1.0
+    assert _parse_retry_after("2.5") == 2.5
+    assert _parse_retry_after("0") == 0.0
+    # Absent, empty, unparseable and negative all fall back to our own backoff
+    # rather than to a guess.
+    for bad in (None, "", "soon", "-3", "Wed, 21 Oct 2026 07:28:00 GMT"):
+        assert _parse_retry_after(bad) is None
+
+
+def test_page_listing_backoff_honours_retry_after():
+    """A 429 must wait roughly what the server asked, not a fixed 30s.
+
+    Halo answers page-listing 429s with `Retry-After: 1` (verified live). The
+    old code did max(int(retry_after), 30), so it slept 30x the requested time;
+    five of those turned the page-listing phase of a 670-match crawl into 61 of
+    its 105 seconds.
+    """
+    from src.api.client import (
+        RATE_LIMIT_BASE_BACKOFF,
+        RATE_LIMIT_MAX_BACKOFF,
+        _parse_retry_after,
+    )
+
+    def wait_for(retry_after, attempt):
+        hint = _parse_retry_after(retry_after)
+        backoff = RATE_LIMIT_BASE_BACKOFF * (2 ** attempt)
+        return min(max(hint or 0.0, backoff), RATE_LIMIT_MAX_BACKOFF)
+
+    # The measured real-world case: server says 1, first attempt.
+    assert wait_for("1", 0) == 1.0
+
+    # Repeated refusals still escalate, so a genuinely angry API is respected.
+    ladder = [wait_for("1", a) for a in range(5)]
+    assert ladder == [1.0, 2.0, 4.0, 8.0, 16.0]
+
+    # A server asking for longer than our ladder wins...
+    assert wait_for("45", 0) == 45.0
+    # ...but cannot park a worker indefinitely.
+    assert wait_for("3600", 0) == RATE_LIMIT_MAX_BACKOFF
+
+    # No header: fall back to our own escalation, not to zero.
+    assert wait_for(None, 0) == RATE_LIMIT_BASE_BACKOFF

@@ -96,6 +96,29 @@ _PAGE_FETCH_FAILED = object()
 # nothing, high enough that a long one is at full width within ~3 rounds.
 SLOW_START_PAGES = 4
 
+# Page-listing 429 backoff. Halo answers these with `Retry-After: 1` (measured
+# live), so the base is small and the server's own hint acts as a floor; the
+# exponential term only bites when it keeps refusing the same page.
+RATE_LIMIT_BASE_BACKOFF = 1.0      # 1s, 2s, 4s, 8s, 16s across retries
+RATE_LIMIT_MAX_BACKOFF = 60.0
+RATE_LIMIT_MAX_GLOBAL_BACKOFF = 5.0
+
+
+def _parse_retry_after(value) -> Optional[float]:
+    """Seconds from a Retry-After header, or None if absent/unparseable.
+
+    Only the delta-seconds form is handled; the HTTP-date form is valid per RFC
+    9110 but Halo does not use it, and guessing at clock skew would be worse
+    than falling back to our own backoff.
+    """
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
 
 # =============================================================================
 # HALO API CLIENT
@@ -3000,22 +3023,37 @@ class HaloAPIClient:
                             elif response.status == 429:
                                 # Rate limited - use proper exponential backoff to avoid ban
                                 if rate_limit_retry < max_rate_limit_retries:
-                                    # Check for Retry-After header (API may specify wait time)
-                                    retry_after = response.headers.get('Retry-After')
-                                    if retry_after:
-                                        try:
-                                            wait_time = max(int(retry_after), 30)  # Minimum 30s
-                                        except ValueError:
-                                            wait_time = 30 * (2 ** rate_limit_retry)  # 30s, 60s, 120s, 240s, 480s
-                                    else:
-                                        # Conservative exponential backoff: 30s, 60s, 120s, 240s, 480s
-                                        wait_time = 30 * (2 ** rate_limit_retry)
-                                
+                                    # Honour what the server actually asked for.
+                                    #
+                                    # This used to be max(int(retry_after), 30) - a 30-second
+                                    # floor on a header that measurably says "1". Halo returns
+                                    # `Retry-After: 1` on these 429s (verified live), so every
+                                    # rate-limited page slept 30x longer than requested. On a
+                                    # 670-match crawl that was five 429s turning the
+                                    # page-listing phase into 61s of a 105s crawl, while the
+                                    # match-detail phase - which uses proportionate waits -
+                                    # ran the full 15 req/s the limiter allows.
+                                    #
+                                    # Still backs off if the server keeps refusing: the
+                                    # exponential term grows per retry and the server's hint
+                                    # acts as a floor, so a genuinely angry API is respected
+                                    # without punishing a momentary one.
+                                    server_hint = _parse_retry_after(
+                                        response.headers.get('Retry-After')
+                                    )
+                                    backoff = RATE_LIMIT_BASE_BACKOFF * (2 ** rate_limit_retry)
+                                    wait_time = min(
+                                        max(server_hint or 0.0, backoff),
+                                        RATE_LIMIT_MAX_BACKOFF,
+                                    )
+
                                     # Set backoff for THIS account
                                     halo_stats_rate_limiter.set_backoff(seconds=wait_time, account_index=account_index)
-                                
-                                    # Also set a shorter global backoff to slow down ALL requests
-                                    global_backoff = 5 * (rate_limit_retry + 1)  # 5s, 10s, 15s, 20s, 25s
+
+                                    # And a gentler global nudge so the other accounts ease off
+                                    # too. Scaled to the same signal - a flat 5s per retry was
+                                    # another order-of-magnitude overshoot against a 1s hint.
+                                    global_backoff = min(wait_time / 2.0, RATE_LIMIT_MAX_GLOBAL_BACKOFF)
                                     halo_stats_rate_limiter.set_backoff(seconds=global_backoff, account_index=None)
                                 
                                     print(f"⚠️ Rate limited (429) at page {start_pos} on account {account_index}, waiting {wait_time}s (attempt {rate_limit_retry + 1}/{max_rate_limit_retries})...")
