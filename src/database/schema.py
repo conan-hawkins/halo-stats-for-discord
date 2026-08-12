@@ -413,8 +413,67 @@ class HaloStatsDBv2:
         """)
 
         # ============================================================
+        # Table 10: Player CSR per playlist - current rank and all-time peak,
+        # one row per (player, playlist).
+        #
+        # Kept apart from player_csr_season because all_time_max does NOT vary
+        # by season: skill.svc returns the same value whichever season is
+        # asked for (verified live), so folding it into the per-season table
+        # would store the same number once per season for no gain.
+        #
+        # Source is skill.svc, NOT the match payload. match_participants.csr
+        # exists but is empty in practice - the match-stats payload almost
+        # never carries CSR, which is the reason this table exists at all.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_playlist_csr (
+                xuid TEXT NOT NULL,
+                playlist_asset_id TEXT NOT NULL,
+                current_csr INTEGER,
+                current_tier TEXT,
+                current_sub_tier INTEGER,
+                all_time_max INTEGER,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY (xuid, playlist_asset_id),
+                FOREIGN KEY (xuid) REFERENCES players(xuid)
+            )
+        """)
+
+        # ============================================================
+        # Table 11: Player CSR per season - the historic series, one row per
+        # (player, playlist, season).
+        #
+        # season_id is stored in the BARE form skill.svc accepts
+        # ('CsrSeason13-3'), never the 'Csr/Seasons/CsrSeason13-3.json' path
+        # form that the service record's Subqueries reports. The path form is
+        # accepted by the API and then silently ignored, which hands back the
+        # CURRENT season's numbers labelled as a historic season.
+        #
+        # A row exists only where the player actually held a rank that season.
+        # Absence means "did not play ranked here", which is why nothing is
+        # stored for the -1 sentinel.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS player_csr_season (
+                xuid TEXT NOT NULL,
+                playlist_asset_id TEXT NOT NULL,
+                season_id TEXT NOT NULL,
+                csr INTEGER,
+                tier TEXT,
+                sub_tier INTEGER,
+                season_max INTEGER,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY (xuid, playlist_asset_id, season_id),
+                FOREIGN KEY (xuid) REFERENCES players(xuid)
+            )
+        """)
+
+        # ============================================================
         # Indexes for performance
         # ============================================================
+        # The two CSR tables above deliberately get none: both primary keys
+        # lead with xuid, which is the only way they are ever read ("this
+        # player's CSR"), and a composite PK already serves prefix lookups.
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_start_time ON matches(start_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_playlist ON matches(playlist_id)")
         # Lets reclassify_playlists_backfill's "most recent match per
@@ -658,6 +717,93 @@ class HaloStatsDBv2:
         """, (playlist_asset_id, public_name, 1 if is_ranked else 0, resolution_status, now, version_id))
         if commit:
             conn.commit()
+
+    # =========================================================================
+    # CSR (skill.svc)
+    # =========================================================================
+
+    def upsert_player_playlist_csr(self, xuid: str, playlist_asset_id: str,
+                                   current_csr: Optional[int],
+                                   current_tier: Optional[str],
+                                   current_sub_tier: Optional[int],
+                                   all_time_max: Optional[int],
+                                   commit: bool = True) -> None:
+        """Current rank + all-time peak for one (player, playlist).
+
+        No FK children reference this table, so INSERT OR REPLACE is safe -
+        same reasoning as upsert_playlist_metadata.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO player_playlist_csr
+                (xuid, playlist_asset_id, current_csr, current_tier,
+                 current_sub_tier, all_time_max, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (str(xuid), playlist_asset_id, current_csr, current_tier,
+              current_sub_tier, all_time_max, datetime.now().isoformat()))
+        if commit:
+            conn.commit()
+
+    def upsert_player_csr_season(self, xuid: str, playlist_asset_id: str,
+                                 season_id: str, csr: Optional[int],
+                                 tier: Optional[str], sub_tier: Optional[int],
+                                 season_max: Optional[int],
+                                 commit: bool = True) -> None:
+        """One (player, playlist, season) point of the historic series.
+
+        season_id must already be the bare form ('CsrSeason13-3') - see the
+        table comment for why the path form must never reach here.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO player_csr_season
+                (xuid, playlist_asset_id, season_id, csr, tier, sub_tier,
+                 season_max, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (str(xuid), playlist_asset_id, season_id, csr, tier, sub_tier,
+              season_max, datetime.now().isoformat()))
+        if commit:
+            conn.commit()
+
+    def get_player_csr(self, xuid: str) -> List[sqlite3.Row]:
+        """Every playlist this player has a CSR record in, newest rank first.
+
+        Joins playlist_metadata for the display name; a playlist that has not
+        been resolved yet still returns its row, with a NULL public_name, so a
+        missing name never hides a real rank.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.*, m.public_name
+            FROM player_playlist_csr c
+            LEFT JOIN playlist_metadata m
+                   ON m.playlist_asset_id = c.playlist_asset_id
+            WHERE c.xuid = ?
+            ORDER BY COALESCE(c.all_time_max, -1) DESC
+        """, (str(xuid),))
+        return cursor.fetchall()
+
+    def get_player_csr_seasons(self, xuid: str,
+                               playlist_asset_id: Optional[str] = None) -> List[sqlite3.Row]:
+        """The historic series for a player, optionally one playlist only."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        if playlist_asset_id:
+            cursor.execute("""
+                SELECT * FROM player_csr_season
+                WHERE xuid = ? AND playlist_asset_id = ?
+                ORDER BY season_id
+            """, (str(xuid), playlist_asset_id))
+        else:
+            cursor.execute("""
+                SELECT * FROM player_csr_season
+                WHERE xuid = ?
+                ORDER BY playlist_asset_id, season_id
+            """, (str(xuid),))
+        return cursor.fetchall()
 
     def insert_or_update_player(self, xuid: str, gamertag: str = None,
                                  last_processed_at: str = None, commit: bool = True,

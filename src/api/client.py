@@ -171,6 +171,10 @@ class HaloAPIClient:
     # "No CSR data for this player here" is reported as -1, not as an error or
     # a null, on both skill endpoints (measured).
     SKILL_NO_DATA = -1
+    # Hard ceiling on the playlist-csrs endpoint, measured: 32 players returns
+    # 32 rows, 33 returns 32 - an HTTP 200 that silently drops the rest. 300
+    # players returns HTTP 414. Never raise this without re-measuring.
+    PLAYLIST_CSR_BATCH_MAX = 32
     USER_AGENT = "HaloWaypoint/2021.01.10.01"
     # Zero-network fast path for known ranked playlist asset IDs. Asset IDs
     # rotate across seasons, so this static set is only a best-effort
@@ -1441,50 +1445,93 @@ class HaloAPIClient:
         match = re.search(r'\d+', raw)
         return match.group(0) if match else None
 
+    @staticmethod
+    def _normalise_season_id(season_id: Optional[str]) -> Optional[str]:
+        """'Csr/Seasons/CsrSeason13-3.json' -> 'CsrSeason13-3'.
+
+        The service record's Subqueries reports season ids in path form, but
+        this endpoint only honours the bare id - the path form is accepted and
+        then silently ignored, yielding the CURRENT season's numbers under a
+        historic season's name. Measured live.
+        """
+        if not season_id:
+            return None
+        bare = str(season_id).rsplit("/", 1)[-1]
+        if bare.lower().endswith(".json"):
+            bare = bare[:-5]
+        return bare or None
+
     async def get_playlist_csr(self, playlist_id: str, xuids: List[str],
-                               season_id: Optional[str] = None) -> Dict[str, Dict]:
-        """Current CSR for many players in one playlist, in a single request.
+                               season_id: Optional[str] = None,
+                               include_unranked: bool = False) -> Dict[str, Dict]:
+        """Current CSR for many players in one playlist.
 
-        This is the cheap path: it answers "what rank is this player now"
-        without touching match history at all.
+        Answers "what rank is this player" without touching match history.
 
-        Returns {xuid: {'csr', 'tier', 'sub_tier', 'season_max', 'all_time_max'}}
-        for players who have a CSR here. Players with no data in this playlist
-        are OMITTED rather than returned with -1, so callers can treat presence
-        as meaning.
+        Chunked at 32 because that is the endpoint's hard ceiling: a 33rd
+        player does not error, it is silently dropped from an HTTP 200 (see
+        PLAYLIST_CSR_BATCH_MAX). Each response is checked against the number of
+        players sent, so a short answer is reported as truncation rather than
+        being mistaken for "those players have no rank".
+
+        Returns {xuid: {'csr', 'tier', 'sub_tier', 'season_max', 'all_time_max'}}.
+        By default only players who actually hold a CSR here are present, so
+        callers can treat presence as meaning.
+
+        `include_unranked=True` also returns players whose CSR is -1. Their
+        'csr' and 'season_max' stay None, but 'all_time_max' is still populated
+        if they have ever been ranked in this playlist - which is what makes a
+        cheap "has this player any history here?" probe possible.
         """
         unique = [str(x) for x in dict.fromkeys(xuids) if x]
         if not unique or not playlist_id:
             return {}
 
-        extra = [("season", season_id)] if season_id else None
-        results = await self._fetch_skill(
-            f"{self.SKILL_URL}/hi/playlist/{playlist_id}/csrs", unique, extra
-        )
-        if not results:
-            return {}
+        season = self._normalise_season_id(season_id)
+        extra = [("season", season)] if season else None
 
         out: Dict[str, Dict] = {}
-        for entry in results:
-            xuid = self._unwrap_player_id(entry)
-            result = entry.get("Result") if isinstance(entry, dict) else None
-            if not xuid or not isinstance(result, dict):
+        for i in range(0, len(unique), self.PLAYLIST_CSR_BATCH_MAX):
+            chunk = unique[i:i + self.PLAYLIST_CSR_BATCH_MAX]
+            results = await self._fetch_skill(
+                f"{self.SKILL_URL}/hi/playlist/{playlist_id}/csrs", chunk, extra
+            )
+            if not results:
                 continue
 
-            current = result.get("Current") or {}
-            csr = current.get("Value")
-            # -1 is "no CSR here", not a rank. Returning it would show players
-            # as rank -1 on every social playlist they have ever touched.
-            if not isinstance(csr, (int, float)) or csr <= self.SKILL_NO_DATA:
-                continue
+            if len(results) < len(chunk):
+                # Never observed at or below the ceiling. If it happens, the
+                # missing players are unanswered, NOT unranked - say so rather
+                # than letting them look like players with no rank.
+                print(f"[SKILL] Truncated response: sent {len(chunk)} players, "
+                      f"got {len(results)} for playlist {playlist_id}"
+                      f"{f' season {season}' if season else ''}")
 
-            out[xuid] = {
-                'csr': csr,
-                'tier': current.get("Tier") or None,
-                'sub_tier': current.get("SubTier"),
-                'season_max': (result.get("SeasonMax") or {}).get("Value"),
-                'all_time_max': (result.get("AllTimeMax") or {}).get("Value"),
-            }
+            for entry in results:
+                xuid = self._unwrap_player_id(entry)
+                result = entry.get("Result") if isinstance(entry, dict) else None
+                if not xuid or not isinstance(result, dict):
+                    continue
+
+                current = result.get("Current") or {}
+                csr = current.get("Value")
+                ranked_here = isinstance(csr, (int, float)) and csr > self.SKILL_NO_DATA
+                # -1 is "no CSR here", not a rank. Returning it as one would
+                # show rank -1 for every playlist a player has never touched.
+                if not ranked_here and not include_unranked:
+                    continue
+
+                season_max = (result.get("SeasonMax") or {}).get("Value")
+                all_time_max = (result.get("AllTimeMax") or {}).get("Value")
+                out[xuid] = {
+                    'csr': csr if ranked_here else None,
+                    'tier': (current.get("Tier") or None) if ranked_here else None,
+                    'sub_tier': current.get("SubTier") if ranked_here else None,
+                    'season_max': season_max if isinstance(season_max, (int, float))
+                                  and season_max > self.SKILL_NO_DATA else None,
+                    'all_time_max': all_time_max if isinstance(all_time_max, (int, float))
+                                    and all_time_max > self.SKILL_NO_DATA else None,
+                }
         return out
 
     async def get_match_skill(self, match_id: str, xuids: List[str]) -> Dict[str, Dict]:
