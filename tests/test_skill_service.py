@@ -383,3 +383,46 @@ def test_fill_missing_csr_survives_an_exception(monkeypatch):
     result = asyncio.run(_client()._fill_missing_csr("111", "ranked", original))
 
     assert result == original
+
+
+def test_fill_missing_csr_persists_what_it_fetched(monkeypatch):
+    # The request has already been paid for; not storing it would let the
+    # backfilled table go stale from the day it lands.
+    _install(monkeypatch, lambda p, q: _FakeResponse(
+        200, {"Value": [_csr_entry("111", 1429)]}))
+
+    written = []
+    client = _client()
+
+    class _FakeDb:
+        def upsert_player_playlist_csr(self, *args):
+            written.append(args)
+
+    client.stats_cache = type("C", (), {"db": _FakeDb()})()
+
+    result = asyncio.run(client._fill_missing_csr(
+        "111", "ranked", {"games_played": 5, "estimated_csr": None}))
+
+    assert result["estimated_csr"] == 1429
+    assert len(written) == 1
+    xuid, playlist, csr, tier, sub_tier, all_time = written[0]
+    assert (xuid, csr, tier, all_time) == ("111", 1429, "Diamond", 1560)
+    assert playlist, "playlist id was not carried through to the write"
+
+
+def test_a_failed_csr_write_does_not_fail_the_command(monkeypatch):
+    _install(monkeypatch, lambda p, q: _FakeResponse(
+        200, {"Value": [_csr_entry("111", 1429)]}))
+
+    client = _client()
+
+    class _ExplodingDb:
+        def upsert_player_playlist_csr(self, *args):
+            raise RuntimeError("disk full")
+
+    client.stats_cache = type("C", (), {"db": _ExplodingDb()})()
+
+    result = asyncio.run(client._fill_missing_csr(
+        "111", "ranked", {"games_played": 5, "estimated_csr": None}))
+
+    assert result["estimated_csr"] == 1429

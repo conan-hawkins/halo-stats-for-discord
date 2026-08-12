@@ -1638,6 +1638,22 @@ class HaloAPIClient:
             return stats
 
         print(f"[SKILL] Live CSR for {xuid}: {live.get('csr')} {live.get('tier')}")
+
+        # Keep what we just paid for. Without this the backfilled table goes
+        # stale from the day it lands and only a re-run would refresh it,
+        # whereas this request has already been made and the write is free.
+        # Through the single-writer executor, and best-effort: a stats command
+        # must not fail because a cache write did.
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                self._db_write_executor,
+                self.stats_cache.db.upsert_player_playlist_csr,
+                str(xuid), live.get('playlist_id'), live.get('csr'),
+                live.get('tier'), live.get('sub_tier'), live.get('all_time_max'),
+            )
+        except Exception as e:
+            print(f"[SKILL] Could not persist CSR for {xuid}: {e}")
+
         return {
             **stats,
             'estimated_csr': live.get('csr'),
