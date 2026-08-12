@@ -1,0 +1,389 @@
+"""
+One-time backfill of historic CSR from skill.svc into a standalone SQLite file.
+
+Writes to its OWN database, not the live one, for two reasons: the run takes
+hours and must not hold the bot's single write connection for that long, and a
+separate file makes resume trivial. Merge it in afterwards with
+`python -m src.database.csr_merge`.
+
+Run everything:      python -m src.database.csr_backfill
+Dry run:             python -m src.database.csr_backfill --limit-players 320
+Resume:              re-run the same command; completed work is skipped
+Specific playlists:  python -m src.database.csr_backfill --playlists <id> <id>
+
+Three phases:
+
+  A. discover which CsrSeason ids exist (the space is irregular - 1-1 and 2-1
+     do not exist while 1-2, 2-2 and 2-3 do, and only season 13 has three
+     sub-seasons, so this is probed rather than computed)
+  B. scope: one pass over every ranked player per playlist, current season
+     only. A player with no CSR this season STILL reports their all-time peak,
+     so this single pass answers "was this player ever ranked here"
+  C. sweep: the remaining seasons, for qualifying (player, playlist) pairs only
+
+Phase B is what makes this affordable. Without it, every player would need
+every season queried: ~341,000 requests instead of ~50,000.
+
+Safe to re-run. Every unit of work is recorded in csr_progress in the same
+transaction as the rows it produced, so a kill -9 loses at most one chunk and
+a restart re-issues no completed request.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sqlite3
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from src.api.client import HaloAPIClient
+from src.api.utils import is_token_valid, safe_read_json
+from src.config import get_token_cache_path
+
+# The template's value. The real pacing is BUCKET_SKILL inside the client;
+# this only bounds how many chunks are in flight at once.
+CONCURRENCY = 5
+
+# Probed once at startup, then cached. Bounds chosen to cover the observed
+# space (CsrSeason1-2 .. CsrSeason13-3) with room for new seasons.
+SEASON_MAJOR_MAX = 16
+SEASON_MINOR_MAX = 4
+
+# Marks a phase-B (current season) unit in csr_progress, where season_id has no
+# meaningful value. Empty string rather than NULL so it participates in the PK.
+CURRENT_SEASON = ""
+
+
+@dataclass
+class BackfillResult:
+    seasons_discovered: int = 0
+    playlists: int = 0
+    players: int = 0
+    requests: int = 0
+    units_skipped: int = 0
+    playlist_rows: int = 0
+    season_rows: int = 0
+    qualifying_pairs: int = 0
+    per_phase: Dict[str, int] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# output database
+# ---------------------------------------------------------------------------
+
+def _open_output(path: str) -> sqlite3.Connection:
+    """The standalone result file. Mirrors the two live tables exactly so the
+    merge is a plain INSERT ... SELECT with no column mapping."""
+    conn = sqlite3.connect(path, timeout=60)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS player_playlist_csr (
+            xuid TEXT NOT NULL,
+            playlist_asset_id TEXT NOT NULL,
+            current_csr INTEGER,
+            current_tier TEXT,
+            current_sub_tier INTEGER,
+            all_time_max INTEGER,
+            last_updated TEXT NOT NULL,
+            PRIMARY KEY (xuid, playlist_asset_id)
+        );
+        CREATE TABLE IF NOT EXISTS player_csr_season (
+            xuid TEXT NOT NULL,
+            playlist_asset_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            csr INTEGER,
+            tier TEXT,
+            sub_tier INTEGER,
+            season_max INTEGER,
+            last_updated TEXT NOT NULL,
+            PRIMARY KEY (xuid, playlist_asset_id, season_id)
+        );
+        -- One row per completed chunk. Written in the same transaction as the
+        -- data it covers, so "recorded" and "durable" cannot disagree.
+        CREATE TABLE IF NOT EXISTS csr_progress (
+            playlist_asset_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            done_at TEXT NOT NULL,
+            PRIMARY KEY (playlist_asset_id, season_id, chunk_index)
+        );
+        CREATE TABLE IF NOT EXISTS csr_seasons (
+            season_id TEXT PRIMARY KEY,
+            discovered_at TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+    return conn
+
+
+def _completed_units(conn: sqlite3.Connection) -> set:
+    return {(r["playlist_asset_id"], r["season_id"], r["chunk_index"])
+            for r in conn.execute("SELECT * FROM csr_progress")}
+
+
+# ---------------------------------------------------------------------------
+# inputs, read from the live database read-only
+# ---------------------------------------------------------------------------
+
+def _ranked_players(db_path: str, limit: Optional[int]) -> List[str]:
+    """Players with ranked games. Ordered, because chunk_index is only a
+    stable identity across runs if the list is stable."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+    conn.execute("PRAGMA query_only=ON")
+    sql = ("SELECT xuid FROM player_mode_stats "
+           "WHERE game_mode='ranked' AND games_played > 0 ORDER BY xuid")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    out = [str(r[0]) for r in conn.execute(sql)]
+    conn.close()
+    return out
+
+
+def _ranked_playlists(db_path: str) -> List[str]:
+    """Resolved ranked playlists, plus the two hardcoded ids that never get a
+    metadata row because the classifier short-circuits them."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+    conn.execute("PRAGMA query_only=ON")
+    ids = {r[0] for r in conn.execute(
+        "SELECT playlist_asset_id FROM playlist_metadata "
+        "WHERE resolution_status='resolved' AND is_ranked=1")}
+    conn.close()
+    ids |= set(HaloAPIClient.RANKED_PLAYLIST_IDS)
+    return sorted(ids)
+
+
+def _load_cached_spartan_accounts() -> List[Dict]:
+    """Whatever valid Spartan tokens already exist on disk, with no refresh and
+    no interactive login - this is a batch job and must never block on a
+    browser popup. Same helper shape as reclassify_playlists_backfill."""
+    accounts = []
+    for i in range(1, 6):
+        cache = safe_read_json(get_token_cache_path(i), default={})
+        spartan = cache.get("spartan") if cache else None
+        if spartan and is_token_valid(spartan):
+            accounts.append({'id': f'account{i}', 'token': spartan.get("token"),
+                             'name': f'Account {i}'})
+    return accounts
+
+
+# ---------------------------------------------------------------------------
+# phase A - which seasons exist
+# ---------------------------------------------------------------------------
+
+async def _discover_seasons(client: HaloAPIClient, out: sqlite3.Connection,
+                            playlist_id: str, sample: List[str]) -> List[str]:
+    cached = [r["season_id"] for r in out.execute(
+        "SELECT season_id FROM csr_seasons ORDER BY season_id")]
+    if cached:
+        print(f"[CSR] Using {len(cached)} cached season ids")
+        return cached
+
+    print("[CSR] Discovering season ids (the space is irregular, so probe it)...")
+    found: List[str] = []
+    for major in range(1, SEASON_MAJOR_MAX + 1):
+        for minor in range(1, SEASON_MINOR_MAX + 1):
+            season = f"CsrSeason{major}-{minor}"
+            got = await client._fetch_skill(
+                f"{client.SKILL_URL}/hi/playlist/{playlist_id}/csrs",
+                sample, [("season", season)])
+            if got is not None:
+                found.append(season)
+
+    now = datetime.now().isoformat()
+    out.executemany("INSERT OR REPLACE INTO csr_seasons VALUES (?, ?)",
+                    [(s, now) for s in found])
+    out.commit()
+    print(f"[CSR] {len(found)} seasons: {', '.join(found)}")
+    return found
+
+
+# ---------------------------------------------------------------------------
+# the work
+# ---------------------------------------------------------------------------
+
+def _chunks(items: Sequence[str], size: int) -> List[List[str]]:
+    return [list(items[i:i + size]) for i in range(0, len(items), size)]
+
+
+def _persist(out: sqlite3.Connection, playlist: str, season: str,
+             chunk_index: int, found: Dict[str, Dict]) -> Tuple[int, int]:
+    """Write one chunk's rows and its progress marker atomically.
+
+    The progress row goes in the SAME transaction as the data, so a crash can
+    never leave a chunk marked done with its rows missing.
+    """
+    now = datetime.now().isoformat()
+    playlist_rows = season_rows = 0
+    with out:  # implicit transaction; commits on clean exit
+        if season == CURRENT_SEASON:
+            for xuid, v in found.items():
+                # Only players with a history here are worth a row. A player
+                # who has never ranked in this playlist has nothing to show.
+                if v.get("all_time_max") is None and v.get("csr") is None:
+                    continue
+                out.execute("""INSERT OR REPLACE INTO player_playlist_csr
+                    (xuid, playlist_asset_id, current_csr, current_tier,
+                     current_sub_tier, all_time_max, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (xuid, playlist, v.get("csr"), v.get("tier"),
+                     v.get("sub_tier"), v.get("all_time_max"), now))
+                playlist_rows += 1
+        else:
+            for xuid, v in found.items():
+                # Absence is the signal for "did not play ranked that season",
+                # so a row without a CSR would be noise.
+                if v.get("csr") is None:
+                    continue
+                out.execute("""INSERT OR REPLACE INTO player_csr_season
+                    (xuid, playlist_asset_id, season_id, csr, tier, sub_tier,
+                     season_max, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (xuid, playlist, season, v.get("csr"), v.get("tier"),
+                     v.get("sub_tier"), v.get("season_max"), now))
+                season_rows += 1
+        out.execute("INSERT OR REPLACE INTO csr_progress VALUES (?, ?, ?, ?)",
+                    (playlist, season, chunk_index, now))
+    return playlist_rows, season_rows
+
+
+async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
+                     units: List[Tuple[str, str, int, List[str]]],
+                     result: BackfillResult, label: str) -> None:
+    """Fetch units concurrently, persist them serially.
+
+    Writes are serialised behind a lock rather than done concurrently: SQLite
+    would serialise them anyway, and doing it explicitly keeps the transaction
+    boundaries in _persist meaningful.
+    """
+    if not units:
+        print(f"[CSR] {label}: nothing to do")
+        return
+
+    sem = asyncio.Semaphore(CONCURRENCY)
+    write_lock = asyncio.Lock()
+    done = 0
+    total = len(units)
+
+    async def one(unit):
+        nonlocal done
+        playlist, season, idx, players = unit
+        async with sem:
+            found = await client.get_playlist_csr(
+                playlist, players,
+                season_id=season or None,
+                include_unranked=(season == CURRENT_SEASON),
+            )
+        result.requests += 1
+        async with write_lock:
+            p_rows, s_rows = _persist(out, playlist, season, idx, found)
+            result.playlist_rows += p_rows
+            result.season_rows += s_rows
+            done += 1
+            if done % 50 == 0 or done == total:
+                print(f"[CSR] {label}: {done}/{total} chunks "
+                      f"(+{result.playlist_rows} current, +{result.season_rows} season)")
+
+    await asyncio.gather(*(one(u) for u in units))
+    result.per_phase[label] = done
+
+
+async def backfill_csr(db_path: Optional[str] = None,
+                       out_path: Optional[str] = None,
+                       playlists: Optional[Sequence[str]] = None,
+                       limit_players: Optional[int] = None) -> BackfillResult:
+    from src.config import DATA_DIR
+
+    db_path = db_path or str(Path(DATA_DIR) / "halo_stats_v2.db")
+    out_path = out_path or str(Path.home() / "csr_backfill.db")
+    result = BackfillResult()
+
+    client = HaloAPIClient()
+    client.spartan_accounts = _load_cached_spartan_accounts()
+    if not client.spartan_accounts:
+        raise RuntimeError(
+            "No valid cached Spartan tokens in data/auth/token_cache*.json - "
+            "start the bot once so it refreshes them, then re-run.")
+    from src.api.rate_limiters import halo_stats_rate_limiter
+    halo_stats_rate_limiter.set_num_accounts(len(client.spartan_accounts))
+    print(f"[CSR] {len(client.spartan_accounts)} Spartan account(s)")
+
+    players = _ranked_players(db_path, limit_players)
+    playlist_ids = list(playlists) if playlists else _ranked_playlists(db_path)
+    result.players = len(players)
+    result.playlists = len(playlist_ids)
+    print(f"[CSR] {len(players):,} ranked players x {len(playlist_ids)} playlists")
+    if not players or not playlist_ids:
+        return result
+
+    out = _open_output(out_path)
+    print(f"[CSR] Output: {out_path}")
+
+    seasons = await _discover_seasons(client, out, playlist_ids[0], players[:8])
+    result.seasons_discovered = len(seasons)
+
+    done_units = _completed_units(out)
+    chunk_size = HaloAPIClient.PLAYLIST_CSR_BATCH_MAX
+
+    # ---- phase B: current season, everyone -------------------------------
+    scope_units = []
+    for playlist in playlist_ids:
+        for idx, chunk in enumerate(_chunks(players, chunk_size)):
+            if (playlist, CURRENT_SEASON, idx) in done_units:
+                result.units_skipped += 1
+                continue
+            scope_units.append((playlist, CURRENT_SEASON, idx, chunk))
+    await _run_units(client, out, scope_units, result, "scope")
+
+    # ---- phase C: the rest of the seasons, qualifying players only -------
+    sweep_units = []
+    for playlist in playlist_ids:
+        qualifying = [r[0] for r in out.execute(
+            "SELECT xuid FROM player_playlist_csr WHERE playlist_asset_id = ? "
+            "ORDER BY xuid", (playlist,))]
+        result.qualifying_pairs += len(qualifying)
+        if not qualifying:
+            continue
+        for season in seasons:
+            for idx, chunk in enumerate(_chunks(qualifying, chunk_size)):
+                if (playlist, season, idx) in done_units:
+                    result.units_skipped += 1
+                    continue
+                sweep_units.append((playlist, season, idx, chunk))
+    await _run_units(client, out, sweep_units, result, "sweep")
+
+    out.close()
+    return result
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db-path", help="live halo_stats_v2.db (read-only)")
+    ap.add_argument("--out", help="output SQLite file (default ~/csr_backfill.db)")
+    ap.add_argument("--playlists", nargs="*", help="restrict to these asset ids")
+    ap.add_argument("--limit-players", type=int,
+                    help="cap the player list; use for a dry run")
+    args = ap.parse_args()
+
+    r = asyncio.run(backfill_csr(db_path=args.db_path, out_path=args.out,
+                                 playlists=args.playlists,
+                                 limit_players=args.limit_players))
+    print("\n" + "=" * 60)
+    print(f"  seasons discovered : {r.seasons_discovered}")
+    print(f"  playlists x players: {r.playlists} x {r.players:,}")
+    print(f"  requests issued    : {r.requests:,}")
+    print(f"  units skipped      : {r.units_skipped:,} (already done)")
+    print(f"  qualifying pairs   : {r.qualifying_pairs:,}")
+    print(f"  current-rank rows  : {r.playlist_rows:,}")
+    print(f"  season rows        : {r.season_rows:,}")
+    print("=" * 60)
+    print("Now merge: python -m src.database.csr_merge")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
