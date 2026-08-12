@@ -30,10 +30,22 @@ import argparse
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 TABLES = ("player_playlist_csr", "player_csr_season")
+
+# HaloAPIClient.RANKED_PLAYLIST_IDS are recognised as ranked without a lookup,
+# which means _lookup_or_resolve_playlist_ranked short-circuits them and they
+# NEVER get a playlist_metadata row. That was harmless while nothing displayed
+# playlist names; now it is not. edfef3ac is Ranked Arena and is the single
+# most-played ranked playlist, so without this the busiest playlist on the site
+# renders as a raw GUID.
+HARDCODED_PLAYLIST_NAMES = {
+    "6e4e9372-5d49-4f87-b0a7-4489b5e96a0b": "Ranked Arena",
+    "edfef3ac-9cbe-4fa2-b949-8f29deafd483": "Ranked Arena",
+}
 
 
 @dataclass
@@ -41,7 +53,27 @@ class MergeResult:
     playlist_csr_rows: int = 0
     season_rows: int = 0
     orphans_skipped: int = 0
+    playlist_names_seeded: int = 0
     dry_run: bool = False
+
+
+def _seed_hardcoded_playlist_names(conn) -> int:
+    """Give the short-circuited ranked playlists a metadata row.
+
+    Only inserts where no row exists, so a name the resolver has since
+    discovered for itself always wins over this fallback.
+    """
+    seeded = 0
+    now = datetime.now().isoformat()
+    for asset_id, name in HARDCODED_PLAYLIST_NAMES.items():
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO playlist_metadata
+                   (playlist_asset_id, public_name, is_ranked, resolution_status,
+                    last_checked_at, last_version_id)
+               VALUES (?, ?, 1, 'resolved', ?, NULL)""",
+            (asset_id, name, now))
+        seeded += cur.rowcount
+    return seeded
 
 
 def merge_csr(db_path: Optional[str] = None, in_path: Optional[str] = None,
@@ -86,6 +118,7 @@ def merge_csr(db_path: Optional[str] = None, in_path: Optional[str] = None,
 
     try:
         with conn:
+            result.playlist_names_seeded = _seed_hardcoded_playlist_names(conn)
             cur = conn.execute("""
                 INSERT OR REPLACE INTO main.player_playlist_csr
                     (xuid, playlist_asset_id, current_csr, current_tier,
@@ -128,6 +161,8 @@ def main() -> int:
           f"{' (would write)' if r.dry_run else ' written'}")
     print(f"  player_csr_season   : {r.season_rows:,} rows"
           f"{' (would write)' if r.dry_run else ' written'}")
+    if r.playlist_names_seeded:
+        print(f"  playlist names seeded: {r.playlist_names_seeded}")
     if r.orphans_skipped:
         print(f"  orphans skipped     : {r.orphans_skipped:,}")
     print("=" * 56)

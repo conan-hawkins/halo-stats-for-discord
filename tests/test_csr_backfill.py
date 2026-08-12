@@ -241,3 +241,32 @@ def test_merge_dry_run_writes_nothing(tmp_path, live_db):
 def test_merge_refuses_a_missing_backfill_file(tmp_path, live_db):
     with pytest.raises(FileNotFoundError):
         csr_merge.merge_csr(db_path=live_db, in_path=str(tmp_path / "nope.db"))
+
+
+def test_merge_names_the_short_circuited_ranked_playlists(tmp_path, live_db):
+    # edfef3ac is Ranked Arena and the busiest ranked playlist, but the
+    # classifier short-circuits it so it never gets a metadata row. Without a
+    # name it would render as a raw GUID on the site.
+    from src.database.csr_merge import HARDCODED_PLAYLIST_NAMES
+
+    src = tmp_path / "csr.db"
+    _seed_backfill(src)
+    r = csr_merge.merge_csr(db_path=live_db, in_path=str(src))
+
+    assert r.playlist_names_seeded == len(HARDCODED_PLAYLIST_NAMES)
+    db = HaloStatsDBv2(live_db)
+    for asset_id, name in HARDCODED_PLAYLIST_NAMES.items():
+        assert dict(db.get_playlist_metadata(asset_id))["public_name"] == name
+
+
+def test_merge_does_not_overwrite_a_resolved_playlist_name(tmp_path, live_db):
+    # A name the resolver discovered for itself must win over the fallback.
+    asset_id = next(iter(csr_merge.HARDCODED_PLAYLIST_NAMES))
+    db = HaloStatsDBv2(live_db)
+    db.upsert_playlist_metadata(asset_id, "Ranked Arena (2029 rework)", True, "resolved")
+
+    src = tmp_path / "csr.db"
+    _seed_backfill(src)
+    csr_merge.merge_csr(db_path=live_db, in_path=str(src))
+
+    assert dict(db.get_playlist_metadata(asset_id))["public_name"] == "Ranked Arena (2029 rework)"
