@@ -69,6 +69,7 @@ class BackfillResult:
     season_rows: int = 0
     qualifying_pairs: int = 0
     failed_chunks: int = 0
+    gone_chunks: int = 0
     per_phase: Dict[str, int] = field(default_factory=dict)
 
 
@@ -304,11 +305,13 @@ async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
     write_lock = asyncio.Lock()
     done = 0
     failed = 0
+    gone = 0
     total = len(units)
 
     async def one(unit):
-        nonlocal done, failed
+        nonlocal done, failed, gone
         playlist, season, idx, players = unit
+
         async def attempt():
             return await client.get_playlist_csr(
                 playlist, players,
@@ -321,24 +324,35 @@ async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
             try:
                 found = await attempt()
             except SkillFetchError as exc:
-                # Overwhelmingly the cause is tokens ageing out mid-run, so
-                # re-read them and try once more before writing the chunk off.
-                try:
-                    if not await _reload_tokens(client):
-                        raise exc
-                    found = await attempt()
-                except SkillFetchError as exc2:
-                    # Deliberately do NOT persist. _persist writes the progress
-                    # marker in the same transaction as the rows, so recording a
-                    # failed chunk would mark it done with nothing in it - and
-                    # the resume logic would then skip it forever. Those players
-                    # would show "no CSR that season" with nothing anywhere to
-                    # say the answer was never actually received. Leave it
-                    # incomplete so a later run picks it up.
-                    failed += 1
-                    print(f"[CSR] {label}: chunk {idx} FAILED, left for a later "
-                          f"run - {exc2}")
-                    return
+                if exc.permanent:
+                    # HTTP 404: the playlist has no CSR ladder at all, or the
+                    # season is retired. It will never answer, so mark it done
+                    # with no rows - here the absence IS the answer. Retrying
+                    # is why a sweep could never reach zero failures: the
+                    # retired playlists (Survivors, FFA, Squad Battle, and the
+                    # rotated asset ids) 404 on every single attempt, so every
+                    # run burned thousands of requests re-asking them.
+                    gone += 1
+                    found = {}
+                else:
+                    try:
+                        # Overwhelmingly this is tokens ageing out mid-run, so
+                        # re-read them and try once more before writing it off.
+                        if not await _reload_tokens(client):
+                            raise exc
+                        found = await attempt()
+                    except SkillFetchError as exc2:
+                        # Deliberately do NOT persist. _persist writes the
+                        # progress marker in the same transaction as the rows,
+                        # so recording a failed chunk would mark it done with
+                        # nothing in it - and the resume logic would skip it
+                        # forever. Those players would show "no CSR that
+                        # season" with nothing anywhere to say the answer was
+                        # never actually received. Leave it incomplete.
+                        failed += 1
+                        print(f"[CSR] {label}: chunk {idx} FAILED, left for a "
+                              f"later run - {exc2}")
+                        return
         result.requests += 1
         async with write_lock:
             p_rows, s_rows = _persist(out, playlist, season, idx, found)
@@ -352,6 +366,10 @@ async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
     await asyncio.gather(*(one(u) for u in units))
     result.per_phase[label] = done
     result.failed_chunks += failed
+    result.gone_chunks += gone
+    if gone:
+        print(f"[CSR] {label}: {gone} chunk(s) 404'd (no ladder / retired "
+              f"season) and are recorded as empty, not retried.")
     if failed:
         print(f"[CSR] {label}: {failed} chunk(s) got no answer and were NOT "
               f"marked done. Re-run to fill them.")
@@ -443,6 +461,7 @@ def main() -> int:
     print(f"  playlists x players: {r.playlists} x {r.players:,}")
     print(f"  requests issued    : {r.requests:,}")
     print(f"  units skipped      : {r.units_skipped:,} (already done)")
+    print(f"  404 chunks         : {r.gone_chunks:,} (no ladder/retired; recorded empty)")
     print(f"  FAILED chunks      : {r.failed_chunks:,} (no answer; re-run to fill)")
     print(f"  qualifying pairs   : {r.qualifying_pairs:,}")
     print(f"  current-rank rows  : {r.playlist_rows:,}")

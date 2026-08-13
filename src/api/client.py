@@ -138,7 +138,21 @@ class SkillFetchError(RuntimeError):
     only shrug either way. It is not fine for anything that RECORDS the answer,
     because "no rows" then gets written down as fact and never revisited. Any
     caller persisting a result should ask for strict=True and let this raise.
+
+    `status` carries the HTTP status (0 when no request completed), because
+    "retry this" and "this will never work" are different answers and a
+    resumable job needs to tell them apart. 404 is permanent: the playlist has
+    no CSR concept, or the season is retired. Retrying it forever means a
+    resumable job can never finish.
     """
+
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def permanent(self) -> bool:
+        return self.status == 404
 
 
 class HaloAPIClient:
@@ -1523,19 +1537,21 @@ class HaloAPIClient:
         out: Dict[str, Dict] = {}
         for i in range(0, len(unique), self.PLAYLIST_CSR_BATCH_MAX):
             chunk = unique[i:i + self.PLAYLIST_CSR_BATCH_MAX]
-            results = await self._fetch_skill(
+            status, results = await self._fetch_skill_ex(
                 f"{self.SKILL_URL}/hi/playlist/{playlist_id}/csrs", chunk, extra
             )
             if not results:
-                # None means "no data OR the request failed" - indistinguishable
-                # here. Skipping is right for display, but a caller writing this
-                # down needs to know it never got an answer, or it will record
-                # the silence as "these players have no CSR" for good.
+                # A bare None means "no data OR the request failed" -
+                # indistinguishable. Skipping is right for display, but a caller
+                # writing this down needs to know it never got an answer, or it
+                # will record the silence as "these players have no CSR" for
+                # good. The status rides along so the caller can also tell a
+                # permanent 404 from something worth retrying.
                 if strict:
                     raise SkillFetchError(
-                        f"no answer for playlist {playlist_id}"
+                        f"no answer (HTTP {status}) for playlist {playlist_id}"
                         f"{f' season {season}' if season else ''}, "
-                        f"{len(chunk)} players")
+                        f"{len(chunk)} players", status=status)
                 continue
 
             if len(results) < len(chunk):
@@ -1600,6 +1616,7 @@ class HaloAPIClient:
                 raise SkillFetchError(f"no answer for match {match_id}, "
                                       f"{len(unique)} players")
             return {}
+
 
         out: Dict[str, Dict] = {}
         for entry in results:
