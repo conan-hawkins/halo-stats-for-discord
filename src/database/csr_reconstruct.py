@@ -175,6 +175,13 @@ def _open_output(path: str) -> sqlite3.Connection:
             started TEXT NOT NULL,
             pre_csr INTEGER,
             post_csr INTEGER,
+            -- Placement state, straight from the recap. A player is not ranked
+            -- until MeasurementMatchesRemaining hits 0, and CSR reads -1 the
+            -- whole way there. Storing it turns "-1, we know nothing" into
+            -- "provably unranked, N of 10 placement matches played", which is
+            -- a fact worth showing rather than a gap.
+            placement_left INTEGER,
+            placement_total INTEGER,
             PRIMARY KEY (xuid, match_id)
         );
         CREATE INDEX IF NOT EXISTS idx_obs_ladder_started
@@ -201,10 +208,29 @@ def _open_output(path: str) -> sqlite3.Connection:
             csr INTEGER,
             season_max INTEGER,
             matches INTEGER,
+            -- What this row is allowed to claim. See classify() - publishing a
+            -- 'floor' as if it were a peak is what would make the site less
+            -- accurate, not more.
+            status TEXT,
+            placement_played INTEGER,
             derived_at TEXT NOT NULL,
             PRIMARY KEY (xuid, ladder_id, season_id)
         );
     """)
+    # Migrations. The observations are expensive (one API request each) and the
+    # season rows are not (pure derivation), so columns are ADDED to the former
+    # and the latter is simply rebuilt.
+    cols = {r[1] for r in out.execute("PRAGMA table_info(csr_observation)")}
+    for col in ("placement_left", "placement_total"):
+        if col not in cols:
+            out.execute(f"ALTER TABLE csr_observation ADD COLUMN {col} INTEGER")
+    if "status" not in {r[1] for r in out.execute("PRAGMA table_info(recon_season)")}:
+        out.execute("DROP TABLE recon_season")
+        out.execute("""CREATE TABLE recon_season (
+            xuid TEXT NOT NULL, ladder_id TEXT NOT NULL, season_id TEXT NOT NULL,
+            csr INTEGER, season_max INTEGER, matches INTEGER, status TEXT,
+            placement_played INTEGER, derived_at TEXT NOT NULL,
+            PRIMARY KEY (xuid, ladder_id, season_id))""")
     out.commit()
     return out
 
@@ -312,15 +338,22 @@ async def harvest(db_path: str, out_path: str, start: str, end: str,
                 if not xuid or not isinstance(res, dict):
                     continue
                 recap = res.get("RankRecap") or {}
+                post_block = recap.get("PostMatchCsr") or {}
                 pre = (recap.get("PreMatchCsr") or {}).get("Value")
-                post = (recap.get("PostMatchCsr") or {}).get("Value")
-                # -1 is "unplaced on a live ladder" and 0/0 is "unranked match";
-                # neither is a rank, so neither is worth a row.
+                post = post_block.get("Value")
+                left = post_block.get("MeasurementMatchesRemaining")
+                total = post_block.get("InitialMeasurementMatches")
+                # -1 is "not ranked yet" and 0/0 is "unranked match"; neither is
+                # a rank. But the placement counters alongside them ARE
+                # meaningful, so a -1 row is kept when it can say WHY.
                 pre = pre if isinstance(pre, int) and pre > 0 else None
                 post = post if isinstance(post, int) and post > 0 else None
-                if pre is None and post is None:
+                placement = isinstance(left, int) and isinstance(total, int) and total > 0
+                if pre is None and post is None and not placement:
                     continue
-                rows.append((str(xuid), ladder, mid, started, pre, post))
+                rows.append((str(xuid), ladder, mid, started, pre, post,
+                             left if placement else None,
+                             total if placement else None))
 
         await asyncio.gather(*(one(*m) for m in batch))
         result.failed += failed
@@ -330,7 +363,7 @@ async def harvest(db_path: str, out_path: str, start: str, end: str,
         # rather than leaving a permanent hole nothing records.
         with out:
             out.executemany(
-                "INSERT OR REPLACE INTO csr_observation VALUES (?,?,?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO csr_observation VALUES (?,?,?,?,?,?,?,?)", rows)
             out.executemany(
                 "INSERT OR REPLACE INTO recon_unavailable VALUES (?,?,?)", gone)
             if not failed:
@@ -388,17 +421,53 @@ def aggregate(out_path: str, db_path: Optional[str] = None) -> None:
     if db_path:
         fixed = _repair_ladders(out, db_path)
         print(f"[RECON] ladder repair: {fixed:,} observations re-pointed")
+
+    live = None
+    if db_path:
+        live = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        live.execute("PRAGMA query_only=ON")
+
     now = datetime.now().isoformat()
     for season, a, b in SEASON_WINDOWS:
         rows = out.execute(
             "SELECT xuid, ladder_id,"
             "       MAX(MAX(COALESCE(pre_csr,-1), COALESCE(post_csr,-1))) AS peak,"
+            "       MIN(COALESCE(placement_left, 99)) AS min_left,"
+            "       MAX(COALESCE(placement_total, 0)) AS total,"
             "       COUNT(*) AS n"
             "  FROM csr_observation"
             " WHERE started >= ? AND started < ?"
             " GROUP BY xuid, ladder_id", (a, b)).fetchall()
-        keep = [(r["xuid"], r["ladder_id"], season, None, r["peak"], r["n"], now)
-                for r in rows if (r["peak"] or -1) > 0]
+
+        keep = []
+        tally = {"exact": 0, "floor": 0, "unranked": 0}
+        for r in rows:
+            peak = r["peak"] if (r["peak"] or -1) > 0 else None
+            if peak is None:
+                # No CSR ever seen. If the recaps showed placement counters,
+                # that is not missing data - the player provably never ranked
+                # here that season. Their K/D still stands; their rank does
+                # not exist. Anything else is a gap, so record nothing.
+                if r["total"]:
+                    played = r["total"] - min(r["min_left"], r["total"])
+                    keep.append((r["xuid"], r["ladder_id"], season, None, None,
+                                 r["n"], "unranked", played, now))
+                    tally["unranked"] += 1
+                continue
+            status = "floor"
+            if live is not None:
+                atm = live.execute(
+                    "SELECT all_time_max FROM player_playlist_csr"
+                    " WHERE xuid=? AND playlist_asset_id=?",
+                    (r["xuid"], r["ladder_id"])).fetchone()
+                # Reconstruction can only undershoot, so reaching the
+                # authoritative all-time max proves the true peak was found.
+                if atm and atm[0] is not None and peak == atm[0]:
+                    status = "exact"
+            keep.append((r["xuid"], r["ladder_id"], season, None, peak,
+                         r["n"], status, None, now))
+            tally[status] += 1
+
         with out:
             # Rebuild the season from scratch. INSERT OR REPLACE alone would
             # leave behind rows keyed on an asset id this run no longer
@@ -406,8 +475,63 @@ def aggregate(out_path: str, db_path: Optional[str] = None) -> None:
             # still reported 127 impossible values from the previous, wrongly
             # canonicalised run.
             out.execute("DELETE FROM recon_season WHERE season_id = ?", (season,))
-            out.executemany("INSERT OR REPLACE INTO recon_season VALUES (?,?,?,?,?,?,?)", keep)
-        print(f"[RECON] {season}: {len(keep):,} (player, ladder) rows from {len(rows):,} groups")
+            out.executemany(
+                "INSERT OR REPLACE INTO recon_season VALUES (?,?,?,?,?,?,?,?,?)", keep)
+        print(f"[RECON] {season}: {len(keep):,} rows  "
+              f"exact={tally['exact']:,}  floor={tally['floor']:,}  "
+              f"unranked={tally['unranked']:,}")
+    if live is not None:
+        live.close()
+
+
+def merge(out_path: str, db_path: str) -> None:
+    """Publish reconstructed seasons into the live DB, in their own table.
+
+    Deliberately NOT written into player_csr_season. Most reconstructed values
+    are floors, not peaks (see bot_docs/CSR_SEASON1_RECONSTRUCTION.md), and
+    anything reading player_csr_season today would present them as peaks - a
+    player who peaked at 1700 would be shown as 1250. A separate table with an
+    explicit `status` means no existing reader changes behaviour, and the site
+    can adopt it deliberately, honouring the claim each row is allowed to make.
+
+    The bot is the single writer of halo_stats_v2.db. This takes one short
+    transaction with a long busy timeout rather than requiring it to be stopped.
+    """
+    out = _open_output(out_path)
+    rows = out.execute(
+        "SELECT xuid, ladder_id, season_id, season_max, matches, status,"
+        "       placement_played, derived_at FROM recon_season").fetchall()
+
+    live = sqlite3.connect(db_path, timeout=30)
+    live.execute("PRAGMA busy_timeout=30000")
+    live.execute("""
+        CREATE TABLE IF NOT EXISTS player_csr_season_derived (
+            xuid TEXT NOT NULL,
+            playlist_asset_id TEXT NOT NULL,
+            season_id TEXT NOT NULL,
+            season_max INTEGER,
+            matches_observed INTEGER,
+            -- 'exact'    : reached all_time_max, provably the true peak
+            -- 'floor'    : a real CSR, but coverage cannot prove it is the peak
+            --              -> may only ever be shown as "at least X"
+            -- 'unranked' : placement counters present, never placed
+            status TEXT NOT NULL,
+            placement_played INTEGER,
+            derived_at TEXT NOT NULL,
+            PRIMARY KEY (xuid, playlist_asset_id, season_id)
+        )""")
+    live.execute("CREATE INDEX IF NOT EXISTS idx_csr_derived_xuid"
+                 " ON player_csr_season_derived (xuid)")
+    with live:
+        live.execute("DELETE FROM player_csr_season_derived")
+        live.executemany(
+            "INSERT OR REPLACE INTO player_csr_season_derived VALUES (?,?,?,?,?,?,?,?)",
+            [tuple(r) for r in rows])
+    n = live.execute("SELECT COUNT(*) FROM player_csr_season_derived").fetchone()[0]
+    by = dict(live.execute("SELECT status, COUNT(*) FROM player_csr_season_derived"
+                           " GROUP BY status").fetchall())
+    live.close()
+    print(f"[RECON] merged {n:,} rows into player_csr_season_derived  {by}")
 
 
 def main() -> int:
@@ -421,6 +545,8 @@ def main() -> int:
                     help=f"shared with the live bot - keep it low (default {DEFAULT_CONCURRENCY})")
     ap.add_argument("--dry-run", action="store_true", help="count matches, fetch nothing")
     ap.add_argument("--aggregate", action="store_true", help="build season rows from observations")
+    ap.add_argument("--merge", action="store_true",
+                    help="publish season rows into the live DB (own table, not player_csr_season)")
     args = ap.parse_args()
 
     from src.config import DATA_DIR
@@ -429,6 +555,10 @@ def main() -> int:
 
     if args.aggregate:
         aggregate(out_path, db_path)
+        return 0
+
+    if args.merge:
+        merge(out_path, db_path)
         return 0
 
     r = asyncio.run(harvest(db_path, out_path, args.start, args.end,
