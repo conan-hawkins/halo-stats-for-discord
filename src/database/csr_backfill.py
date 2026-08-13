@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -251,6 +252,41 @@ def _persist(out: sqlite3.Connection, playlist: str, season: str,
     return playlist_rows, season_rows
 
 
+_last_token_reload = 0.0
+_token_reload_lock: Optional[asyncio.Lock] = None
+
+
+async def _reload_tokens(client: HaloAPIClient) -> bool:
+    """Re-read the Spartan tokens the bot keeps refreshed on disk.
+
+    The backfill snapshots tokens once at startup and holds them for the whole
+    run. A full sweep takes over an hour, Spartan tokens do not last that long,
+    and the bot rewrites the caches as it refreshes them - so the run carries on
+    presenting an in-memory copy that expired, and every request 401s from there
+    on. Measured: a single sweep lost 18,099 chunks that way, then 10,664 on the
+    next pass, converging only because each re-run re-read the cache at startup.
+
+    Reloading on the first 401 collapses that into one run. Rate-limited so a
+    burst of concurrent 401s reloads once, not once per chunk.
+    """
+    global _last_token_reload, _token_reload_lock
+    if _token_reload_lock is None:
+        _token_reload_lock = asyncio.Lock()
+    async with _token_reload_lock:
+        now = time.monotonic()
+        if now - _last_token_reload < 30:
+            return False          # someone else just did it; use theirs
+        accounts = _load_cached_spartan_accounts()
+        if not accounts:
+            return False
+        client.spartan_accounts = accounts
+        from src.api.rate_limiters import halo_stats_rate_limiter
+        halo_stats_rate_limiter.set_num_accounts(len(accounts))
+        _last_token_reload = now
+        print(f"[CSR] reloaded {len(accounts)} Spartan token(s) from cache")
+        return True
+
+
 async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
                      units: List[Tuple[str, str, int, List[str]]],
                      result: BackfillResult, label: str) -> None:
@@ -273,26 +309,36 @@ async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
     async def one(unit):
         nonlocal done, failed
         playlist, season, idx, players = unit
+        async def attempt():
+            return await client.get_playlist_csr(
+                playlist, players,
+                season_id=season or None,
+                include_unranked=(season == CURRENT_SEASON),
+                strict=True,
+            )
+
         async with sem:
             try:
-                found = await client.get_playlist_csr(
-                    playlist, players,
-                    season_id=season or None,
-                    include_unranked=(season == CURRENT_SEASON),
-                    strict=True,
-                )
+                found = await attempt()
             except SkillFetchError as exc:
-                # Deliberately do NOT persist. _persist writes the progress
-                # marker in the same transaction as the rows, so recording a
-                # failed chunk would mark it done with nothing in it - and the
-                # resume logic would then skip it forever. Those players would
-                # show "no CSR that season" with nothing anywhere to say the
-                # answer was never actually received. Leave it incomplete so a
-                # later run picks it up.
-                failed += 1
-                print(f"[CSR] {label}: chunk {idx} FAILED, left for a later "
-                      f"run - {exc}")
-                return
+                # Overwhelmingly the cause is tokens ageing out mid-run, so
+                # re-read them and try once more before writing the chunk off.
+                try:
+                    if not await _reload_tokens(client):
+                        raise exc
+                    found = await attempt()
+                except SkillFetchError as exc2:
+                    # Deliberately do NOT persist. _persist writes the progress
+                    # marker in the same transaction as the rows, so recording a
+                    # failed chunk would mark it done with nothing in it - and
+                    # the resume logic would then skip it forever. Those players
+                    # would show "no CSR that season" with nothing anywhere to
+                    # say the answer was never actually received. Leave it
+                    # incomplete so a later run picks it up.
+                    failed += 1
+                    print(f"[CSR] {label}: chunk {idx} FAILED, left for a later "
+                          f"run - {exc2}")
+                    return
         result.requests += 1
         async with write_lock:
             p_rows, s_rows = _persist(out, playlist, season, idx, found)
