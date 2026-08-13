@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from src.api.client import HaloAPIClient
+from src.api.client import HaloAPIClient, SkillFetchError
 from src.api.utils import is_token_valid, safe_read_json
 from src.config import get_token_cache_path
 
@@ -67,6 +67,7 @@ class BackfillResult:
     playlist_rows: int = 0
     season_rows: int = 0
     qualifying_pairs: int = 0
+    failed_chunks: int = 0
     per_phase: Dict[str, int] = field(default_factory=dict)
 
 
@@ -266,17 +267,32 @@ async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
     sem = asyncio.Semaphore(CONCURRENCY)
     write_lock = asyncio.Lock()
     done = 0
+    failed = 0
     total = len(units)
 
     async def one(unit):
-        nonlocal done
+        nonlocal done, failed
         playlist, season, idx, players = unit
         async with sem:
-            found = await client.get_playlist_csr(
-                playlist, players,
-                season_id=season or None,
-                include_unranked=(season == CURRENT_SEASON),
-            )
+            try:
+                found = await client.get_playlist_csr(
+                    playlist, players,
+                    season_id=season or None,
+                    include_unranked=(season == CURRENT_SEASON),
+                    strict=True,
+                )
+            except SkillFetchError as exc:
+                # Deliberately do NOT persist. _persist writes the progress
+                # marker in the same transaction as the rows, so recording a
+                # failed chunk would mark it done with nothing in it - and the
+                # resume logic would then skip it forever. Those players would
+                # show "no CSR that season" with nothing anywhere to say the
+                # answer was never actually received. Leave it incomplete so a
+                # later run picks it up.
+                failed += 1
+                print(f"[CSR] {label}: chunk {idx} FAILED, left for a later "
+                      f"run - {exc}")
+                return
         result.requests += 1
         async with write_lock:
             p_rows, s_rows = _persist(out, playlist, season, idx, found)
@@ -289,6 +305,10 @@ async def _run_units(client: HaloAPIClient, out: sqlite3.Connection,
 
     await asyncio.gather(*(one(u) for u in units))
     result.per_phase[label] = done
+    result.failed_chunks += failed
+    if failed:
+        print(f"[CSR] {label}: {failed} chunk(s) got no answer and were NOT "
+              f"marked done. Re-run to fill them.")
 
 
 async def backfill_csr(db_path: Optional[str] = None,
@@ -377,6 +397,7 @@ def main() -> int:
     print(f"  playlists x players: {r.playlists} x {r.players:,}")
     print(f"  requests issued    : {r.requests:,}")
     print(f"  units skipped      : {r.units_skipped:,} (already done)")
+    print(f"  FAILED chunks      : {r.failed_chunks:,} (no answer; re-run to fill)")
     print(f"  qualifying pairs   : {r.qualifying_pairs:,}")
     print(f"  current-rank rows  : {r.playlist_rows:,}")
     print(f"  season rows        : {r.season_rows:,}")

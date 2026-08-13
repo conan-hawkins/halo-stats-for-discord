@@ -130,6 +130,17 @@ def _parse_retry_after(value) -> Optional[float]:
 # =============================================================================
 
 
+class SkillFetchError(RuntimeError):
+    """A skill.svc request failed, as distinct from returning no data.
+
+    _fetch_skill answers None for BOTH "this ladder/season does not exist" and
+    "the request failed", which is fine for the bot's display paths - they can
+    only shrug either way. It is not fine for anything that RECORDS the answer,
+    because "no rows" then gets written down as fact and never revisited. Any
+    caller persisting a result should ask for strict=True and let this raise.
+    """
+
+
 class HaloAPIClient:
     """
     Async client for interacting with the Halo Infinite API.
@@ -1463,7 +1474,8 @@ class HaloAPIClient:
 
     async def get_playlist_csr(self, playlist_id: str, xuids: List[str],
                                season_id: Optional[str] = None,
-                               include_unranked: bool = False) -> Dict[str, Dict]:
+                               include_unranked: bool = False,
+                               strict: bool = False) -> Dict[str, Dict]:
         """Current CSR for many players in one playlist.
 
         Answers "what rank is this player" without touching match history.
@@ -1497,6 +1509,15 @@ class HaloAPIClient:
                 f"{self.SKILL_URL}/hi/playlist/{playlist_id}/csrs", chunk, extra
             )
             if not results:
+                # None means "no data OR the request failed" - indistinguishable
+                # here. Skipping is right for display, but a caller writing this
+                # down needs to know it never got an answer, or it will record
+                # the silence as "these players have no CSR" for good.
+                if strict:
+                    raise SkillFetchError(
+                        f"no answer for playlist {playlist_id}"
+                        f"{f' season {season}' if season else ''}, "
+                        f"{len(chunk)} players")
                 continue
 
             if len(results) < len(chunk):
@@ -1534,11 +1555,17 @@ class HaloAPIClient:
                 }
         return out
 
-    async def get_match_skill(self, match_id: str, xuids: List[str]) -> Dict[str, Dict]:
+    async def get_match_skill(self, match_id: str, xuids: List[str],
+                              strict: bool = False) -> Dict[str, Dict]:
         """CSR movement and team MMR for the players of one match.
 
         One request covers the whole roster, so this costs one extra request
         per match regardless of how many players are being recorded.
+
+        This is the ONLY surviving source of CSR for retired seasons: once a
+        CsrSeason stops being served by the playlist endpoint, the per-match
+        recaps for that era still answer. Anything recording that history
+        should pass strict=True - see SkillFetchError.
 
         Returns {xuid: {'pre_csr', 'post_csr', 'tier', 'sub_tier', 'team_mmr',
         'team_id', 'expected_kills', 'expected_deaths'}}.
@@ -1551,6 +1578,9 @@ class HaloAPIClient:
             f"{self.SKILL_URL}/hi/matches/{match_id}/skill", unique
         )
         if not results:
+            if strict:
+                raise SkillFetchError(f"no answer for match {match_id}, "
+                                      f"{len(unique)} players")
             return {}
 
         out: Dict[str, Dict] = {}
