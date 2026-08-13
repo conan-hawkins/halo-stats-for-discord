@@ -1398,9 +1398,27 @@ class HaloAPIClient:
         Both skill endpoints take repeated `players=xuid(...)` params and answer
         with {"Value": [{"Id": "xuid(...)", "Result": {...}}, ...]}, so one
         request covers a whole match roster or a whole comparison group.
+
+        Collapsing every outcome into None loses the difference between "this
+        does not exist" (404, permanent) and "the request failed" (retry). That
+        is fine for display and wrong for anything that records the answer - use
+        _fetch_skill_ex there and decide for yourself.
+        """
+        _, value = await self._fetch_skill_ex(url, xuids, extra_params)
+        return value
+
+    async def _fetch_skill_ex(self, url: str, xuids: List[str],
+                              extra_params: Optional[List[Tuple[str, str]]] = None
+                              ) -> Tuple[int, Optional[List[Dict]]]:
+        """As _fetch_skill, but reports the HTTP status alongside the payload.
+
+        Returns (status, value). Status is 0 when no request completed at all -
+        no token, or a transport-level failure. The distinction callers usually
+        want is 404 (gone for good: a retired season, a social playlist, a match
+        whose recap is no longer served) versus anything else (worth retrying).
         """
         if not xuids:
-            return None
+            return 0, None
 
         params: List[Tuple[str, str]] = [("players", f"xuid({x})") for x in xuids]
         if extra_params:
@@ -1413,7 +1431,7 @@ class HaloAPIClient:
                 if isinstance(spartan_token, dict) and 'token' in spartan_token:
                     spartan_token = spartan_token['token']
                 if not spartan_token:
-                    return None
+                    return 0, None
 
                 headers = {
                     "Authorization": f"Spartan {spartan_token}",
@@ -1429,7 +1447,7 @@ class HaloAPIClient:
                             halo_stats_rate_limiter.note_result(BUCKET_SKILL, rate_limited=False)
                             payload = await response.json()
                             value = payload.get("Value") if isinstance(payload, dict) else None
-                            return value if isinstance(value, list) else None
+                            return 200, (value if isinstance(value, list) else None)
 
                         if response.status == 429:
                             halo_stats_rate_limiter.note_result(BUCKET_SKILL, rate_limited=True)
@@ -1441,11 +1459,11 @@ class HaloAPIClient:
                         # playlist), which is a normal answer, not a fault.
                         elif response.status != 404:
                             print(f"[SKILL] {url} returned {response.status}")
-                        return None
+                        return response.status, None
 
         except Exception as e:
             print(f"[SKILL] Request failed: {e}")
-            return None
+            return 0, None
 
     @staticmethod
     def _unwrap_player_id(entry: Dict) -> Optional[str]:
