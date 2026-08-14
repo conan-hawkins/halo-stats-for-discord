@@ -73,13 +73,19 @@ async def main() -> int:
         f" ORDER BY last_processed_at DESC LIMIT {int(args.limit)}")]
     print(f"[CAREER] {len(todo):,} players to resolve (batch {BATCH})")
 
-    resolved = 0
+    resolved = failed = 0
     for i in range(0, len(todo), BATCH):
         chunk = todo[i:i + BATCH]
-        resolved += await progression.refresh_career_ranks(client, db, chunk)
+        try:
+            resolved += await progression.refresh_career_ranks(client, db, chunk)
+        except Exception as e:
+            # Nothing is written for a failed chunk, so those players keep a
+            # NULL timestamp and the next run picks them up. Never marked done.
+            failed += 1
+            print(f"[CAREER] chunk at {i} FAILED, left for a later run - {e}")
         if (i // BATCH) % 20 == 0 or i + BATCH >= len(todo):
             print(f"[CAREER] {min(i + BATCH, len(todo)):,}/{len(todo):,}"
-                  f"  resolved={resolved:,}")
+                  f"  resolved={resolved:,}  failed_chunks={failed}")
         await asyncio.sleep(0.15)
 
     have = db.execute(

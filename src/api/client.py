@@ -1768,6 +1768,13 @@ class HaloAPIClient:
                                 retry_after = _parse_retry_after(response.headers.get('Retry-After'))
                                 halo_stats_rate_limiter.set_backoff(
                                     account_index=account_index, seconds=retry_after or 5.0)
+                            else:
+                                # Say which account and which status. A silent
+                                # skip here reads as "these players have no
+                                # career rank" when the real answer is "account
+                                # 3's token is dead".
+                                print(f"[CAREER] account {account_index} -> HTTP "
+                                      f"{status} for {len(chunk)} player(s)")
             except Exception as e:
                 print(f"[CAREER] request failed for {len(chunk)} player(s): {e}")
 
@@ -1792,6 +1799,14 @@ class HaloAPIClient:
                 progress = ((entry.get("Result") or {}).get("CurrentProgress") or {})
                 rank = progress.get("Rank")
                 if not xuid or not isinstance(rank, int):
+                    continue
+                # Rank 0 is a SENTINEL, not a rank: the ladder is 1 (Recruit) to
+                # 272 (Hero) and 343 has no definition for 0. It means the player
+                # has no career progression, and 22% of a first backfill came
+                # back this way. Storing it as a rank would put an unrankable
+                # number in the database and inflate every "has a rank" count -
+                # the same shape of mistake as treating CSR -1 as a rating.
+                if rank <= 0:
                     continue
                 out[str(xuid)] = {
                     "rank": rank,

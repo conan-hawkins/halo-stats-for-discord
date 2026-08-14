@@ -73,25 +73,41 @@ async def refresh_gamerpics(client, conn: sqlite3.Connection,
 
 async def refresh_career_ranks(client, conn: sqlite3.Connection,
                                xuids: Iterable[str]) -> int:
-    """Fetch and store career ranks. Returns how many were written.
+    """Fetch and store career ranks. Returns how many real ranks were written.
 
-    Absent players are left untouched rather than zeroed: the endpoint omits
-    anyone it has nothing for, and writing that down as rank 0 would turn "we
-    do not know" into a claim.
+    Three outcomes, and they must not be conflated:
+
+      a real rank      stored, with the timestamp
+      no career rank   the endpoint answered but omitted this player, or gave
+                       the rank-0 sentinel. Stored as NULL WITH a timestamp, so
+                       we record that we asked and stop asking every run.
+      request failed   nothing written at all. strict=True makes the client
+                       raise rather than return an empty dict, because
+                       otherwise a 401 looks exactly like "nobody has a rank"
+                       and would stamp the whole batch as answered - which is
+                       precisely how the CSR backfill destroyed 13,889 rows.
     """
     wanted = [str(x) for x in dict.fromkeys(xuids) if x]
     if not wanted:
         return 0
-    resolved = await client.get_career_ranks(wanted)
-    if not resolved:
-        return 0
+
+    resolved = await client.get_career_ranks(wanted, strict=True)
+
     now = datetime.now().isoformat()
+    absent = [x for x in wanted if x not in resolved]
     with conn:
-        conn.executemany(
-            "UPDATE players SET career_rank = ?, career_partial_progress = ?,"
-            "       career_rank_updated_at = ? WHERE xuid = ?",
-            [(v["rank"], v.get("partial_progress"), now, xuid)
-             for xuid, v in resolved.items()])
+        if resolved:
+            conn.executemany(
+                "UPDATE players SET career_rank = ?, career_partial_progress = ?,"
+                "       career_rank_updated_at = ? WHERE xuid = ?",
+                [(v["rank"], v.get("partial_progress"), now, xuid)
+                 for xuid, v in resolved.items()])
+        if absent:
+            conn.executemany(
+                "UPDATE players SET career_rank = NULL,"
+                "       career_partial_progress = NULL,"
+                "       career_rank_updated_at = ? WHERE xuid = ?",
+                [(now, xuid) for xuid in absent])
     return len(resolved)
 
 
@@ -111,7 +127,12 @@ async def on_player_viewed(client, conn: sqlite3.Connection, xuid: str,
         state = read_state(conn, xuid)
         never_fetched = state and not state.get("career_rank_updated_at")
         if (new_matches or 0) > 0 or never_fetched:
-            done["career_rank"] = await refresh_career_ranks(client, conn, [xuid])
+            try:
+                done["career_rank"] = await refresh_career_ranks(client, conn, [xuid])
+            except Exception as e:
+                # A failed fetch writes nothing, so the next view retries. Only
+                # an actual answer is ever recorded.
+                print(f"[PROGRESSION] career rank fetch failed for {xuid}: {e}")
     except Exception as e:
         # Upkeep must never break the refresh the page is actually waiting on.
         print(f"[PROGRESSION] upkeep failed for {xuid}: {e}")
