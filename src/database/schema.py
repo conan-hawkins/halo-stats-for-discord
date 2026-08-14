@@ -269,6 +269,32 @@ class HaloStatsDBv2:
         # API service holds no Halo credentials of its own.
         self._ensure_column_exists("players", "gamerpic", "TEXT")
         self._ensure_column_exists("players", "gamerpic_updated_at", "TEXT")
+        # Career rank (1..272) and XP into it. The *_updated_at column is not
+        # decoration: it is the only way to tell "rank 1, freshly measured" from
+        # "never fetched", and the only way staleness is visible rather than
+        # assumed. Career XP only moves when a player plays, so this is
+        # refreshed on new-match activity rather than on a timer.
+        self._ensure_column_exists("players", "career_rank", "INTEGER")
+        self._ensure_column_exists("players", "career_partial_progress", "INTEGER")
+        self._ensure_column_exists("players", "career_rank_updated_at", "TEXT")
+
+        # The 272 static career rank definitions, seeded from gamecms. Separate
+        # table because it is per-rank, not per-player, and identical for
+        # everyone. icon_path is stored VERBATIM from 343: rank 192's icon is
+        # "69_Corporal_Diamond_II.png", so the art numbering is unrelated to the
+        # rank number and must never be constructed.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS career_rank_defs (
+                rank INTEGER PRIMARY KEY,
+                title TEXT,
+                subtitle TEXT,
+                tier TEXT,
+                xp_required INTEGER,
+                icon_path TEXT,
+                large_icon_path TEXT,
+                adornment_icon_path TEXT
+            )
+        """)
 
         # ============================================================
         # Table 2b: Player Failed Matches - specific match IDs whose detail

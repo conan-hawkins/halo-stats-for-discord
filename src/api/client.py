@@ -189,6 +189,26 @@ class HaloAPIClient:
     # one by one would have.
     PROFILE_ISOLATION_BUDGET = 16
     DISCOVERY_UGC_URL = "https://discovery-infiniteugc.svc.halowaypoint.com"
+    # Career rank. Two forms of the same data with DIFFERENT permissions: the
+    # per-player path /hi/players/xuid(X)/rewardtracks/careerranks/careerrank1
+    # is self-only and 403s for anyone else, while this batch form serves any
+    # player - which is how the game shows you someone else's rank.
+    #
+    # Needs the `343-clearance` header (NOT x-343-authorization-clearance, which
+    # is what the stats paths send) or it answers 400 with an empty body.
+    ECONOMY_URL = "https://economy.svc.halowaypoint.com"
+    # Hard ceiling, measured: 32 players answer, and a 33rd is SILENTLY dropped
+    # from an HTTP 200 - exactly like the skill endpoint. Every response must be
+    # checked against the number of players sent.
+    CAREER_RANK_BATCH_MAX = 32
+    # The 272 career rank definitions (titles, XP, icon paths). Static content,
+    # so it is fetched once and stored rather than per player.
+    CAREER_RANK_TRACK_URL = ("https://gamecms-hacs.svc.halowaypoint.com/hi/Progression"
+                             "/file/RewardTracks/CareerRanks/careerRank1.json")
+    # Rank artwork lives under this, at the exact paths the track file gives.
+    # Do NOT construct these: rank 192's icon is "69_Corporal_Diamond_II.png",
+    # so the art has its own numbering unrelated to the rank number.
+    GAMECMS_IMAGE_URL = "https://gamecms-hacs.svc.halowaypoint.com/hi/images/file"
     # Real CSR and MMR. The match-stats payload does not reliably carry CSR -
     # _extract_csr_and_tier finds it so rarely that match_participants.csr is
     # almost entirely null - so this is the only actual source for it.
@@ -1588,6 +1608,220 @@ class HaloAPIClient:
                                     and all_time_max > self.SKILL_NO_DATA else None,
                 }
         return out
+
+    async def get_gamerpics(self, xuids: List[str]) -> Dict[str, str]:
+        """{xuid: avatar url} from profile.svc. Absent players simply omitted.
+
+        The same call that resolves gamertags already returns the avatar, so
+        this is the same request shape and the same ceiling of exactly 100.
+        The 'medium' (208px) variant is chosen: enough for a retina avatar
+        without carrying the 424px 'large' for every row of a leaderboard.
+        """
+        unique = [str(x) for x in dict.fromkeys(xuids) if x]
+        out: Dict[str, str] = {}
+        for i in range(0, len(unique), self.PROFILE_BATCH_MAX):
+            chunk = unique[i:i + self.PROFILE_BATCH_MAX]
+            url = f"{self.PROFILE_BATCH_URL}?" + urlencode([("xuids", x) for x in chunk])
+            try:
+                async with halo_stats_rate_limiter.slot(bucket=BUCKET_PROFILE) as account_index:
+                    spartan = self.get_next_spartan_token(account_index)
+                    if isinstance(spartan, dict):
+                        spartan = spartan.get("token")
+                    if not spartan:
+                        continue
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(url, headers={
+                                "x-343-authorization-spartan": spartan,
+                                "User-Agent": self.user_agent,
+                                "Accept": "application/json"}) as response:
+                            if response.status == 429:
+                                halo_stats_rate_limiter.note_result(BUCKET_PROFILE, rate_limited=True)
+                                retry_after = _parse_retry_after(response.headers.get('Retry-After'))
+                                halo_stats_rate_limiter.set_backoff(
+                                    account_index=account_index, seconds=retry_after or 5.0)
+                                continue
+                            if response.status != 200:
+                                # One nonexistent id 400s the WHOLE batch rather
+                                # than being omitted, so this says nothing about
+                                # any particular player in it.
+                                print(f"[PROFILE] gamerpic batch of {len(chunk)} "
+                                      f"-> HTTP {response.status}")
+                                continue
+                            halo_stats_rate_limiter.note_result(BUCKET_PROFILE, rate_limited=False)
+                            payload = await response.json()
+            except Exception as e:
+                print(f"[PROFILE] gamerpic batch failed: {e}")
+                continue
+
+            for entry in payload if isinstance(payload, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                pic = entry.get("gamerpic") or {}
+                chosen = pic.get("medium") or pic.get("small")
+                if entry.get("xuid") and chosen:
+                    out[str(entry["xuid"])] = chosen
+        return out
+
+    async def ensure_clearance_token(self) -> Optional[str]:
+        """Load the flight/clearance id, which economy.svc requires.
+
+        NOTE the name: this is NOT get_clearance_token(), which despite its name
+        loads the SPARTAN token and never touches self.clearance_token. That one
+        has two callers relying on its actual behaviour, so it is left alone.
+
+        Cached on the instance. Falls back to settings.svc when the token cache
+        has none, because a clearance id is public per-audience rather than
+        per-player - the RETAIL one and the player-specific one measured
+        identical.
+        """
+        if self.clearance_token:
+            return self.clearance_token
+
+        try:
+            async with get_token_swap_lock():
+                cache = safe_read_json(TOKEN_CACHE_FILE, default={}) or {}
+            clearance = cache.get("clearance")
+            if isinstance(clearance, dict) and clearance.get("FlightConfigurationId"):
+                self.clearance_token = clearance["FlightConfigurationId"]
+                return self.clearance_token
+        except Exception:
+            pass
+
+        spartan = self.get_next_spartan_token()
+        if isinstance(spartan, dict):
+            spartan = spartan.get("token")
+        if not spartan:
+            return None
+        url = (f"{self.SETTINGS_URL}/oban/flight-configurations/titles/hi"
+               f"/audiences/RETAIL/active")
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={
+                        "x-343-authorization-spartan": spartan,
+                        "User-Agent": self.user_agent,
+                        "Accept": "application/json"}) as response:
+                    if response.status != 200:
+                        print(f"[CAREER] clearance fetch returned {response.status}")
+                        return None
+                    payload = await response.json()
+                    self.clearance_token = payload.get("FlightConfigurationId")
+                    return self.clearance_token
+        except Exception as e:
+            print(f"[CAREER] clearance fetch failed: {e}")
+            return None
+
+    async def get_career_ranks(self, xuids: List[str],
+                               strict: bool = False) -> Dict[str, Dict]:
+        """Career rank for many players. {xuid: {'rank', 'partial_progress'}}.
+
+        Chunked at 32 because that is the endpoint's hard ceiling, and a 33rd
+        player is dropped from an HTTP 200 without a word. Every chunk's
+        response is counted against what was sent, so a short answer is reported
+        as truncation instead of being written down as "these players have no
+        career rank" - which is exactly how the CSR backfill destroyed 13,889
+        rows before it was fixed.
+
+        Players the endpoint has nothing for are simply absent from the result,
+        so presence means something and callers can treat absence as "unknown"
+        rather than "rank 0".
+        """
+        unique = [str(x) for x in dict.fromkeys(xuids) if x]
+        if not unique:
+            return {}
+
+        clearance = await self.ensure_clearance_token()
+        if not clearance:
+            if strict:
+                raise SkillFetchError("no clearance token; economy.svc will 400", status=0)
+            return {}
+
+        out: Dict[str, Dict] = {}
+        for i in range(0, len(unique), self.CAREER_RANK_BATCH_MAX):
+            chunk = unique[i:i + self.CAREER_RANK_BATCH_MAX]
+            query = "&".join(f"players=xuid({x})" for x in chunk)
+            url = f"{self.ECONOMY_URL}/hi/careerranks/careerrank1?{query}"
+
+            status, tracks = 0, None
+            try:
+                async with halo_stats_rate_limiter.slot(bucket=BUCKET_PROFILE) as account_index:
+                    spartan = self.get_next_spartan_token(account_index)
+                    if isinstance(spartan, dict):
+                        spartan = spartan.get("token")
+                    if not spartan:
+                        continue
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(url, headers={
+                                "x-343-authorization-spartan": spartan,
+                                "343-clearance": clearance,
+                                "User-Agent": self.user_agent,
+                                "Accept": "application/json"}) as response:
+                            status = response.status
+                            if status == 200:
+                                halo_stats_rate_limiter.note_result(BUCKET_PROFILE, rate_limited=False)
+                                payload = await response.json()
+                                tracks = payload.get("RewardTracks") if isinstance(payload, dict) else None
+                            elif status == 429:
+                                halo_stats_rate_limiter.note_result(BUCKET_PROFILE, rate_limited=True)
+                                retry_after = _parse_retry_after(response.headers.get('Retry-After'))
+                                halo_stats_rate_limiter.set_backoff(
+                                    account_index=account_index, seconds=retry_after or 5.0)
+            except Exception as e:
+                print(f"[CAREER] request failed for {len(chunk)} player(s): {e}")
+
+            if not isinstance(tracks, list):
+                if strict:
+                    raise SkillFetchError(
+                        f"no answer (HTTP {status}) for {len(chunk)} player(s)", status=status)
+                continue
+
+            # The silent-truncation guard. Not a warning to be skimmed past: a
+            # short answer means the missing players were never asked about.
+            if len(tracks) < len(chunk):
+                print(f"[CAREER] TRUNCATED: sent {len(chunk)} players, got {len(tracks)}")
+                if strict:
+                    raise SkillFetchError(
+                        f"truncated: sent {len(chunk)}, got {len(tracks)}", status=status)
+
+            for entry in tracks:
+                if not isinstance(entry, dict) or entry.get("ResultCode") != "Success":
+                    continue
+                xuid = self._unwrap_player_id(entry)
+                progress = ((entry.get("Result") or {}).get("CurrentProgress") or {})
+                rank = progress.get("Rank")
+                if not xuid or not isinstance(rank, int):
+                    continue
+                out[str(xuid)] = {
+                    "rank": rank,
+                    "partial_progress": progress.get("PartialProgress"),
+                }
+        return out
+
+    async def get_career_rank_definitions(self) -> List[Dict]:
+        """The 272 static rank definitions, for seeding. [] on failure."""
+        spartan = self.get_next_spartan_token()
+        if isinstance(spartan, dict):
+            spartan = spartan.get("token")
+        if not spartan:
+            return []
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.CAREER_RANK_TRACK_URL, headers={
+                        "x-343-authorization-spartan": spartan,
+                        "User-Agent": self.user_agent,
+                        "Accept": "application/json"}) as response:
+                    if response.status != 200:
+                        print(f"[CAREER] track file returned {response.status}")
+                        return []
+                    payload = await response.json()
+                    ranks = payload.get("Ranks")
+                    return ranks if isinstance(ranks, list) else []
+        except Exception as e:
+            print(f"[CAREER] track file failed: {e}")
+            return []
 
     async def get_match_skill(self, match_id: str, xuids: List[str],
                               strict: bool = False) -> Dict[str, Dict]:

@@ -78,7 +78,7 @@ async def _do_refresh(gamertag: str, xuid: str | None) -> dict:
     assert _refresh_semaphore is not None
     async with _refresh_semaphore:
         try:
-            return await api_client.get_player_stats(
+            result = await api_client.get_player_stats(
                 gamertag,
                 "overall",
                 matches_to_process=None,   # None => full incremental history
@@ -87,6 +87,46 @@ async def _do_refresh(gamertag: str, xuid: str | None) -> dict:
             )
         except Exception as e:  # defensive: never leak a raw stacktrace to HTTP
             return {"error": 4, "message": f"Refresh failed: {e}"}
+
+    # Progression upkeep, OUTSIDE the semaphore so it never holds a live-fetch
+    # slot, and after the fetch so it can see whether new matches arrived.
+    await _refresh_progression(result, xuid)
+    return result
+
+
+async def _refresh_progression(result: dict, xuid: str | None) -> None:
+    """Keep the avatar and career rank current for a player just looked at.
+
+    The two refresh on different triggers because they go stale for different
+    reasons. A gamerpic changes when the player changes their Xbox avatar, which
+    has nothing to do with playing - so it refreshes on page load, throttled by
+    age. A career rank only moves when XP is earned - so it refreshes only when
+    this fetch actually brought new matches in, which costs nothing for the
+    overwhelming majority of views, where nothing has changed.
+
+    Never raises. It runs after the stats result is already in hand, so a
+    failure here cannot affect the answer the page is waiting on, and leaves the
+    stored values alone rather than clearing them.
+    """
+    if result.get("error"):
+        return
+    player_xuid = xuid or result.get("xuid")
+    if not player_xuid:
+        return
+
+    new_matches = None
+    m = _CACHE_INFO_RE.search(result.get("cache_info", "") or "")
+    if m:
+        new_matches = int(m.group(2))
+
+    try:
+        from src.api import progression
+        from src.database.cache import get_cache
+        conn = get_cache().db._get_connection()
+        await progression.on_player_viewed(
+            api_client, conn, str(player_xuid), new_matches)
+    except Exception as e:
+        print(f"[PROGRESSION] upkeep skipped for {player_xuid}: {e}")
 
 
 def _log_refresh_task_end(task: asyncio.Task) -> None:
