@@ -263,6 +263,12 @@ class HaloStatsDBv2:
         # tracking was persisted (previously computed per-request and discarded).
         self._ensure_column_exists("players", "incomplete_data", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column_exists("players", "failed_match_count", "INTEGER NOT NULL DEFAULT 0")
+        # Xbox gamerpic. profile.svc hands it back alongside the gamertag on
+        # every batch resolve, so capturing it costs no extra request - it was
+        # simply being discarded. Stored rather than fetched on read because the
+        # API service holds no Halo credentials of its own.
+        self._ensure_column_exists("players", "gamerpic", "TEXT")
+        self._ensure_column_exists("players", "gamerpic_updated_at", "TEXT")
 
         # ============================================================
         # Table 2b: Player Failed Matches - specific match IDs whose detail
