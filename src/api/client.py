@@ -349,15 +349,32 @@ class HaloAPIClient:
             restore_succeeded = False
             try:
                 write_token_swap_marker(account1_backup, cache_file)
-                safe_write_json(TOKEN_CACHE_FILE, account_cache)
+
+                # Force-expire the derived tokens so the auth flow has to
+                # re-mint them. Without this, a cache whose spartan still looks
+                # valid takes the cached-spartan shortcut in get_clearance_token:
+                # only clearance is re-requested, and the expired XSTS is never
+                # replaced, so the account can never rejoin the pool - the same
+                # failure every hour, indefinitely. The other two refresh call
+                # sites (account 1 below, and proactive_token_refresh) already
+                # do this; this one did not.
+                #
+                # Copied, not mutated in place: account_cache belongs to the
+                # caller and is reused after this returns.
+                candidate_cache = dict(account_cache)
+                for key in ("spartan", "clearance", "xsts", "xsts_xbox"):
+                    token_info = candidate_cache.get(key)
+                    if token_info:
+                        token_copy = dict(token_info)
+                        token_copy["expires_at"] = 0
+                        candidate_cache[key] = token_copy
+                safe_write_json(TOKEN_CACHE_FILE, candidate_cache)
 
                 # interactive=False: the bot must never block on a browser
                 # login the headless server cannot complete.
                 await run_auth_flow(self.client_id, self.client_secret, use_halo=True, interactive=False)
 
                 refreshed_cache = safe_read_json(TOKEN_CACHE_FILE, default={})
-                if refreshed_cache:
-                    safe_write_json(cache_file, refreshed_cache)
 
                 new_spartan = refreshed_cache.get("spartan") if refreshed_cache else None
                 new_xsts = refreshed_cache.get("xsts") if refreshed_cache else None
@@ -367,6 +384,14 @@ class HaloAPIClient:
                     new_xsts and is_token_valid(new_xsts) and
                     new_xbox and is_token_valid(new_xbox)
                 )
+
+                # Persist only a refresh that actually produced usable tokens.
+                # Writing back unconditionally stored the force-expired state
+                # (and a fresh 24h clearance placeholder) over a working cache,
+                # so a failing account was rewritten every hour with tokens
+                # that could not work. Matches proactive_token_refresh.
+                if refresh_succeeded:
+                    safe_write_json(cache_file, refreshed_cache)
             finally:
                 restore_attempts = 3
                 for attempt in range(restore_attempts):

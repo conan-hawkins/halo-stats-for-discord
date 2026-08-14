@@ -5,6 +5,7 @@ Refactored from get_auth_tokens.py to use proper OOP principles
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -15,10 +16,176 @@ import requests
 import aiohttp
 import asyncio
 import xml.etree.ElementTree as ET
-from datetime import datetime
-from typing import Optional, Dict, Any
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple
 
 from src.config import TOKEN_CACHE_FILE, TOKEN_CACHE_DIR
+
+
+# 343 caps a spartan token's ExpiresUtc to the expiry of the XSTS that proved
+# it (~4h observed live). Anything past this is a parse artefact, not a grant.
+SPARTAN_MAX_LIFETIME = 24 * 3600
+# Used only when a response carries no usable expiry at all. Deliberately
+# short: a token we cannot date must be re-minted soon, never trusted a day.
+SPARTAN_UNKNOWN_LIFETIME = 900
+# A clearance request that failed still caches a "skip" placeholder so callers
+# keep working (clearance is optional), but on a short TTL - at 24h a
+# persistent auth failure stayed invisible for a day.
+CLEARANCE_PLACEHOLDER_TTL = 300
+
+_DURATION_RE = re.compile(
+    r"^P(?!$)(?:(?P<days>\d+(?:\.\d+)?)D)?"
+    r"(?:T(?!$)(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?"
+    r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?$"
+)
+
+
+def _parse_iso8601_utc(value: Optional[str]) -> Optional[float]:
+    """Parse an ISO-8601 instant into a POSIX timestamp, or None.
+
+    Tolerates a trailing 'Z', an explicit numeric offset, and the presence or
+    absence of fractional seconds. Always timezone-aware: `.timestamp()` on a
+    naive datetime resolves against the host's local zone, which silently
+    shifts the result by the UTC offset - an hour on this server under BST,
+    twelve in Auckland.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text[-1] in ("z", "Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # The field is documented UTC; say so explicitly rather than letting
+        # .timestamp() assume local time.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _parse_iso8601_duration(value: Optional[str]) -> Optional[float]:
+    """Parse an ISO-8601 duration such as 'PT2H30M59.765S' into seconds."""
+    if not isinstance(value, str):
+        return None
+    match = _DURATION_RE.match(value.strip())
+    if not match:
+        return None
+    parts = {k: v for k, v in match.groupdict().items() if v is not None}
+    if not parts:
+        return None
+    return (
+        float(parts.get("days", 0)) * 86400
+        + float(parts.get("hours", 0)) * 3600
+        + float(parts.get("minutes", 0)) * 60
+        + float(parts.get("seconds", 0))
+    )
+
+
+def _child_by_local_name(parent, name: str):
+    """Find a direct child by local name, ignoring XML namespace.
+
+    Pinning the namespace URI means a server-side namespace change starts
+    returning None silently - which is how the ExpiresUtc miss went unnoticed.
+    """
+    for element in parent:
+        if element.tag.split("}")[-1] == name:
+            return element
+    return None
+
+
+def _extract_spartan_fields(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Pull {token, expires_utc, duration} from a spartan-token response body.
+
+    The endpoint content-negotiates: aiohttp's default `Accept: */*` yields
+    XML, `Accept: application/json` yields the same fields as JSON. Both are
+    handled so a change of Accept header cannot silently break sign-in.
+    """
+    if not isinstance(text, str):
+        return None
+    body = text.lstrip("﻿ \t\r\n")
+    if not body:
+        return None
+
+    if body[0] in "{[":
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        expires = data.get("ExpiresUtc")
+        if isinstance(expires, dict):
+            expires = expires.get("ISO8601Date")
+        token = data.get("SpartanToken")
+        return {
+            "token": token if isinstance(token, str) else None,
+            "expires_utc": expires if isinstance(expires, str) else None,
+            "duration": data.get("TokenDuration"),
+        }
+
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None
+
+    token_el = _child_by_local_name(root, "SpartanToken")
+    expires_el = _child_by_local_name(root, "ExpiresUtc")
+    duration_el = _child_by_local_name(root, "TokenDuration")
+
+    expires_text = None
+    if expires_el is not None:
+        # 343 nests the instant one level down in <ISO8601Date>, so
+        # expires_el.text is empty; accept a flat form too in case that
+        # changes back.
+        iso_el = _child_by_local_name(expires_el, "ISO8601Date")
+        if iso_el is not None and iso_el.text and iso_el.text.strip():
+            expires_text = iso_el.text.strip()
+        elif expires_el.text and expires_el.text.strip():
+            expires_text = expires_el.text.strip()
+
+    return {
+        "token": token_el.text if token_el is not None else None,
+        "expires_utc": expires_text,
+        "duration": duration_el.text if duration_el is not None else None,
+    }
+
+
+def _resolve_spartan_expiry(
+    fields: Dict[str, Any], now: Optional[float] = None
+) -> Tuple[float, str]:
+    """Decide a spartan token's expiry, preferring the server's own value.
+
+    Returns (expires_at, source); the source is cached alongside the token so a
+    later cache dump shows whether the value was measured or guessed.
+    """
+    now = time.time() if now is None else now
+
+    expires_at = _parse_iso8601_utc(fields.get("expires_utc"))
+    source = "ExpiresUtc"
+
+    if expires_at is None:
+        seconds = _parse_iso8601_duration(fields.get("duration"))
+        if seconds is not None:
+            expires_at, source = now + seconds, "TokenDuration"
+
+    if expires_at is None:
+        print("Spartan response carried no usable expiry; "
+              f"assuming {SPARTAN_UNKNOWN_LIFETIME}s")
+        return now + SPARTAN_UNKNOWN_LIFETIME, "fallback"
+
+    if expires_at > now + SPARTAN_MAX_LIFETIME:
+        print(f"Spartan {source} implausibly far ahead; clamping to "
+              f"{SPARTAN_MAX_LIFETIME}s")
+        return now + SPARTAN_MAX_LIFETIME, f"{source}-clamped"
+
+    # A past expiry is returned as-is on purpose: the caller's validity gates
+    # then reject it, which is the honest outcome for an already-dead token.
+    return expires_at, source
 
 
 class TokenCache:
@@ -303,9 +470,20 @@ class XboxAuth:
         r = requests.post(url, json=payload, headers=headers)
         r.raise_for_status()
         data = r.json()
+        # Xbox returns NotAfter, an ISO-8601 instant. The old code read
+        # "NotAfterSeconds", which the service does not send, so every user
+        # token was dated with a flat 24h guess instead of the real grant.
+        # The guess is kept as a last resort so an unexpected payload shape
+        # can never break sign-in.
+        expires_at = _parse_iso8601_utc(data.get("NotAfter"))
+        if expires_at is None:
+            seconds = data.get("NotAfterSeconds")
+            if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+                seconds = 86400
+            expires_at = time.time() + float(seconds)
         return {
             "token": data["Token"],
-            "expires_at": time.time() + (data.get("NotAfterSeconds", 86400))
+            "expires_at": expires_at
         }
     
     @staticmethod
@@ -421,27 +599,21 @@ class HaloAuth:
                     
                     if response.status == 201:
                         try:
-                            root = ET.fromstring(text)
-                            ns = {"ns": "http://schemas.datacontract.org/2004/07/Microsoft.Halo.RegisterClient.Bond"}
-                            token_elem = root.find("ns:SpartanToken", ns)
-                            expires_elem = root.find("ns:ExpiresUtc", ns)
-                            
-                            if token_elem is not None:
-                                spartan_token = token_elem.text
-                                if expires_elem is not None and expires_elem.text:
-                                    expires_at = datetime.strptime(
-                                        expires_elem.text, "%Y-%m-%dT%H:%M:%S.%fZ"
-                                    ).timestamp()
-                                else:
-                                    expires_at = time.time() + 86400
-                                
+                            fields = _extract_spartan_fields(text)
+                            if fields and fields.get("token"):
+                                expires_at, source = _resolve_spartan_expiry(fields)
                                 return {
-                                    "token": spartan_token,
-                                    "expires_at": expires_at
+                                    "token": fields["token"],
+                                    "expires_at": expires_at,
+                                    "expires_source": source,
                                 }
-                        except Exception:
-                            pass
-                    
+                            print("Spartan token response could not be parsed "
+                                  "(no token field found)")
+                        except Exception as e:
+                            # Narrowed from a bare `pass`: a parse failure used
+                            # to be indistinguishable from an auth failure.
+                            print(f"Spartan token response parse error: {e}")
+
                     print(f"Spartan token request failed ({response.status})")
                     return None
         except asyncio.TimeoutError:
@@ -509,12 +681,15 @@ class HaloAuth:
             if attempt < 2:
                 await asyncio.sleep(1 + attempt)
         
-        # Clearance is optional - return placeholder
+        # Clearance is optional - return placeholder. Short-lived on purpose:
+        # cached for 24h, a failed clearance made a persistently broken account
+        # look freshly authenticated for a whole day.
         print("Clearance token unavailable (not critical)")
         return {
             "FlightConfigurationId": "skip",
             "token": "skip",
-            "expires_at": time.time() + 86400
+            "placeholder": True,
+            "expires_at": time.time() + CLEARANCE_PLACEHOLDER_TTL
         }
 
 
