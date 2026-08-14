@@ -48,10 +48,22 @@ from src.config import get_token_cache_path
 # this only bounds how many chunks are in flight at once.
 CONCURRENCY = 5
 
-# Probed once at startup, then cached. Bounds chosen to cover the observed
-# space (CsrSeason1-2 .. CsrSeason13-3) with room for new seasons.
-SEASON_MAJOR_MAX = 16
-SEASON_MINOR_MAX = 4
+# Probed once at startup, then cached.
+#
+# The minor bound was 4, which was wrong: CsrSeason13-5 through 13-11 all exist
+# and were never probed, so the discovery pass could not have found them. They
+# happen to be empty today - 343 serves them as future slots, and no player has
+# a rank in any of them - so nothing was actually lost. But 343 resets CSR
+# roughly every four months (Nov 18 2025, Mar 3 2026, Jul 7 2026), each reset
+# opening the next minor, so 13-5 becomes real in due course and a bound of 4
+# would have silently dropped it.
+#
+# Probing is cheap and one-off (cached in csr_seasons afterwards), and the space
+# is irregular enough - 1-1 and 2-1 do not exist while 1-2, 2-2 and 2-3 do -
+# that it has to be probed rather than computed. So set the bound well clear of
+# anything 343 is likely to reach.
+SEASON_MAJOR_MAX = 20
+SEASON_MINOR_MAX = 16
 
 # Marks a phase-B (current season) unit in csr_progress, where season_id has no
 # meaningful value. Empty string rather than NULL so it participates in the PK.
@@ -183,7 +195,11 @@ async def _discover_seasons(client: HaloAPIClient, out: sqlite3.Connection,
     cached = [r["season_id"] for r in out.execute(
         "SELECT season_id FROM csr_seasons ORDER BY season_id")]
     if cached:
-        print(f"[CSR] Using {len(cached)} cached season ids")
+        # The cache is keyed on nothing but its own existence, so a run that
+        # discovered under an older, narrower bound would keep reporting that
+        # narrower answer forever. Re-probe when the cache predates the bounds.
+        print(f"[CSR] Using {len(cached)} cached season ids "
+              f"(delete from csr_seasons to re-probe after a bound change)")
         return cached
 
     print("[CSR] Discovering season ids (the space is irregular, so probe it)...")
