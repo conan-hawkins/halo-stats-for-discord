@@ -8,6 +8,7 @@ import pytest
 
 from src.api.client import HaloAPIClient
 from src.config import CORE_RANKED_PLAYLIST_IDS, STATS_HISTORY_FRESHNESS_TTL_SECONDS
+from src.database.cache import PlayerStatsCacheV2
 
 
 def test_get_next_spartan_token_round_robin_and_index_selection():
@@ -2461,6 +2462,57 @@ async def test_full_crawl_page_failure_does_not_truncate_and_marks_incomplete(mo
     assert got_ids == {"m0", "m1", "m3", "m4", "m5", "m6"}
     # The page stayed failed after the repair pass -> explicit incomplete signal.
     assert saved["data"]["incomplete_data"] is True
+
+
+@pytest.mark.asyncio
+async def test_full_crawl_401_resume_does_not_restart_from_page_zero(monkeypatch, tmp_path):
+    """A token refresh should resume from the last persisted page, not replay the
+    full history from page 0."""
+    client = HaloAPIClient()
+    client.spartan_token = "tok"
+    client.stats_cache = PlayerStatsCacheV2(str(tmp_path / "stats.db"))
+
+    starts = []
+    refreshed = {"done": False}
+
+    def page_handler(start):
+        starts.append(start)
+        if not refreshed["done"]:
+            if start >= 75:
+                return 401, []
+            if start >= 100:
+                return 200, []
+            return 200, [{"MatchId": f"m{start + i}"} for i in range(25)]
+        if start >= 100:
+            return 200, []
+        if start >= 75:
+            return 200, [{"MatchId": f"m{start + i}"} for i in range(25)]
+        return 200, []
+
+    _install_fake_http(monkeypatch, page_handler)
+    monkeypatch.setattr(client, "load_cached_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "save_stats_cache", lambda *a, **k: None)
+    monkeypatch.setattr(client.stats_cache, "get_player_mode_summary", lambda *a, **k: None)
+
+    async def fake_ensure_valid_tokens():
+        refreshed["done"] = True
+        return True
+
+    monkeypatch.setattr(client, "ensure_valid_tokens", fake_ensure_valid_tokens)
+
+    async def _detail(match_id, player_xuid, session):
+        return _full_match(match_id)
+
+    monkeypatch.setattr(client, "get_match_stats_for_match", _detail)
+
+    result = await client.calculate_comprehensive_stats(
+        xuid="resume-xuid", stat_type="overall", gamertag="Resume",
+        matches_to_process=None, force_full_fetch=False,
+    )
+
+    assert result["error"] == 0
+    assert starts.count(0) == 1, "Page 0 should be fetched once on initial crawl, never on resume"
+    assert any(start >= 75 for start in starts)
 
 
 def test_failed_match_ids_survive_save_load_round_trip(tmp_path):

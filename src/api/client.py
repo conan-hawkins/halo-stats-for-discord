@@ -40,6 +40,7 @@ load_dotenv()
 from src.auth.tokens import run_auth_flow
 from src.database.cache import get_cache
 from src.config import (
+    DATA_DIR,
     TOKEN_CACHE_FILE,
     get_token_cache_path,
     XUID_CACHE_FILE,
@@ -336,6 +337,49 @@ class HaloAPIClient:
         internal freshness TTL uses at calculate_comprehensive_stats."""
         checked = self._history_checked_at.get(xuid)
         return (time.monotonic() - checked) if checked is not None else None
+
+    def _full_history_resume_path(self, xuid: str, stat_type: str) -> str:
+        """Disk checkpoint for a long full-history crawl.
+
+        The bot may need to refresh tokens mid-crawl, so the last known page and
+        match IDs live on disk instead of only in memory. Narrowing this to match
+        IDs keeps the checkpoint small enough for the 8 GB machine while still
+        making resume deterministic.
+        """
+        resume_dir = DATA_DIR / "history_resume"
+        resume_dir.mkdir(parents=True, exist_ok=True)
+        return str(resume_dir / f"{xuid}_{stat_type}.json")
+
+    def _load_full_history_resume(self, xuid: str, stat_type: str) -> Dict:
+        state = safe_read_json(self._full_history_resume_path(xuid, stat_type), default={})
+        if not isinstance(state, dict):
+            return {}
+        if state.get("xuid") != xuid or state.get("stat_type") != stat_type:
+            return {}
+        return state
+
+    def _save_full_history_resume(self, xuid: str, stat_type: str, gamertag: str, next_page: int, all_matches: List[Dict]) -> None:
+        checkpoint = {
+            "xuid": xuid,
+            "stat_type": stat_type,
+            "gamertag": gamertag,
+            "next_page": max(0, int(next_page)),
+            "match_ids": [
+                match.get("MatchId")
+                for match in all_matches
+                if isinstance(match, dict) and match.get("MatchId")
+            ],
+            "updated_at": time.time(),
+        }
+        safe_write_json(self._full_history_resume_path(xuid, stat_type), checkpoint)
+
+    def _clear_full_history_resume(self, xuid: str, stat_type: str) -> None:
+        try:
+            os.remove(self._full_history_resume_path(xuid, stat_type))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
     async def _refresh_account_via_swap(self, account_num: int, account_cache: Dict) -> bool:
         """Refresh a secondary account by swapping its cache into the primary slot."""
@@ -4464,13 +4508,21 @@ class HaloAPIClient:
                 if not use_incremental:
                     # Fetch all matches from the list endpoint, then merge with cached details.
                     print(f"Running full match-history fetch with rolling queue...")
+
+                    resume_state = self._load_full_history_resume(xuid, stat_type) if full_history_requested and not force_full_fetch else {}
+                    resume_page = int(resume_state.get("next_page", 0) or 0)
+                    resume_match_ids = resume_state.get("match_ids") or []
+                    if resume_state:
+                        print(f"Resuming full match-history crawl from persisted checkpoint at page {resume_page} ({len(resume_match_ids)} ids restored)")
                     
                     # Rolling queue approach - keep N requests in flight at all times
                     # Conservative concurrency to respect API rate limits and avoid bans
-                    all_matches = []
+                    # The checkpoint is stored on disk so a mid-crawl token refresh can
+                    # resume from the last persisted page instead of replaying page 0.
+                    all_matches = [{"MatchId": mid} for mid in resume_match_ids] if resume_state else []
                     num_accounts = len(self.spartan_accounts) if self.spartan_accounts else 1
                     max_in_flight = min(num_accounts * 5, 25)  # 5 per account, max 25 total
-                    current_page = 0
+                    current_page = resume_page if resume_state else 0
                     bounded_fetch = not full_history_requested
                     if bounded_fetch:
                         max_pages = max(0, math.ceil(matches_to_process / PAGE_SIZE))
@@ -4503,12 +4555,18 @@ class HaloAPIClient:
                     #
                     # It also makes the short-history case free: a player with
                     # fewer than PAGE_SIZE matches is fully read by this request.
-                    current_page = 1
                     if max_pages <= 0:
                         # Caller asked for zero matches. Not the same as "no
                         # history" - do not let it look like one.
                         got_empty_page = True
+                        current_page = 1
+                    elif resume_state:
+                        # A persisted checkpoint means the earlier pages already
+                        # completed successfully; resume from the next offset and do
+                        # not replay page 0.
+                        current_page = resume_page
                     else:
+                        current_page = 1
                         first_page = await fetch_match_page(session, 0, PAGE_SIZE)
 
                         if first_page is None:
@@ -4602,6 +4660,7 @@ class HaloAPIClient:
 
                             if page is None:
                                 got_401_error = True
+                                self._save_full_history_resume(xuid, stat_type, gamertag or xuid, page_num, all_matches)
                                 break
                             elif page is _PAGE_FETCH_FAILED:
                                 consecutive_full = 0
@@ -4616,6 +4675,7 @@ class HaloAPIClient:
                                 failed_page_nums.append(page_num)
                             elif page and len(page) > 0:
                                 all_matches.extend(page)
+                                self._save_full_history_resume(xuid, stat_type, gamertag or xuid, page_num + 1, all_matches)
 
                                 # A short page is NOT end-of-history here (see the
                                 # comment on the first-page handler), but it is not
@@ -4710,7 +4770,15 @@ class HaloAPIClient:
                     if _retry_count >= 2:
                         print(f"Failed after {_retry_count} token refresh attempts")
                         return {"error": 4, "message": "Authentication failed - token refresh unsuccessful after multiple attempts"}
-                    
+
+                    # Persist the checkpoint before the token refresh so a later
+                    # retry resumes from the last saved page instead of replaying
+                    # page 0 on every 401. Memory-only state is not enough here;
+                    # the server may have a long crawl in progress when the token
+                    # expires, and we must keep the resume point durable.
+                    if full_history_requested:
+                        self._save_full_history_resume(xuid, stat_type, gamertag or xuid, max(0, current_page if 'current_page' in locals() else 0), all_matches if 'all_matches' in locals() else [])
+
                     # Try refreshing tokens and retry
                     print(f"Got 401 error, attempting token refresh (attempt {_retry_count + 1}/2)...")
                     if await self.ensure_valid_tokens():
@@ -4934,6 +5002,8 @@ class HaloAPIClient:
                     self._db_write_executor,
                     self.save_stats_cache, xuid, stat_type, cache_data, gamertag,
                 )
+                if full_history_requested:
+                    self._clear_full_history_resume(xuid, stat_type)
 
                 # Prefer the precomputed per-mode summary (now up to date) over
                 # rescanning all_processed_matches in Python; only estimated_csr/

@@ -146,7 +146,7 @@ def test_completed_units_are_skipped_on_a_rerun(tmp_path, live_db, monkeypatch):
     calls = []
 
     async def fake_get_playlist_csr(self, playlist, players, season_id=None,
-                                    include_unranked=False):
+                                    include_unranked=False, strict=False):
         calls.append((playlist, season_id, len(players)))
         return {players[0]: {"csr": 1500, "tier": "Onyx", "sub_tier": 0,
                              "season_max": 1500, "all_time_max": 1600}}
