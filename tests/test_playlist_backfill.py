@@ -2,8 +2,8 @@ import pytest
 
 from src.api.client import HaloAPIClient
 from src.database.cache import PlayerStatsCacheV2
-from src.database import reclassify_playlists_backfill as backfill_module
-from src.database.reclassify_playlists_backfill import backfill_playlist_reclassification
+from src.jobs import reclassify_playlists_backfill as backfill_module
+from src.jobs.reclassify_playlists_backfill import backfill_playlist_reclassification
 
 
 def _fake_spartan_accounts():

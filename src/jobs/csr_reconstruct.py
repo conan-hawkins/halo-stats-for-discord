@@ -12,9 +12,9 @@ The per-match recap endpoint still answers for those same matches. So the
 history is recoverable, just not by asking about the season - you have to walk
 the matches and take the best CSR seen.
 
-    python -m src.database.csr_reconstruct --dry-run     # counts only
-    python -m src.database.csr_reconstruct               # harvest
-    python -m src.database.csr_reconstruct --aggregate   # build season rows
+    python -m src.jobs.csr_reconstruct --dry-run     # counts only
+    python -m src.jobs.csr_reconstruct               # harvest
+    python -m src.jobs.csr_reconstruct --aggregate   # build season rows
 
 WHY IT IS BUILT THIS WAY
 

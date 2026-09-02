@@ -1,9 +1,9 @@
 """
 Merge a csr_backfill.db into the live database.
 
-    python -m src.database.csr_merge
-    python -m src.database.csr_merge --dry-run
-    python -m src.database.csr_merge --in ~/csr_backfill.db
+    python -m src.jobs.csr_merge
+    python -m src.jobs.csr_merge --dry-run
+    python -m src.jobs.csr_merge --in ~/csr_backfill.db
 
 **Stop the bot first.** Only the bot may write the live database, and it holds
 a single write connection for the life of the process. Racing it would mean

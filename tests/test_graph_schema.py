@@ -329,7 +329,7 @@ def test_get_coplay_edges_within_set_filters_min_matches(tmp_path):
 
 
 def test_coplay_quality_flags_and_coverage_from_backfill_logic(tmp_path, monkeypatch):
-    from src.database import coplay_backfill as backfill_module
+    from src.jobs import coplay_backfill as backfill_module
     from src.database.schema import HaloStatsDBv2
 
     graph_db = HaloSocialGraphDB(str(tmp_path / "graph.db"))
@@ -449,7 +449,7 @@ def test_coplay_quality_flags_and_coverage_from_backfill_logic(tmp_path, monkeyp
 
 
 def test_coplay_backfill_rerun_idempotency(tmp_path, monkeypatch):
-    from src.database import coplay_backfill as backfill_module
+    from src.jobs import coplay_backfill as backfill_module
     from src.database.schema import HaloStatsDBv2
 
     graph_db = HaloSocialGraphDB(str(tmp_path / "graph.db"))

@@ -28,8 +28,8 @@ Three outcomes, three different conclusions:
                     independently of CSR.
 
   200, real values  The backfill MISSED them. Recover with a targeted re-run:
-                        python -m src.database.csr_backfill --playlists <id> ...
-                        python -m src.database.csr_merge     (bot stopped)
+                        python -m src.jobs.csr_backfill --playlists <id> ...
+                        python -m src.jobs.csr_merge     (bot stopped)
 """
 import asyncio
 import json

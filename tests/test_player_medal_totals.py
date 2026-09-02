@@ -1,6 +1,6 @@
 from src.config import CORE_RANKED_PLAYLIST_IDS
 from src.database.cache import PlayerStatsCacheV2
-from src.database.player_medal_totals_backfill import backfill_player_medal_totals
+from src.jobs.player_medal_totals_backfill import backfill_player_medal_totals
 
 DOUBLE_KILL = 622331684  # named in MEDAL_NAME_MAPPING
 TRIPLE_KILL = 2063152177  # named in MEDAL_NAME_MAPPING

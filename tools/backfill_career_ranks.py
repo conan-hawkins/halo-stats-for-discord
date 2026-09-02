@@ -30,7 +30,7 @@ from pathlib import Path
 from src.api import progression
 from src.api.client import HaloAPIClient
 from src.api.rate_limiters import halo_stats_rate_limiter
-from src.database.csr_backfill import _load_cached_spartan_accounts
+from src.jobs.csr_backfill import _load_cached_spartan_accounts
 
 BATCH = HaloAPIClient.CAREER_RANK_BATCH_MAX      # 32; 33+ truncates silently
 

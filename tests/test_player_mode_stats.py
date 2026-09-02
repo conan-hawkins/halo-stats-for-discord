@@ -1,6 +1,6 @@
 from src.config import CORE_RANKED_PLAYLIST_IDS
 from src.database.cache import PlayerStatsCacheV2
-from src.database.player_mode_stats_backfill import backfill_player_mode_stats
+from src.jobs.player_mode_stats_backfill import backfill_player_mode_stats
 
 CORE_PLAYLIST_ID = sorted(CORE_RANKED_PLAYLIST_IDS)[0]
 

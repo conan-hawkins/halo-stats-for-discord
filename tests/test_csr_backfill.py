@@ -20,8 +20,8 @@ from pathlib import Path
 import pytest
 
 from src.api.client import HaloAPIClient
-from src.database import csr_backfill, csr_merge
-from src.database.csr_backfill import (
+from src.jobs import csr_backfill, csr_merge
+from src.jobs.csr_backfill import (
     CURRENT_SEASON, _chunks, _completed_units, _open_output, _persist,
     _ranked_players, _ranked_playlists,
 )
@@ -247,7 +247,7 @@ def test_merge_names_the_short_circuited_ranked_playlists(tmp_path, live_db):
     # edfef3ac is Ranked Arena and the busiest ranked playlist, but the
     # classifier short-circuits it so it never gets a metadata row. Without a
     # name it would render as a raw GUID on the site.
-    from src.database.csr_merge import HARDCODED_PLAYLIST_NAMES
+    from src.jobs.csr_merge import HARDCODED_PLAYLIST_NAMES
 
     src = tmp_path / "csr.db"
     _seed_backfill(src)

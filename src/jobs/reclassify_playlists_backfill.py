@@ -249,5 +249,5 @@ if __name__ == "__main__":
         for pid, cnt in sorted(outcome.unresolved_playlist_match_counts.items(), key=lambda kv: -kv[1]):
             print(f"  {pid}: {cnt}")
     print("Now re-run:")
-    print("  python -m src.database.player_mode_stats_backfill")
-    print("  python -m src.database.player_medal_totals_backfill")
+    print("  python -m src.jobs.player_mode_stats_backfill")
+    print("  python -m src.jobs.player_medal_totals_backfill")

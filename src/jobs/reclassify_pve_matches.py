@@ -18,10 +18,10 @@ their resolved playlist_metadata.public_name (same signal the live ingest
 path now uses via HaloAPIClient._public_name_is_pve). Pure DB, no network.
 
 Ordering:
-  1. python -m src.database.reclassify_playlists_backfill   (resolves names)
-  2. python -m src.database.reclassify_pve_matches          (this script)
-  3. python -m src.database.player_mode_stats_backfill      (recompute)
-  4. python -m src.database.player_medal_totals_backfill    (recompute)
+  1. python -m src.jobs.reclassify_playlists_backfill   (resolves names)
+  2. python -m src.jobs.reclassify_pve_matches          (this script)
+  3. python -m src.jobs.player_mode_stats_backfill      (recompute)
+  4. python -m src.jobs.player_medal_totals_backfill    (recompute)
 
 Steps 3-4 need no code change: they INSERT OR REPLACE a full recompute and
 already exclude match_category='custom' from overall/social, and Firefight is
@@ -139,5 +139,5 @@ if __name__ == "__main__":
             print(f"  {pid}: {cnt}")
     if not args.dry_run:
         print("Now re-run:")
-        print("  python -m src.database.player_mode_stats_backfill")
-        print("  python -m src.database.player_medal_totals_backfill")
+        print("  python -m src.jobs.player_mode_stats_backfill")
+        print("  python -m src.jobs.player_medal_totals_backfill")

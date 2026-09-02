@@ -3,8 +3,8 @@ One-time backfill for the player_medal_totals summary table from existing
 player_match/medal_sets history. Safe to re-run: each mode's rows are fully
 recomputed and written with INSERT OR REPLACE, not incremented.
 
-Run all modes:    python -m src.database.player_medal_totals_backfill
-Specific modes:   python -m src.database.player_medal_totals_backfill core_ranked rotational_ranked
+Run all modes:    python -m src.jobs.player_medal_totals_backfill
+Specific modes:   python -m src.jobs.player_medal_totals_backfill core_ranked rotational_ranked
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Optional, Sequence
 
 from src.database.cache import get_cache, PlayerStatsCacheV2
-from src.database.player_mode_stats_backfill import ALL_MODES, _mode_where_clause
+from src.jobs.player_mode_stats_backfill import ALL_MODES, _mode_where_clause
 
 
 @dataclass

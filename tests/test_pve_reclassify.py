@@ -1,6 +1,6 @@
 from src.database.cache import PlayerStatsCacheV2
-from src.database.reclassify_pve_matches import reclassify_pve_matches
-from src.database.player_mode_stats_backfill import backfill_player_mode_stats
+from src.jobs.reclassify_pve_matches import reclassify_pve_matches
+from src.jobs.player_mode_stats_backfill import backfill_player_mode_stats
 
 
 FIREFIGHT_ID = "96aedf55-1c7e-46d5-bdaf-19a1329fb95d"

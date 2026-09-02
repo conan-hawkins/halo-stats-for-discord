@@ -4,12 +4,12 @@ One-time backfill of historic CSR from skill.svc into a standalone SQLite file.
 Writes to its OWN database, not the live one, for two reasons: the run takes
 hours and must not hold the bot's single write connection for that long, and a
 separate file makes resume trivial. Merge it in afterwards with
-`python -m src.database.csr_merge`.
+`python -m src.jobs.csr_merge`.
 
-Run everything:      python -m src.database.csr_backfill
-Dry run:             python -m src.database.csr_backfill --limit-players 320
+Run everything:      python -m src.jobs.csr_backfill
+Dry run:             python -m src.jobs.csr_backfill --limit-players 320
 Resume:              re-run the same command; completed work is skipped
-Specific playlists:  python -m src.database.csr_backfill --playlists <id> <id>
+Specific playlists:  python -m src.jobs.csr_backfill --playlists <id> <id>
 
 Three phases:
 
@@ -483,7 +483,7 @@ def main() -> int:
     print(f"  current-rank rows  : {r.playlist_rows:,}")
     print(f"  season rows        : {r.season_rows:,}")
     print("=" * 60)
-    print("Now merge: python -m src.database.csr_merge")
+    print("Now merge: python -m src.jobs.csr_merge")
     return 0
 
 
