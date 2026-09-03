@@ -322,6 +322,20 @@ class HaloAPIClient:
         # history check, only the post-fetch filtering differs.
         self._history_checked_at: Dict[str, float] = {}
 
+        # What that same check established about an EMPTY history, per xuid:
+        # "private" | "no_games" | None. Written in lockstep with
+        # _history_checked_at (see _stamp_history_checked), so an xuid present
+        # in one is always present in the other - which is what lets a caller
+        # read a missing entry here as "the last check saw a real history",
+        # not as "we never looked".
+        #
+        # It exists because the verdict outlives the response that produced it.
+        # The freshness gate is global across every viewer, so the first person
+        # to open a private player consumes the only refresh that would have
+        # said "private" - everyone else arriving inside the freshness window
+        # gets a bare skip. Remembering it lets the skip carry the answer.
+        self._history_visibility: Dict[str, Optional[str]] = {}
+
         # XUIDs the batch profile endpoint rejects. One unknown id fails the
         # WHOLE batch with a 400 (measured), so a bad id left in the working
         # set would poison every batch it lands in. Process-lifetime only and
@@ -329,6 +343,32 @@ class HaloAPIClient:
         # transient service answer, and this must never be confused with
         # data/xuid_gamertag_blacklist.json, which is a moderation watchlist.
         self._unresolvable_xuids: Set[str] = set()
+
+    def _stamp_history_checked(self, xuid: str, history_visibility: Optional[str] = None) -> None:
+        """Record a just-completed API history check, and what it found.
+
+        The two facts are stored together on purpose: "when we last looked" and
+        "what we saw" are the same observation, and letting them drift would let
+        the freshness gate answer for a check whose verdict came from a
+        different one. `history_visibility` is None whenever the history was
+        visible and non-empty, which is exactly what clears a stale "private"
+        once a player opens their account back up.
+        """
+        self._history_checked_at[xuid] = time.monotonic()
+        self._history_visibility[xuid] = (
+            history_visibility if history_visibility in ("private", "no_games") else None
+        )
+
+    def last_history_visibility(self, xuid: str) -> Optional[str]:
+        """Why this xuid's history was empty at the last completed check:
+        "private", "no_games", or None for "it wasn't empty, or we never
+        looked". Read it together with history_checked_age_seconds, which is
+        what distinguishes those last two: an xuid with an age has been checked,
+        so None there means a real history was seen.
+
+        Process-lifetime only, like the freshness clock it shadows. A restart
+        loses it and the next refresh re-establishes it."""
+        return self._history_visibility.get(xuid)
 
     def history_checked_age_seconds(self, xuid: str) -> Optional[float]:
         """Seconds since this xuid's match history was last API-checked, or None
@@ -4476,7 +4516,7 @@ class HaloAPIClient:
                             # A real API check just confirmed the cache is
                             # current; stamp it so requests within the
                             # freshness TTL skip the API entirely.
-                            self._history_checked_at[xuid] = time.monotonic()
+                            self._stamp_history_checked(xuid, history_visibility)
                             print(f"No new matches found, using cache ({len(existing_match_ids)} matches)")
                             # Prefer the precomputed per-mode summary over
                             # rescanning the cached matches in Python; falls
@@ -5062,7 +5102,7 @@ class HaloAPIClient:
                 # never proved the history is complete, so they must not let
                 # later full-history requests skip their API check.
                 if full_history_requested:
-                    self._history_checked_at[xuid] = time.monotonic()
+                    self._stamp_history_checked(xuid, history_visibility)
 
                 return {
                     'error': 0,

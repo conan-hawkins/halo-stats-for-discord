@@ -208,18 +208,36 @@ async def handle_refresh(request: web.Request) -> web.Response:
     if xuid:
         age = api_client.history_checked_age_seconds(xuid)
         if age is not None and age < settings.WEB_AUTOREFRESH_FRESHNESS_SECONDS:
-            return web.json_response(
-                {"ok": True, "skipped": True, "reason": "fresh", "age_seconds": int(age)},
-                status=200,
-            )
+            payload = {
+                "ok": True, "skipped": True, "reason": "fresh", "age_seconds": int(age),
+            }
+            # Carry the last check's verdict on the skip. The gate is global, so
+            # whoever opens a private player first consumes the one refresh that
+            # would have reported "private" - without this, every other viewer
+            # inside the freshness window is told nothing and their page cannot
+            # explain the empty history. `last_reason` is separate from `reason`
+            # because `reason` says why we skipped, and clients switch on it.
+            #
+            # Omitted when the check found a real history: reaching here proves a
+            # check completed, so its absence is itself the answer ("not empty"),
+            # which is what retires a stale notice on the site.
+            last = api_client.last_history_visibility(xuid)
+            if last in ("private", "no_games"):
+                payload["last_reason"] = last
+            return web.json_response(payload, status=200)
 
     result = await _refresh_coalesced(gamertag, xuid)
 
     if result.get("_rate_limited"):
         # Graceful: the page keeps showing cached data instead of erroring.
-        return web.json_response(
-            {"ok": True, "skipped": True, "reason": "rate_limited"}, status=200
-        )
+        # Unlike the freshness skip this proves nothing about a check having
+        # run, so a missing verdict here means "we don't know" and the site is
+        # expected to keep whatever it already had.
+        payload = {"ok": True, "skipped": True, "reason": "rate_limited"}
+        last = api_client.last_history_visibility(xuid) if xuid else None
+        if last in ("private", "no_games"):
+            payload["last_reason"] = last
+        return web.json_response(payload, status=200)
 
     error = result.get("error", 4)
     if error == 0:

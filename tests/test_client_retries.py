@@ -662,3 +662,101 @@ async def test_surviving_crawl_is_not_duplicated_by_the_next_caller():
     second = await internal_api._refresh_coalesced("Big", "x")
     assert second["error"] == 0
     assert starts == ["Big"], f"crawl started {len(starts)} times: {starts}"
+
+
+# --- Remembered empty-history verdict -------------------------------------
+#
+# The freshness gate is global across every viewer, so only the FIRST person to
+# open a private player gets a refresh that reports "private". Everyone else
+# arriving inside the freshness window gets a skip, and their page has nothing
+# to explain the empty history with unless the skip carries the last verdict.
+
+
+def _fresh_request(gamertag="Tester", token="secret"):
+    """Minimal stand-in for the aiohttp request handle_refresh actually uses."""
+
+    class _Req:
+        headers = {"X-Internal-Token": token}
+
+        async def json(self):
+            return {"gamertag": gamertag}
+
+    return _Req()
+
+
+def test_stamping_a_check_records_its_verdict():
+    client = HaloAPIClient()
+
+    client._stamp_history_checked("x1", "private")
+    assert client.last_history_visibility("x1") == "private"
+
+    # A later check that saw a real history clears it - this is what stops a
+    # player who opens their account back up being called private forever.
+    client._stamp_history_checked("x1", None)
+    assert client.last_history_visibility("x1") is None
+
+    # Anything the bot did not actually establish is stored as "don't know".
+    client._stamp_history_checked("x2", "some_unexpected_value")
+    assert client.last_history_visibility("x2") is None
+
+    # An xuid never checked reads the same as one checked and found non-empty;
+    # history_checked_age_seconds is what separates them.
+    assert client.last_history_visibility("never-seen") is None
+    assert client.history_checked_age_seconds("never-seen") is None
+    assert client.history_checked_age_seconds("x1") is not None
+
+
+@pytest.mark.asyncio
+async def test_fresh_skip_carries_the_last_private_verdict(monkeypatch):
+    import json
+
+    from src.config import settings
+    from src.web import internal_api
+
+    monkeypatch.setattr(settings, "INTERNAL_STATS_REFRESH_TOKEN", "secret")
+    monkeypatch.setattr(settings, "WEB_AUTOREFRESH_FRESHNESS_SECONDS", 300)
+    monkeypatch.setattr(
+        internal_api.api_client.stats_cache, "resolve_xuid_by_gamertag", lambda g: "x1"
+    )
+    monkeypatch.setattr(
+        internal_api.api_client, "history_checked_age_seconds", lambda xuid: 12.0
+    )
+    monkeypatch.setattr(
+        internal_api.api_client, "last_history_visibility", lambda xuid: "private"
+    )
+
+    resp = await internal_api.handle_refresh(_fresh_request())
+    body = json.loads(resp.body)
+
+    assert body["skipped"] is True
+    # `reason` still says why we skipped; the verdict rides alongside it, or
+    # clients switching on "fresh" would break.
+    assert body["reason"] == "fresh"
+    assert body["last_reason"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_fresh_skip_omits_the_verdict_when_the_history_was_real(monkeypatch):
+    """Absence is the answer here, not a gap: reaching the gate proves a check
+    completed, so no verdict means it saw a genuine history."""
+    import json
+
+    from src.config import settings
+    from src.web import internal_api
+
+    monkeypatch.setattr(settings, "INTERNAL_STATS_REFRESH_TOKEN", "secret")
+    monkeypatch.setattr(settings, "WEB_AUTOREFRESH_FRESHNESS_SECONDS", 300)
+    monkeypatch.setattr(
+        internal_api.api_client.stats_cache, "resolve_xuid_by_gamertag", lambda g: "x1"
+    )
+    monkeypatch.setattr(
+        internal_api.api_client, "history_checked_age_seconds", lambda xuid: 12.0
+    )
+    monkeypatch.setattr(
+        internal_api.api_client, "last_history_visibility", lambda xuid: None
+    )
+
+    body = json.loads((await internal_api.handle_refresh(_fresh_request())).body)
+
+    assert body["reason"] == "fresh"
+    assert "last_reason" not in body

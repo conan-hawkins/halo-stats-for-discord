@@ -2317,6 +2317,9 @@ async def test_no_new_matches_stamps_freshness_and_skips_api_on_repeat(monkeypat
     assert first["stats"]["games_played"] == 25
     # The confirmed-current check must stamp the freshness timestamp.
     assert "test-xuid" in client._history_checked_at
+    # ...and record what it saw. A visible, non-empty history leaves no verdict,
+    # which is what the website reads as "nothing to explain here".
+    assert client.last_history_visibility("test-xuid") is None
     requests_after_first = len(starts)
     assert requests_after_first > 0
 
