@@ -210,6 +210,10 @@ async def backfill_match_modes(
 
             result.players_visited += 1
             cursor = conn.cursor()
+            # Assets this player's matches referenced, resolved once the row
+            # updates are committed and the write lock is released.
+            pending_maps: Dict[str, Optional[str]] = {}
+            pending_variants: Dict[str, Optional[str]] = {}
             collected = 0
             start = 0
             while collected < matches_per_player:
@@ -278,29 +282,42 @@ async def backfill_match_modes(
                     )
                     result.matches_updated += cursor.rowcount
 
-                    # Names are joined from the metadata tables at read time, so
-                    # resolving an asset once here names every match that ever
-                    # used it - including matches this job will never visit.
-                    if resolve_assets and map_asset_id and map_asset_id not in seen_maps:
-                        seen_maps.add(map_asset_id)
-                        if cache.db.get_map_metadata(map_asset_id) is None:
-                            await client._lookup_or_resolve_map(map_asset_id, map_version_id, session)
-                            result.maps_resolved += 1
-
-                    if resolve_assets and variant_asset_id and variant_asset_id not in seen_variants:
-                        seen_variants.add(variant_asset_id)
-                        if cache.db.get_game_variant_metadata(variant_asset_id) is None:
-                            await client._lookup_or_resolve_game_variant(
-                                variant_asset_id, variant_version_id, session
-                            )
-                            result.variants_resolved += 1
+                    # Assets are only NOTED here, and resolved after the commit
+                    # below. Resolving inline deadlocks: this loop holds an open
+                    # write transaction on matches, while the resolver writes its
+                    # metadata row from a thread-pool thread - which, because the
+                    # bot's connections are thread-local, is a SECOND connection
+                    # to the same file. It waits on a write lock this loop is
+                    # holding and dies with "database is locked".
+                    if resolve_assets:
+                        if map_asset_id and map_asset_id not in seen_maps:
+                            seen_maps.add(map_asset_id)
+                            pending_maps[map_asset_id] = map_version_id
+                        if variant_asset_id and variant_asset_id not in seen_variants:
+                            seen_variants.add(variant_asset_id)
+                            pending_variants[variant_asset_id] = variant_version_id
 
                 if len(page) < PAGE_SIZE:
                     break
                 start += PAGE_SIZE
 
-            # Per player, so an interrupted run keeps everything it has done.
+            # Per player, so an interrupted run keeps everything it has done -
+            # and, critically, BEFORE the resolves below, which write to the
+            # same database from another thread and would otherwise block on
+            # the write lock this transaction holds.
             conn.commit()
+
+            # Names are joined from the metadata tables at read time, so
+            # resolving an asset once here names every match that ever used it -
+            # including matches this job will never visit.
+            for asset_id, version_id in pending_maps.items():
+                if cache.db.get_map_metadata(asset_id) is None:
+                    await client._lookup_or_resolve_map(asset_id, version_id, session)
+                    result.maps_resolved += 1
+            for asset_id, version_id in pending_variants.items():
+                if cache.db.get_game_variant_metadata(asset_id) is None:
+                    await client._lookup_or_resolve_game_variant(asset_id, version_id, session)
+                    result.variants_resolved += 1
             print(
                 f"[MODE-BACKFILL] {gamertag}: {result.matches_updated} matches enriched so far "
                 f"({result.players_visited} players visited, {result.players_skipped_complete} already complete)"
