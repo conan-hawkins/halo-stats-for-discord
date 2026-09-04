@@ -320,3 +320,26 @@ def test_non_images_are_refused_whatever_they_claim_to_be():
     assert _sniff_extension(b"") is None
     # A truncated JPEG magic must not pass on a prefix match.
     assert _sniff_extension(b"\xff\xd8") is None
+
+
+def test_a_truncated_image_is_refused():
+    """aiohttp's content.read(n) returns what is BUFFERED, up to n - not n
+    bytes - so the first version of this cached the leading ~15KB of every map
+    thumbnail and served artwork with a grey band across the bottom. The header
+    was perfectly valid, so sniffing could not catch it; the trailer can.
+    """
+    from src.api.map_images import _looks_complete
+
+    jpeg_head = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+    png_head = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+    assert _looks_complete(jpeg_head + b"\xff\xd9", ".jpg")
+    assert not _looks_complete(jpeg_head, ".jpg")
+
+    assert _looks_complete(png_head + b"IEND\xaeB`\x82", ".png")
+    assert not _looks_complete(png_head, ".png")
+
+    # RIFF declares its own payload length, so WebP needs no trailer.
+    webp = b"RIFF" + (24).to_bytes(4, "little") + b"WEBP" + b"\x00" * 24
+    assert _looks_complete(webp, ".webp")
+    assert not _looks_complete(webp[:-4], ".webp")

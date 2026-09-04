@@ -31,6 +31,9 @@ MAX_IMAGE_BYTES = 1_048_576
 
 DOWNLOAD_TIMEOUT_SECONDS = 20
 
+# Read granularity while draining a response body.
+_CHUNK_BYTES = 65536
+
 # Magic numbers for the formats we will write to disk, mapped to the extension
 # each is stored under. Anything else is discarded: the API serves these
 # straight to browsers, so the set accepted here is the set it can serve.
@@ -60,6 +63,30 @@ def _sniff_extension(data: bytes) -> Optional[str]:
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return ".webp"
     return None
+
+
+def _looks_complete(data: bytes, extension: str) -> bool:
+    """Whether these bytes carry their format's end marker.
+
+    A half-downloaded image still starts with a perfectly good header, so the
+    magic number alone cannot tell a whole file from a truncated one - and a
+    truncated one renders as artwork with a grey band across the bottom, which
+    is what shipped before the chunked read below replaced content.read(n).
+    Checking the trailer costs nothing and makes a dropped connection fail
+    loudly instead of caching a broken picture forever.
+    """
+    if extension == ".jpg":
+        return data.endswith(b"\xff\xd9")
+    if extension == ".png":
+        return data.endswith(b"IEND\xaeB`\x82")
+    if extension == ".webp":
+        # RIFF declares its own payload length in bytes 4-8, excluding the
+        # 8-byte header - so a short file is detectable without a trailer.
+        if len(data) < 12:
+            return False
+        declared = int.from_bytes(data[4:8], "little")
+        return len(data) >= declared + 8
+    return False
 
 
 def cached_image_path(map_asset_id: str) -> Optional[str]:
@@ -153,18 +180,35 @@ async def cache_map_image(map_asset_id: str, image_url: str, client=None) -> Opt
                     print(f"[map_images] GET {image_url} -> HTTP {response.status}")
                     return None
 
-                # Read with a ceiling rather than response.read(): the length
-                # header is the server's claim, not a guarantee.
-                data = await response.content.read(MAX_IMAGE_BYTES + 1)
-                if len(data) > MAX_IMAGE_BYTES:
-                    print(f"[map_images] Map {map_asset_id} artwork exceeds {MAX_IMAGE_BYTES} bytes - skipped")
-                    return None
+                # Drain the body in chunks, with a ceiling.
+                #
+                # NOT `content.read(n)`. That returns whatever is already
+                # buffered, up to n - not n bytes - so it silently yielded the
+                # first ~15KB of every map thumbnail and cached a picture whose
+                # bottom third was missing. Nothing downstream could tell: the
+                # bytes it did return were a valid JPEG header.
+                chunks = []
+                total = 0
+                async for chunk in response.content.iter_chunked(_CHUNK_BYTES):
+                    total += len(chunk)
+                    if total > MAX_IMAGE_BYTES:
+                        print(
+                            f"[map_images] Map {map_asset_id} artwork exceeds "
+                            f"{MAX_IMAGE_BYTES} bytes - skipped"
+                        )
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
                 if not data:
                     return None
 
                 extension = _sniff_extension(data)
                 if extension is None:
                     print(f"[map_images] Not an image we serve, for map {map_asset_id} - skipped")
+                    return None
+
+                if not _looks_complete(data, extension):
+                    print(f"[map_images] Truncated artwork for map {map_asset_id} - skipped")
                     return None
 
         MAP_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
