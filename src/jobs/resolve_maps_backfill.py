@@ -21,10 +21,14 @@ version id straight out of the table rather than sampling a live match to
 obtain one. The resolver still falls back to the unversioned URL, which is
 what rescues maps whose stored version has since been retired.
 
-Safe to re-run: asset ids already cached 'resolved' or 'not_found' are
-skipped with zero network calls unless --retry-unresolved is passed. Nothing
-in matches is rewritten - map names are joined at read time, so there is no
-64M-row UPDATE here and no precomputed table to rebuild afterwards.
+Safe to re-run, and converges when re-run: asset ids already cached 'resolved'
+or 'not_found' are skipped with zero network calls unless --retry-unresolved is
+passed, EXCEPT that a map which resolved to a name but has no artwork on disk
+is always retried - see the selection code for why that state happens and why
+it would otherwise be permanent.
+
+Nothing in matches is rewritten - map names are joined at read time, so there
+is no 64M-row UPDATE here and no precomputed table to rebuild afterwards.
 """
 
 from __future__ import annotations
@@ -54,6 +58,8 @@ class MapBackfillResult:
     maps_named: int = 0
     maps_with_artwork: int = 0
     maps_unresolved: int = 0
+    # Resolved maps whose artwork was missing from disk when this run started.
+    maps_missing_artwork: int = 0
     matches_covered: int = 0
 
 
@@ -87,19 +93,63 @@ async def backfill_map_metadata(
     targets: List[Tuple[str, int]] = [
         (row["map_asset_id"], row["match_count"]) for row in cursor.fetchall()
     ]
+
+    # A map that resolved to a NAME but never got its PICTURE is unfinished
+    # work, and the query above cannot see it: the row says 'resolved', so it
+    # is skipped forever while the website keeps rendering an empty frame.
+    #
+    # That state is not hypothetical - it is what a transient download failure
+    # leaves behind, and it is what the Content-Type bug left across every map
+    # whose artwork the blob store served as application/octet-stream. So it is
+    # picked up on EVERY run rather than behind a flag: the job's promise is
+    # named-and-pictured, and it should converge on that by being re-run.
+    #
+    # Only rows that claimed a thumbnail_path qualify. A resolved map that
+    # published no usable image has nothing to fetch and must not be retried on
+    # every single run.
+    from src.api.map_images import cached_image_path
+
+    cursor.execute(
+        """
+        SELECT m.map_id AS map_asset_id, COUNT(*) AS match_count
+        FROM matches m
+        JOIN map_metadata mm ON mm.map_asset_id = m.map_id
+        WHERE mm.resolution_status = 'resolved'
+          AND mm.thumbnail_path IS NOT NULL
+        GROUP BY m.map_id
+        ORDER BY match_count DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    missing_art = [
+        (row["map_asset_id"], row["match_count"])
+        for row in cursor.fetchall()
+        if cached_image_path(row["map_asset_id"]) is None
+    ]
+    result.maps_missing_artwork = len(missing_art)
+
+    known = {asset_id for asset_id, _ in targets}
+    targets.extend((a, c) for a, c in missing_art if a not in known)
+    targets.sort(key=lambda t: -t[1])
+    targets = targets[:limit]
+
     result.maps_checked = len(targets)
     result.matches_covered = sum(count for _, count in targets)
 
     if not targets:
         return result
 
-    # _lookup_or_resolve_map short-circuits on anything already cached
-    # 'not_found', which is exactly what --retry-unresolved just asked to
-    # re-attempt. Clear those rows so the lookups below actually go out.
+    # _lookup_or_resolve_map short-circuits on anything already cached - which
+    # is exactly what both retry paths above have just asked to re-attempt.
+    # Clear those rows so the lookups below actually go out.
+    retry_ids = {a for a, _ in missing_art}
     if retry_unresolved:
+        retry_ids.update(a for a, _ in targets)
+    if retry_ids:
         cursor.executemany(
             "DELETE FROM map_metadata WHERE map_asset_id = ?",
-            [(asset_id,) for asset_id, _ in targets],
+            [(asset_id,) for asset_id in retry_ids],
         )
         conn.commit()
 
@@ -143,8 +193,6 @@ async def backfill_map_metadata(
                 result.maps_named += 1
             else:
                 result.maps_unresolved += 1
-            from src.api.map_images import cached_image_path
-
             if cached_image_path(asset_id):
                 result.maps_with_artwork += 1
         else:
@@ -183,5 +231,6 @@ if __name__ == "__main__":
     print(
         f"Checked {outcome.maps_checked} maps covering {outcome.matches_covered:,} matches: "
         f"{outcome.maps_named} named, {outcome.maps_with_artwork} with artwork cached, "
-        f"{outcome.maps_unresolved} unresolved."
+        f"{outcome.maps_unresolved} unresolved "
+        f"({outcome.maps_missing_artwork} were re-fetched for missing artwork)."
     )
