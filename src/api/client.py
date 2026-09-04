@@ -3518,6 +3518,275 @@ class HaloAPIClient:
             return resolved['is_ranked'], resolved['is_pve']
         return None, None
 
+    # =========================================================================
+    # UGC ASSET METADATA (discovery-infiniteugc)
+    # =========================================================================
+
+    async def _fetch_ugc_asset(
+        self,
+        asset_kind: str,
+        asset_id: str,
+        version_id: Optional[str],
+        session: aiohttp.ClientSession,
+        log_tag: str,
+    ) -> Tuple[Optional[Dict], str]:
+        """GET one discovery-infiniteugc asset document.
+
+        Returns (payload, status) where status is 'resolved', 'not_found' or
+        'error', and payload is the parsed JSON only when status is 'resolved'.
+
+        Shared by the map and game-variant resolvers because the request is
+        identical for every asset kind - only the path segment and how the
+        response is read differ. resolve_playlist_metadata predates this and is
+        deliberately left alone: it is load-bearing for match classification and
+        has its own is_ranked/is_pve derivation, so re-routing it through here
+        would risk a live behaviour change for a tidiness gain.
+
+        Tries the versioned URL first when a version is known, then the
+        unversioned form. A retired version 404s while the asset itself still
+        resolves, which is what keeps historical matches nameable.
+
+        Never raises. Every caller is a cosmetic lookup hanging off a real match
+        fetch, and must degrade to a bare GUID rather than cost that match its
+        stats.
+        """
+        try:
+            async with halo_stats_rate_limiter.slot() as account_index:
+                spartan_token = self.get_next_spartan_token(account_index)
+                if isinstance(spartan_token, dict) and 'token' in spartan_token:
+                    spartan_token = spartan_token['token']
+
+                headers = {
+                    "Authorization": f"Spartan {spartan_token}",
+                    "x-343-authorization-spartan": spartan_token,
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json",
+                }
+                # Not required (confirmed 200 without it live) but sent
+                # opportunistically, matching resolve_playlist_metadata.
+                if self.clearance_token and self.clearance_token != "skip":
+                    headers["x-343-authorization-clearance"] = self.clearance_token
+
+                urls = []
+                if version_id:
+                    urls.append(f"{self.DISCOVERY_UGC_URL}/hi/{asset_kind}/{asset_id}/versions/{version_id}")
+                urls.append(f"{self.DISCOVERY_UGC_URL}/hi/{asset_kind}/{asset_id}")
+
+                last_status = 'error'
+                for url in urls:
+                    try:
+                        async with session.get(url, headers=headers) as response:
+                            if response.status == 200:
+                                return await response.json(), 'resolved'
+                            elif response.status == 404:
+                                last_status = 'not_found'
+                                continue
+                            elif response.status == 429:
+                                retry_after = response.headers.get('Retry-After')
+                                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else 3
+                                halo_stats_rate_limiter.set_backoff(seconds=wait_time, account_index=account_index)
+                                last_status = 'error'
+                                continue
+                            else:
+                                last_status = 'error'
+                                continue
+                    except Exception as e:
+                        print(f"[{log_tag}] Error resolving {asset_id}: {e}")
+                        last_status = 'error'
+                        continue
+
+                return None, last_status
+        except Exception as e:
+            print(f"[{log_tag}] Error resolving {asset_id}: {e}")
+            return None, 'error'
+
+    async def resolve_game_variant_metadata(
+        self,
+        asset_id: str,
+        version_id: Optional[str],
+        session: aiohttp.ClientSession,
+    ) -> Dict:
+        """Resolve a UGC game variant's PublicName - the match's MODE.
+
+        "Slayer", "Capture the Flag", "Oddball", "Firefight: King of the Hill".
+        This is the authoritative source for what a match was played as, and the
+        reason nothing here maps MatchInfo.GameVariantCategory to names: that
+        enum is sparse, undocumented by 343 and renumbered across the game's
+        life, so a hand-written table quietly mislabels modes. One request per
+        distinct variant asset, ever, cannot.
+
+        Always returns {'public_name', 'resolution_status'}.
+        """
+        data, status = await self._fetch_ugc_asset(
+            "ugcGameVariants", asset_id, version_id, session, "VARIANT"
+        )
+        if status != 'resolved' or not isinstance(data, dict):
+            return {'public_name': None, 'resolution_status': status}
+        public_name = str(data.get('PublicName') or '').strip()
+        return {'public_name': public_name or None, 'resolution_status': 'resolved'}
+
+    async def _lookup_or_resolve_game_variant(
+        self,
+        asset_id: Optional[str],
+        version_id: Optional[str],
+        session: aiohttp.ClientSession,
+    ) -> Optional[str]:
+        """Consult (and, on a cache miss, populate) game_variant_metadata for
+        this asset's mode name. Returns the name, or None when it is unknown -
+        callers must treat None as "no mode to show", never as an error.
+
+        Zero-network for any asset already cached 'resolved' or 'not_found'.
+        Halo runs a few dozen distinct matchmade variants at a time, not one per
+        match, so in steady state this costs a request only when a new mode
+        ships - the same self-healing shape as the playlist and map lookups.
+        """
+        if not asset_id:
+            return None
+        asset_id = asset_id.strip()
+        if not asset_id:
+            return None
+
+        cached = self.stats_cache.db.get_game_variant_metadata(asset_id)
+        if cached:
+            if cached['resolution_status'] == 'resolved':
+                return cached['public_name']
+            if cached['resolution_status'] == 'not_found':
+                return None  # confirmed unresolvable; don't hammer it every match
+
+        resolved = await self.resolve_game_variant_metadata(asset_id, version_id, session)
+        await asyncio.get_running_loop().run_in_executor(
+            self._db_write_executor,
+            self.stats_cache.db.upsert_game_variant_metadata,
+            asset_id, resolved['public_name'], resolved['resolution_status'], version_id,
+        )
+        if resolved['resolution_status'] == 'resolved':
+            return resolved['public_name']
+        return None
+
+    @staticmethod
+    def _pick_map_thumbnail(files: Optional[Dict]) -> Optional[str]:
+        """Choose the best artwork path out of a UGC asset's Files block.
+
+        A map asset publishes several images and the useful ones are not named
+        consistently across shipped maps and Forge variants, so this prefers in
+        descending order of how well they crop into a list row: the explicit
+        thumbnail, then a screenshot, then anything else under images/.
+
+        Returns the RELATIVE path, which the caller joins onto Files.Prefix -
+        the prefix is a per-asset, per-version blob-store URL and is the only
+        place the version actually appears, so the two must not be separated.
+        """
+        if not isinstance(files, dict):
+            return None
+        paths = files.get('FileRelativePaths')
+        if not isinstance(paths, list):
+            return None
+        candidates = [str(path) for path in paths if isinstance(path, str)]
+
+        def _first(predicate) -> Optional[str]:
+            return next((c for c in candidates if predicate(c.lower())), None)
+
+        return (
+            _first(lambda c: 'thumbnail' in c)
+            or _first(lambda c: 'screenshot' in c)
+            or _first(lambda c: c.startswith('images/') and c.endswith(('.jpg', '.jpeg', '.png')))
+        )
+
+    async def resolve_map_metadata(
+        self,
+        asset_id: str,
+        version_id: Optional[str],
+        session: aiohttp.ClientSession,
+    ) -> Dict:
+        """Resolve a MapVariant's PublicName and artwork URL.
+
+        The inline MatchInfo.MapVariant object carries only AssetKind/AssetId/
+        VersionId - never a name - which is why matches.map_id has always been a
+        bare GUID and no map name has ever been displayable.
+
+        Always returns {'public_name', 'thumbnail_url', 'thumbnail_path',
+        'resolution_status'}.
+        """
+        data, status = await self._fetch_ugc_asset(
+            "maps", asset_id, version_id, session, "MAP"
+        )
+        if status != 'resolved' or not isinstance(data, dict):
+            return {
+                'public_name': None,
+                'thumbnail_url': None,
+                'thumbnail_path': None,
+                'resolution_status': status,
+            }
+
+        public_name = str(data.get('PublicName') or '').strip()
+        files = data.get('Files')
+        relative = self._pick_map_thumbnail(files)
+        prefix = ''
+        if isinstance(files, dict):
+            prefix = str(files.get('Prefix') or '').strip()
+        thumbnail_url = None
+        if prefix and relative:
+            thumbnail_url = f"{prefix.rstrip('/')}/{relative.lstrip('/')}"
+
+        return {
+            'public_name': public_name or None,
+            'thumbnail_url': thumbnail_url,
+            'thumbnail_path': relative,
+            'resolution_status': 'resolved',
+        }
+
+    async def _lookup_or_resolve_map(
+        self,
+        map_asset_id: Optional[str],
+        map_version_id: Optional[str],
+        session: aiohttp.ClientSession,
+    ) -> Optional[str]:
+        """
+        Consult (and, on a cache miss, populate) map_metadata for this asset's
+        display name, caching its artwork to disk as a side effect. Returns the
+        name, or None when the asset is unknown or unresolvable - callers must
+        treat None as "no name to show", never as an error.
+
+        Zero-network for any asset id already cached 'resolved' or 'not_found',
+        which after a short warm-up is nearly every match: the 25 most-played
+        maps cover roughly 80% of all matches ingested. Exactly the shape of
+        _lookup_or_resolve_playlist_ranked, for exactly the same reason - it
+        self-heals when a new map ships without waiting on a backfill run.
+        """
+        if not map_asset_id:
+            return None
+        asset_id = map_asset_id.strip()
+        if not asset_id:
+            return None
+
+        cached = self.stats_cache.db.get_map_metadata(asset_id)
+        if cached:
+            if cached['resolution_status'] == 'resolved':
+                return cached['public_name']
+            if cached['resolution_status'] == 'not_found':
+                return None  # confirmed unresolvable; don't hammer it every match
+
+        resolved = await self.resolve_map_metadata(asset_id, map_version_id, session)
+        await asyncio.get_running_loop().run_in_executor(
+            self._db_write_executor,
+            self.stats_cache.db.upsert_map_metadata,
+            asset_id, resolved['public_name'], resolved['thumbnail_path'],
+            resolved['resolution_status'], map_version_id,
+        )
+
+        if resolved['resolution_status'] == 'resolved' and resolved['thumbnail_url']:
+            # Fetched once per asset id, ever. Failure is silent and leaves the
+            # map nameable but pictureless, which is exactly what the website
+            # renders when an image 404s anyway.
+            from src.api.map_images import cache_map_image
+            # `self`, not the module singleton: the backfill jobs run their own
+            # client built from cached tokens and never authenticate that one.
+            await cache_map_image(asset_id, resolved['thumbnail_url'], client=self)
+
+        if resolved['resolution_status'] == 'resolved':
+            return resolved['public_name']
+        return None
+
     async def get_match_stats_for_match(
         self,
         match_id: str,
@@ -3728,6 +3997,56 @@ class HaloAPIClient:
                             metadata_is_ranked, metadata_is_pve = await self._lookup_or_resolve_playlist_ranked(
                                 playlist_asset_id, playlist_version_id, session
                             )
+
+                            # What the match WAS - Slayer, Oddball, CTF.
+                            #
+                            # The category int is already in hand:
+                            # _classify_match_category has always read
+                            # GameVariantCategory off this same payload as a
+                            # custom-vs-matchmade signal and thrown it away, so
+                            # persisting it costs nothing but the column. It is
+                            # stored raw and never turned into a mode name - see
+                            # resolve_game_variant_metadata for why.
+                            #
+                            # The asset id is what actually names the mode, via
+                            # game_variant_metadata. UgcGameVariant is the key
+                            # matchmade payloads use; GameVariant is checked too
+                            # because custom lobbies have been observed carrying
+                            # it under that name instead.
+                            game_variant_category = self._coerce_intish(
+                                match_info.get('GameVariantCategory')
+                            )
+                            game_variant_asset_id = None
+                            game_variant_version_id = None
+                            game_variant_name = None
+                            for variant_key in ('UgcGameVariant', 'GameVariant'):
+                                variant = match_info.get(variant_key)
+                                if not isinstance(variant, dict):
+                                    continue
+                                if game_variant_asset_id is None and variant.get('AssetId'):
+                                    game_variant_asset_id = variant.get('AssetId')
+                                    game_variant_version_id = variant.get('VersionId')
+                                if game_variant_name is None:
+                                    # Only ever a fallback for a variant asset
+                                    # that will not resolve (a private or deleted
+                                    # Forge variant), and absent on most
+                                    # matchmade games.
+                                    name = str(variant.get('Name') or '').strip()
+                                    if name:
+                                        game_variant_name = name
+
+                            # Name the map and the mode. Both are cached per asset
+                            # id, so these are network calls only the first time
+                            # any match anywhere references a given asset - and
+                            # neither can block the stats: they return None rather
+                            # than raising.
+                            await self._lookup_or_resolve_map(
+                                map_asset_id, map_version_id, session
+                            )
+                            await self._lookup_or_resolve_game_variant(
+                                game_variant_asset_id, game_variant_version_id, session
+                            )
+
                             match_category, is_ranked, category_source = self._classify_match_category(
                                 playlist_asset_id=playlist_asset_id,
                                 playlist_version_id=playlist_version_id,
@@ -3758,6 +4077,10 @@ class HaloAPIClient:
                                 'csr_tier': csr_tier,
                                 'map_id': map_asset_id,
                                 'map_version': map_version_id,
+                                'game_variant_id': game_variant_asset_id,
+                                'game_variant_version': game_variant_version_id,
+                                'game_variant_category': game_variant_category,
+                                'game_variant_name': game_variant_name,
                                 'players': player_xuids,
                                 'all_participants': all_participants,
                             }

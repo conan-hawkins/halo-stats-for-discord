@@ -67,6 +67,12 @@ MEDAL_ICON_CACHE_DIR = DATA_DIR / "medal_icons"
 MEDAL_SHEET_CACHE_FILE = MEDAL_ICON_CACHE_DIR / "medal_sheet_xl.png"
 MEDAL_METADATA_CACHE_FILE = MEDAL_ICON_CACHE_DIR / "metadata.json"
 
+# Map thumbnail cache, one JPEG per MapVariant asset id. Unlike medals there is
+# no sprite sheet: each map asset carries its own image on the UGC blob store,
+# so these are downloaded individually and cached forever (a given asset id's
+# artwork never changes - a reworked map ships as a new asset).
+MAP_IMAGE_CACHE_DIR = DATA_DIR / "map_images"
+
 # =============================================================================
 # API CONFIGURATION
 # =============================================================================
@@ -201,6 +207,7 @@ def ensure_data_directories():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     MEDAL_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    MAP_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # Create directories on import

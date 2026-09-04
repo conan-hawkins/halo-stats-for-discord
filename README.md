@@ -22,6 +22,7 @@ halo-stats-for-discord/
 │   ├── api/                  # Halo API client
 │   │   ├── client.py         # API client wrapper
 │   │   ├── rate_limiters.py  # Rate limiting classes
+│   │   ├── map_images.py     # Map artwork cache, served by halo-stats-api
 │   │   ├── xuid_cache.py     # XUID/Gamertag cache
 │   │   └── utils.py          # Utility functions
 │   ├── auth/                 # Authentication
@@ -53,6 +54,7 @@ halo-stats-for-discord/
     ├── halo_stats_v2.db      # Stats database
     ├── halo_social_graph.db  # Social graph database
     ├── medal_icons/          # Cropped medal PNGs, served by halo-stats-api
+    ├── map_images/           # Map thumbnails, served by halo-stats-api
     └── xuid_gamertag_cache.json  # XUID cache (86k+ entries)
 ```
 
@@ -163,6 +165,61 @@ Matches now store category metadata in the stats DB:
 - `category_source`: classifier provenance (for example `playlist_map`, `text_heuristic`, `default_non_ranked`)
 
 Historical migration and one-time backfill scripts are no longer part of this repository.
+
+## Maps and modes
+
+A match stores asset GUIDs; the human-readable names live in metadata tables
+that this bot fills from discovery-infiniteugc. Three asset kinds, one pattern:
+
+| Table | Names | Filled by |
+|---|---|---|
+| `playlist_metadata` | the playlist ("Ranked Arena") | `_lookup_or_resolve_playlist_ranked`, `reclassify_playlists_backfill` |
+| `map_metadata` | the map ("Aquarius") | `_lookup_or_resolve_map`, `resolve_maps_backfill` |
+| `game_variant_metadata` | the MODE ("Capture the Flag") | `_lookup_or_resolve_game_variant`, `backfill_match_modes` |
+
+Each lookup is zero-network for an asset already cached `resolved` or
+`not_found`, so in steady state a request goes out only when a new map or mode
+ships — self-healing at ingest without waiting on a backfill run. Names are
+joined at read time by `halo-stats-api`, so resolving one asset names every
+match that ever used it, retroactively.
+
+**Nothing maps `GameVariantCategory` to a mode name.** The int is stored raw, on
+`matches.game_variant_category`, and never labelled. That enum is sparse,
+undocumented by 343 and has been renumbered across the game's life, so a
+hand-written table would confidently mislabel matches — "Oddball" over games
+that were Capture the Flag — and no test in any of the three repos could catch
+it. Asking the UGC service costs one request per distinct variant, ever, and
+cannot be wrong. The int is kept because it is free and because it is the only
+mode signal left for a variant that has since been delisted.
+
+Map artwork is downloaded once per asset into `data/map_images/` and served by
+`halo-stats-api`, exactly as medal icons are — a browser cannot fetch it
+itself, because the UGC blob store sits behind the same Spartan auth as the
+rest of the Halo API.
+
+### Backfilling
+
+Both new columns and both new tables start empty. Nothing about the game
+variant was ever stored, so the ~64M rows already in `matches` have no mode at
+all until something goes and looks them up.
+
+```bash
+# Name the maps. Ordered by match count, most-played first: the 25 most-played
+# asset ids cover ~80% of all matches, so this is worth most in its first
+# few dozen calls. Safe to re-run.
+python -m src.jobs.resolve_maps_backfill --limit 500
+
+# Fill the mode on recent history, and the maps it meets along the way. Uses
+# the match-LIST endpoint - 25 matches per request, MatchInfo included - so a
+# player's last 50 matches cost two requests rather than fifty. Visits players
+# most-recently-refreshed first, which is the closest signal to "somebody is
+# looking at this profile". Safe to re-run and safe to interrupt.
+python -m src.jobs.backfill_match_modes --players 200 --matches-per-player 50
+```
+
+Filling all 64M rows is deliberately not offered: at 25 matches a request that
+is ~2.6M rate-limited calls for matches nobody opens. Rows neither job reaches
+keep a NULL mode, and the website renders that as a dash rather than a guess.
 
 ## Social Graph Crawler
 

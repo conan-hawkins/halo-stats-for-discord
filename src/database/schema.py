@@ -246,6 +246,33 @@ class HaloStatsDBv2:
         # Migration-safe columns for existing DBs created before category support.
         self._ensure_column_exists("matches", "match_category", "TEXT NOT NULL DEFAULT 'unknown'")
         self._ensure_column_exists("matches", "category_source", "TEXT")
+
+        # What the match actually WAS - Slayer, Oddball, CTF. Stored the same way
+        # the playlist is: the UGC asset id here, the human-readable name once in
+        # game_variant_metadata (Table 13), joined at read time. One resolution
+        # therefore names every match that ever used that variant, retroactively,
+        # instead of writing the same string onto millions of rows.
+        #
+        # game_variant_category is MatchInfo's GameVariantCategory int, kept raw
+        # and unlabelled. It is free (ingest already parses it as a custom-vs-
+        # matchmade signal and threw it away until now) and it is the only mode
+        # signal left for a match whose variant asset has since been delisted.
+        # Nothing may turn it into a mode NAME without a verified enum: guessing
+        # one would put "Oddball" under matches that were Capture the Flag.
+        #
+        # game_variant_name is the inline MatchInfo name, when there is one. It
+        # is usually absent on matchmade games, and exists here for the case the
+        # join cannot cover: a private or deleted Forge variant, whose asset
+        # 404s while the name sat in the payload all along.
+        #
+        # All four are NULL on every row written before this shipped, because
+        # none of it was ever persisted. src/jobs/backfill_match_modes.py fills
+        # the recent window from the match-list endpoint; anything older stays
+        # NULL and must render as unknown rather than as a guess.
+        self._ensure_column_exists("matches", "game_variant_id", "TEXT")
+        self._ensure_column_exists("matches", "game_variant_version", "TEXT")
+        self._ensure_column_exists("matches", "game_variant_category", "INTEGER")
+        self._ensure_column_exists("matches", "game_variant_name", "TEXT")
         
         # ============================================================
         # Table 2: Players - Player information
@@ -501,6 +528,59 @@ class HaloStatsDBv2:
         """)
 
         # ============================================================
+        # Table 12: Map Metadata - cache of discovery-infiniteugc map lookups,
+        # keyed by map_asset_id. Exactly the playlist_metadata pattern (Table 9)
+        # applied to matches.map_id, and populated the same two ways: lazily at
+        # ingest (HaloAPIClient._lookup_or_resolve_map) and in bulk by
+        # src/jobs/resolve_maps_backfill.py.
+        #
+        # Worth having despite ~22k distinct asset ids, because the distribution
+        # is extremely top-heavy: the 25 most-played maps account for roughly
+        # 80% of all matches ever ingested, so the cache is useful long before
+        # it is complete. The long tail is Forge variants, which resolve to
+        # their author's title and are no less correct for being rare.
+        #
+        # thumbnail_path is the blob-store path the artwork was fetched from,
+        # kept for diagnostics; the bytes themselves live on disk under
+        # MAP_IMAGE_CACHE_DIR, which is what the website actually serves. NULL
+        # means the asset resolved but published no usable image.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS map_metadata (
+                map_asset_id TEXT PRIMARY KEY,
+                public_name TEXT,
+                thumbnail_path TEXT,
+                resolution_status TEXT NOT NULL DEFAULT 'unresolved',
+                last_checked_at TEXT NOT NULL,
+                last_version_id TEXT
+            )
+        """)
+
+        # ============================================================
+        # Table 13: Game Variant Metadata - cache of discovery-infiniteugc
+        # ugcGameVariants lookups, keyed by asset id. Table 9 (playlists) and
+        # Table 12 (maps) for a third asset kind, and populated the same two
+        # ways: lazily at ingest, in bulk by a backfill job.
+        #
+        # This is what finally names the MODE. The service returns the variant's
+        # own PublicName - "Slayer", "Capture the Flag", "Oddball" - which is
+        # authoritative in a way GameVariantCategory is not: that enum is sparse,
+        # undocumented by 343, and has been renumbered across the game's life,
+        # so anything mapping it to names by hand is a guess that silently
+        # mislabels matches. Asking the service costs one request per distinct
+        # variant, ever, and cannot be wrong.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS game_variant_metadata (
+                game_variant_asset_id TEXT PRIMARY KEY,
+                public_name TEXT,
+                resolution_status TEXT NOT NULL DEFAULT 'unresolved',
+                last_checked_at TEXT NOT NULL,
+                last_version_id TEXT
+            )
+        """)
+
+        # ============================================================
         # Indexes for performance
         # ============================================================
         # The two CSR tables above deliberately get none: both primary keys
@@ -516,6 +596,14 @@ class HaloStatsDBv2:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_ranked ON matches(is_ranked)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_category ON matches(match_category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_matches_map ON matches(map_id)")
+        # NOTE: matches(game_variant_id) deliberately has NO index.
+        #
+        # Read paths join on game_variant_metadata's PRIMARY KEY, so nothing
+        # needs one, and building it would cost far more than it could ever
+        # return: 64M rows on a spinning disk, inside _init_db, holding the
+        # write lock while the bot cannot start - to index a column that is
+        # NULL on every one of those rows until a backfill fills it. Add one
+        # only alongside a query that actually scans by variant.
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_gamertag ON players(gamertag)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_match_xuid ON player_match(xuid)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_match_match ON player_match(match_id)")
@@ -689,8 +777,9 @@ class HaloStatsDBv2:
         try:
             cursor.execute("""
                 INSERT OR IGNORE INTO matches 
-                (match_id, duration, start_time, is_ranked, playlist_id, match_category, category_source, map_id, map_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (match_id, duration, start_time, is_ranked, playlist_id, match_category, category_source, map_id, map_version,
+                 game_variant_id, game_variant_version, game_variant_category, game_variant_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 match_data.get('match_id'),
                 match_data.get('duration'),
@@ -700,20 +789,37 @@ class HaloStatsDBv2:
                 match_data.get('match_category', 'unknown') or 'unknown',
                 match_data.get('category_source'),
                 match_data.get('map_id'),
-                match_data.get('map_version')
+                match_data.get('map_version'),
+                match_data.get('game_variant_id'),
+                match_data.get('game_variant_version'),
+                match_data.get('game_variant_category'),
+                match_data.get('game_variant_name')
             ))
 
+            # COALESCE, so re-ingesting a match already in the table can FILL a
+            # column it was written without but never blank one it already has.
+            # That is what lets backfill_match_modes.py enrich the 64M rows
+            # written before game_variant_category existed, simply by replaying
+            # them through the normal ingest path.
             cursor.execute(
                 """
                 UPDATE matches
                 SET
                     match_category = COALESCE(?, match_category),
-                    category_source = COALESCE(?, category_source)
+                    category_source = COALESCE(?, category_source),
+                    game_variant_id = COALESCE(?, game_variant_id),
+                    game_variant_version = COALESCE(?, game_variant_version),
+                    game_variant_category = COALESCE(?, game_variant_category),
+                    game_variant_name = COALESCE(?, game_variant_name)
                 WHERE match_id = ?
                 """,
                 (
                     match_data.get('match_category'),
                     match_data.get('category_source'),
+                    match_data.get('game_variant_id'),
+                    match_data.get('game_variant_version'),
+                    match_data.get('game_variant_category'),
+                    match_data.get('game_variant_name'),
                     match_data.get('match_id'),
                 ),
             )
@@ -747,6 +853,60 @@ class HaloStatsDBv2:
                 (playlist_asset_id, public_name, is_ranked, resolution_status, last_checked_at, last_version_id)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (playlist_asset_id, public_name, 1 if is_ranked else 0, resolution_status, now, version_id))
+        if commit:
+            conn.commit()
+
+    def get_map_metadata(self, map_asset_id: str) -> Optional[sqlite3.Row]:
+        """Point lookup by asset id - the map equivalent of
+        get_playlist_metadata, and read the same way: inline from ingest."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM map_metadata WHERE map_asset_id = ?",
+            (map_asset_id,)
+        )
+        return cursor.fetchone()
+
+    def upsert_map_metadata(self, map_asset_id: str, public_name: Optional[str],
+                            thumbnail_path: Optional[str], resolution_status: str,
+                            version_id: Optional[str] = None, commit: bool = True) -> None:
+        """No FK children reference map_metadata, so INSERT OR REPLACE is safe -
+        same reasoning as upsert_playlist_metadata."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            INSERT OR REPLACE INTO map_metadata
+                (map_asset_id, public_name, thumbnail_path, resolution_status, last_checked_at, last_version_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (map_asset_id, public_name, thumbnail_path, resolution_status, now, version_id))
+        if commit:
+            conn.commit()
+
+    def get_game_variant_metadata(self, game_variant_asset_id: str) -> Optional[sqlite3.Row]:
+        """Point lookup by asset id - the game-variant twin of
+        get_playlist_metadata / get_map_metadata."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM game_variant_metadata WHERE game_variant_asset_id = ?",
+            (game_variant_asset_id,)
+        )
+        return cursor.fetchone()
+
+    def upsert_game_variant_metadata(self, game_variant_asset_id: str, public_name: Optional[str],
+                                     resolution_status: str, version_id: Optional[str] = None,
+                                     commit: bool = True) -> None:
+        """No FK children reference game_variant_metadata, so INSERT OR REPLACE
+        is safe - same reasoning as upsert_playlist_metadata."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            INSERT OR REPLACE INTO game_variant_metadata
+                (game_variant_asset_id, public_name, resolution_status, last_checked_at, last_version_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (game_variant_asset_id, public_name, resolution_status, now, version_id))
         if commit:
             conn.commit()
 
