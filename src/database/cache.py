@@ -39,7 +39,8 @@ class PlayerStatsCacheV2:
         try:
             # The whole per-player batch is written under ONE transaction and
             # committed once at the end (one fsync-class write instead of ~4 per
-            # match - the dominant cost on HDD-backed storage; composes with
+            # match - which dominated back when this DB lived on an HDD, and is
+            # still the cheaper shape on the SSD; composes with
             # synchronous=NORMAL). To keep atomicity per-match despite the single
             # commit, each match is wrapped in its own SAVEPOINT: a single bad
             # match rolls back only itself and the batch continues ("114 of 115",
@@ -177,11 +178,15 @@ class PlayerStatsCacheV2:
             
             # Get processed matches for this player (for "overall", get ALL matches regardless of ranked status)
             #
-            # This is the expensive half of a cache load, and on a cold page
-            # cache it dominates everything else: the JOIN onto `matches` costs
-            # roughly one random seek per match, measured at ~17ms/match on the
-            # spinning disk the DB lives on (0.2ms warm - a 75x difference).
-            # A 696-match player took 16.4s here; a 1194-match player 25.0s.
+            # This is the expensive half of a cache load: the JOIN onto
+            # `matches` costs roughly one random read per match.
+            #
+            # The figures that follow are HDD-era, measured when this DB lived
+            # on a spinning disk: ~17ms/match cold against 0.2ms warm (75x), so
+            # a 696-match player took 16.4s here and a 1194-match player 25.0s.
+            # The DB is on an SSD now and those costs are ~2 orders of magnitude
+            # lower, so this no longer dominates a cold lookup. Re-measure
+            # before citing these numbers as a reason for anything.
             #
             # Callers that only need to know WHICH matches are cached - a
             # freshness check looking for the boundary between new and known -

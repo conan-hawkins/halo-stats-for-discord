@@ -60,7 +60,7 @@ class HaloSocialGraphDB:
             self.local.conn.execute("PRAGMA busy_timeout=5000")
             # Safe with WAL: skips the per-commit fsync (see HaloStatsDBv2).
             self.local.conn.execute("PRAGMA synchronous=NORMAL")
-            # Keep sort/temp b-trees in RAM, off the HDD.
+            # Keep sort/temp b-trees in RAM, off disk.
             self.local.conn.execute("PRAGMA temp_store=MEMORY")
             # Modest 16MB page cache: graph rendering runs in executor threads,
             # each with its own thread-local connection, so this multiplies -

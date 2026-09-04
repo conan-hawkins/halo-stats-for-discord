@@ -39,6 +39,7 @@ load_dotenv()
 
 from src.auth.tokens import run_auth_flow
 from src.database.cache import get_cache
+from src.api.timing import log_timing
 from src.config import (
     DATA_DIR,
     TOKEN_CACHE_FILE,
@@ -299,10 +300,14 @@ class HaloAPIClient:
         self._last_refresh_time = 0.0
 
         # Dedicated single-worker executor for blocking SQLite writes, so they
-        # never stall the asyncio event loop / gateway heartbeat (critical on
-        # HDD-backed storage where a commit can take tens of ms). One worker =>
-        # one writer connection => no write-lock contention, and writes are
-        # naturally serialized, which spinning disks strongly prefer.
+        # never stall the asyncio event loop / gateway heartbeat. The original
+        # rationale was an HDD, where a commit cost tens of ms and serialized
+        # writes suited the spindle. The DB is on an SSD now, so that argument
+        # is gone - but max_workers must still be 1, for a reason the medium
+        # does not change: SQLite admits one writer at a time, so one worker =>
+        # one writer connection => no write-lock contention. Widening this buys
+        # no throughput and trades it for busy_timeout waits and
+        # "database is locked".
         self._db_write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="halo-db-writer"
         )
@@ -2872,7 +2877,11 @@ class HaloAPIClient:
             gamertag: Player gamertag
         """
         try:
+            _t_write = time.monotonic()   # TIMING ONLY
             success = self.stats_cache.save_player_stats(xuid, stat_type, stats_data, gamertag)
+            log_timing("db_write", xuid=xuid,
+                       matches=len(stats_data.get('processed_matches') or []),
+                       seconds=time.monotonic() - _t_write)
             if success:
                 print(f"Saved stats to database for {gamertag or xuid}")
             else:
@@ -4300,18 +4309,26 @@ class HaloAPIClient:
         full_history_requested = matches_to_process >= 999999
         try:
             # Check cache first. Runs in the default executor, not on the event
-            # loop, since a cold-cache read on the HDD-backed DB can take
-            # seconds to minutes and would otherwise stall the Discord gateway
+            # loop, so a slow cache read can never stall the Discord gateway
             # heartbeat.
-            # Index only: which matches are cached, not their contents. The
-            # full rows cost ~17ms each on a cold page cache (one disk seek per
-            # match), so a 696-match player spent 16.4s here before doing any
-            # work - and when the freshness check finds nothing new, the stats
-            # come from the precomputed player_mode_stats summary and those rows
-            # are never read. Load them only if something actually needs them.
+            # Index only: which matches are cached, not their contents. On the
+            # HDD this DB used to live on, the full rows cost ~17ms each on a
+            # cold page cache (one seek per match) and a 696-match player spent
+            # 16.4s here before doing any work. On the SSD that penalty is
+            # smaller by roughly two orders of magnitude, so this is no longer
+            # the dominant cost of a lookup - but the load is still pointless
+            # work: when the freshness check finds nothing new, the stats come
+            # from the precomputed player_mode_stats summary and those rows are
+            # never read. Load them only if something actually needs them.
+            _t_cache = time.monotonic()   # TIMING ONLY
             cached_data = await asyncio.get_running_loop().run_in_executor(
                 None, self.load_cached_stats, xuid, stat_type, gamertag, False
             )
+            # This is the index-only read (include_matches=False). On the HDD
+            # the full-row variant cost 16.4s for 696 matches; this one 0.03s.
+            # Both should now be far cheaper - measure, do not assume.
+            log_timing("cache_load", xuid=xuid,
+                       seconds=time.monotonic() - _t_cache)
             last_update = None
             existing_match_ids = set()
             cache_marked_incomplete = False
@@ -5196,7 +5213,12 @@ class HaloAPIClient:
                 
                 # Rolling queue for match details - keep many requests in flight
                 # 429 retries handle pacing, maximize concurrency
-                max_match_requests = 200  # 40 per account = 200 match details in flight
+                # Upper bound on tasks CREATED, not on requests in flight.
+                # Every task then blocks on halo_stats_rate_limiter.slot(),
+                # whose semaphore is num_accounts * 5 - so real concurrency is
+                # 25 at five accounts, and this 200 never binds. Raising it
+                # changes nothing; the semaphore is the ceiling.
+                max_match_requests = 200
                 new_stats = []
                 failed_matches = []
                 
@@ -5231,6 +5253,7 @@ class HaloAPIClient:
                 # Rolling queue - as each completes, start next
                 completed = 0
                 total = len(matches_to_fetch)
+                _t_fetch = time.monotonic()   # TIMING ONLY
 
                 while pending:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -5262,6 +5285,14 @@ class HaloAPIClient:
                         print(f"   Progress: {completed}/{total} matches fetched ({len(new_stats)} successful)")
                 
                 print(f"   Completed: {len(new_stats)} matches fetched, {len(failed_matches)} failed")
+                # TIMING ONLY. `rate` makes the concurrency question concrete:
+                # the real ceiling here is the limiter's num_accounts * 5
+                # semaphore, not max_match_requests. Compare against the 50
+                # req/s that match_stats was measured serving clean.
+                _fetch_elapsed = time.monotonic() - _t_fetch
+                log_timing("match_details", matches=total, ok=len(new_stats),
+                           failed=len(failed_matches), seconds=_fetch_elapsed,
+                           rate=(total / _fetch_elapsed if _fetch_elapsed > 0 else 0.0))
                 
                 all_processed_matches.extend(new_stats)
                 new_matches_processed = len(new_stats)

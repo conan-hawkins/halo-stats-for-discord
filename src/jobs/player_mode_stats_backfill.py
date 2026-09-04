@@ -6,7 +6,7 @@ recomputed and written with INSERT OR REPLACE, not incremented.
 Run all modes:    python -m src.jobs.player_mode_stats_backfill
 Specific modes:   python -m src.jobs.player_mode_stats_backfill core_ranked rotational_ranked
 (the mode filter avoids rescanning player_match x matches for buckets that
-are already correct - each mode is a full-table scan, slow on the prod HDD)
+are already correct - each mode is a full-table scan, slow even on the SSD)
 """
 
 from __future__ import annotations

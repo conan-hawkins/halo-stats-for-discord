@@ -211,11 +211,12 @@ class HaloStatsDBv2:
             self.local.conn.execute("PRAGMA busy_timeout=5000")
             # Safe with WAL: skips the per-commit fsync (only a checkpoint fsync
             # could be lost on an OS/power crash, never on a process crash, and
-            # never corruption). Biggest single write-latency win on an HDD.
+            # never corruption). Biggest single write-latency win on the HDD
+            # this DB used to live on; still worth having on the SSD.
             self.local.conn.execute("PRAGMA synchronous=NORMAL")
-            # Keep ORDER BY / GROUP BY / DISTINCT spill b-trees in RAM, off the HDD.
+            # Keep ORDER BY / GROUP BY / DISTINCT spill b-trees in RAM, off disk.
             self.local.conn.execute("PRAGMA temp_store=MEMORY")
-            # ~128MB page cache. Access to this (large, HDD-backed) DB is
+            # ~128MB page cache. Access to this (large, SSD-backed) DB is
             # concentrated on the asyncio event-loop thread, so connection count
             # is low and this does not multiply badly across threads.
             self.local.conn.execute("PRAGMA cache_size=-131072")
@@ -626,8 +627,9 @@ class HaloStatsDBv2:
         #
         # Read paths join on game_variant_metadata's PRIMARY KEY, so nothing
         # needs one, and building it would cost far more than it could ever
-        # return: 64M rows on a spinning disk, inside _init_db, holding the
-        # write lock while the bot cannot start - to index a column that is
+        # return: 64M rows indexed inside _init_db, holding the write lock
+        # while the bot cannot start (minutes on the old HDD; the SSD shortens
+        # that but does not make it free) - to index a column that is
         # NULL on every one of those rows until a backfill fills it. Add one
         # only alongside a query that actually scans by variant.
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_players_gamertag ON players(gamertag)")

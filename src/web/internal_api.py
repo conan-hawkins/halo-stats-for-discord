@@ -31,6 +31,7 @@ from collections import deque
 from aiohttp import web
 
 from src.api.client import api_client
+from src.api.timing import log_timing
 from src.config import settings
 
 # Guard against starting twice on Discord reconnects (on_ready can fire again).
@@ -41,6 +42,10 @@ _web_server_started = False
 _refresh_semaphore: asyncio.Semaphore | None = None
 _inflight: dict[str, asyncio.Task] = {}
 _inflight_lock: asyncio.Lock | None = None
+
+# TIMING ONLY: how many refreshes are currently blocked on _refresh_semaphore.
+# Reported as the `waiting=` column and never read to make a decision.
+_refresh_waiting = 0
 
 # monotonic timestamps of actual Halo fetches in the last minute (global cap).
 # Only mutated inside _inflight_lock, so it needs no separate lock.
@@ -75,18 +80,55 @@ async def _do_refresh(gamertag: str, xuid: str | None) -> dict:
     """One live fetch under the concurrency semaphore. force_full_fetch=False so
     it still honours the bot's own freshness logic; we only reach here when the
     web freshness window already judged the player stale. Never raises."""
+    global _refresh_waiting
     assert _refresh_semaphore is not None
-    async with _refresh_semaphore:
-        try:
-            result = await api_client.get_player_stats(
-                gamertag,
-                "overall",
-                matches_to_process=None,   # None => full incremental history
-                force_full_fetch=False,    # respect the shared freshness signal
-                xuid=xuid,
+    # TIMING ONLY below - the control flow is unchanged. `queue_wait` is the
+    # number this was added for: REFRESH_MAX_CONCURRENCY is 2 and the slot is
+    # held for the WHOLE fetch, so a cheap incremental refresh can sit behind a
+    # full crawl running for minutes. Near-zero kills that theory; tens of
+    # seconds confirms head-of-line blocking is the cost, not throughput.
+    _t_arrived = time.monotonic()
+    _refresh_waiting += 1
+    _acquired = False
+    try:
+        async with _refresh_semaphore:
+            _acquired = True
+            _refresh_waiting -= 1
+            _t_start = time.monotonic()
+            try:
+                result = await api_client.get_player_stats(
+                    gamertag,
+                    "overall",
+                    matches_to_process=None,   # None => full incremental history
+                    force_full_fetch=False,    # respect the shared freshness signal
+                    xuid=xuid,
+                )
+            except Exception as e:  # defensive: never leak a raw stacktrace to HTTP
+                log_timing(
+                    "refresh", gamertag=gamertag, outcome="error",
+                    queue_wait=_t_start - _t_arrived,
+                    fetch=time.monotonic() - _t_start,
+                    waiting=_refresh_waiting,
+                )
+                return {"error": 4, "message": f"Refresh failed: {e}"}
+            # matches/new distinguish a full cold crawl (new == matches) from a
+            # cheap incremental one, which is what makes the two lanes visible.
+            _info = (_CACHE_INFO_RE.search(result.get("cache_info", "") or "")
+                     if isinstance(result, dict) else None)
+            log_timing(
+                "refresh", gamertag=gamertag, outcome="ok",
+                xuid_known=int(xuid is not None),
+                matches=(_info.group(1) if _info else "?"),
+                new=(_info.group(2) if _info else "?"),
+                queue_wait=_t_start - _t_arrived,
+                fetch=time.monotonic() - _t_start,
+                waiting=_refresh_waiting,
             )
-        except Exception as e:  # defensive: never leak a raw stacktrace to HTTP
-            return {"error": 4, "message": f"Refresh failed: {e}"}
+    finally:
+        # Only if the acquire itself was abandoned (cancellation); the success
+        # path already decremented inside the block.
+        if not _acquired:
+            _refresh_waiting -= 1
 
     # Progression upkeep, OUTSIDE the semaphore so it never holds a live-fetch
     # slot, and after the fetch so it can see whether new matches arrived.
