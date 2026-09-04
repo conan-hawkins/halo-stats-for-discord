@@ -40,9 +40,23 @@ from src.api.client import HaloAPIClient
 from src.jobs.reclassify_playlists_backfill import _load_cached_spartan_accounts
 from src.database.cache import get_cache, PlayerStatsCacheV2
 
-# resolve_xuids_batch already chunks to PROFILE_BATCH_MAX (100) per request.
-# This is how many are handed to it at once, i.e. the commit granularity.
-BATCH = 500
+# How many are handed to resolve_xuids_batch at once.
+#
+# Sized against DISK, not the network. That call already chunks to
+# PROFILE_BATCH_MAX (100) per request, so the batch size does not change how
+# many requests go out - but it is also cache-THROUGH, and one call rewrites
+# both of the bot's JSON caches in full, whatever it learned:
+# xuid_gamertag_cache.json (~31MB) and its history sidecar (~133MB), each
+# re-read, re-serialised and fsynced. That is ~359MB of I/O per call.
+#
+# At 500 this cost ~360MB per 500 names - about 130GB to name the remaining
+# roster. At 10000 the same work costs ~7GB. The requests are identical either
+# way; only the number of full-file rewrites changes.
+#
+# The batch is also the DB commit granularity, so an interrupted run re-does at
+# most this many - and re-doing them is nearly free, because the names are
+# already in the JSON cache by then and resolve_xuids_batch is cache-first.
+BATCH = 10000
 DEFAULT_LIMIT = 5000
 
 
