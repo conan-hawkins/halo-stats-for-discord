@@ -340,6 +340,8 @@ def test_a_truncated_image_is_refused():
     assert not _looks_complete(png_head, ".png")
 
     # RIFF declares its own payload length, so WebP needs no trailer.
+    # 4 + 4 + 4 + 24 = 36 bytes declaring a 24-byte payload, so 32 bytes is the
+    # shortest COMPLETE file. Cut below that, not merely shorter than the whole.
     webp = b"RIFF" + (24).to_bytes(4, "little") + b"WEBP" + b"\x00" * 24
     assert _looks_complete(webp, ".webp")
-    assert not _looks_complete(webp[:-4], ".webp")
+    assert not _looks_complete(webp[:31], ".webp")
