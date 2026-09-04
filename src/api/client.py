@@ -4307,6 +4307,7 @@ class HaloAPIClient:
         if matches_to_process is None:
             matches_to_process = 999999  # Process all matches
         full_history_requested = matches_to_process >= 999999
+        _t_ccs = time.monotonic()   # TIMING ONLY: phase decomposition origin
         try:
             # Check cache first. Runs in the default executor, not on the event
             # loop, so a slow cache read can never stall the Discord gateway
@@ -4346,10 +4347,16 @@ class HaloAPIClient:
                     # payload that carries the rows regardless of the flag.
                     rows = (cached_data or {}).get('processed_matches') or []
                     if not rows:
+                        _t_full = time.monotonic()   # TIMING ONLY
                         full = await asyncio.get_running_loop().run_in_executor(
                             None, self.load_cached_stats, xuid, stat_type, gamertag, True
                         )
                         rows = (full or {}).get('processed_matches') or []
+                        # The full-row read that include_matches=False exists to
+                        # avoid - an incremental refresh still pays it in full,
+                        # to merge one new match into the whole history.
+                        log_timing("full_read", xuid=xuid, matches=len(rows),
+                                   seconds=time.monotonic() - _t_full)
                     _full_matches_cache = {m['match_id']: m for m in rows}
                 return _full_matches_cache
             
@@ -5189,6 +5196,12 @@ class HaloAPIClient:
                                 uncached_match_ids.append(mid)
                                 seen.add(mid)
                     print(f"Processing {len(uncached_match_ids)} uncached matches from {len(all_matches)} listed matches")
+                    # TIMING ONLY. Entry -> here is the index-only cache read
+                    # plus the whole match-LIST walk (BUCKET_MATCH_LIST, the
+                    # tight one). Subtract cache_load to isolate the walk.
+                    log_timing("list_phase", xuid=xuid, listed=len(all_matches),
+                               uncached=len(uncached_match_ids),
+                               seconds=time.monotonic() - _t_ccs)
                     matches_to_fetch = [(match_id, xuid) for match_id in uncached_match_ids]
                     all_processed_matches = list((await load_full_matches()).values())
                 else:
