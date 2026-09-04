@@ -31,19 +31,35 @@ MAX_IMAGE_BYTES = 1_048_576
 
 DOWNLOAD_TIMEOUT_SECONDS = 20
 
-# What we will write to disk, mapped to the extension it gets stored under.
-# Anything else is discarded: the API serves these straight to browsers, so
-# the set of types accepted here is the set of types it can end up serving.
-_ALLOWED_CONTENT_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-}
+# Magic numbers for the formats we will write to disk, mapped to the extension
+# each is stored under. Anything else is discarded: the API serves these
+# straight to browsers, so the set accepted here is the set it can serve.
+#
+# Sniffed from the BYTES, never from Content-Type. The UGC blob store answers
+# for most map artwork with `application/octet-stream` - only some of it comes
+# back as image/jpeg - so a header check silently refused most maps their
+# picture. Reading the bytes is also the stronger check of the two: it means a
+# file only ever reaches the cache if it really is the format its extension
+# claims, whatever the server said.
+_MAGIC = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+)
 
 # Suffix order the API and the backfill both use when looking for an asset's
 # cached image, most likely first.
 IMAGE_EXTENSIONS = (".jpg", ".png", ".webp")
+
+
+def _sniff_extension(data: bytes) -> Optional[str]:
+    """The extension for these bytes, or None if they are not an image we serve."""
+    for magic, extension in _MAGIC:
+        if data.startswith(magic):
+            return extension
+    # WebP is a RIFF container: "RIFF" <4-byte length> "WEBP".
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
 
 
 def cached_image_path(map_asset_id: str) -> Optional[str]:
@@ -137,12 +153,6 @@ async def cache_map_image(map_asset_id: str, image_url: str, client=None) -> Opt
                     print(f"[map_images] GET {image_url} -> HTTP {response.status}")
                     return None
 
-                content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                extension = _ALLOWED_CONTENT_TYPES.get(content_type)
-                if extension is None:
-                    print(f"[map_images] Refusing {content_type or 'unknown'} for map {map_asset_id}")
-                    return None
-
                 # Read with a ceiling rather than response.read(): the length
                 # header is the server's claim, not a guarantee.
                 data = await response.content.read(MAX_IMAGE_BYTES + 1)
@@ -150,6 +160,11 @@ async def cache_map_image(map_asset_id: str, image_url: str, client=None) -> Opt
                     print(f"[map_images] Map {map_asset_id} artwork exceeds {MAX_IMAGE_BYTES} bytes - skipped")
                     return None
                 if not data:
+                    return None
+
+                extension = _sniff_extension(data)
+                if extension is None:
+                    print(f"[map_images] Not an image we serve, for map {map_asset_id} - skipped")
                     return None
 
         MAP_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)

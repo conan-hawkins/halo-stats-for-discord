@@ -289,3 +289,34 @@ def test_map_and_variant_metadata_round_trip(tmp_path):
     assert db.get_game_variant_metadata("variant-1")["public_name"] == "Oddball"
     assert db.get_map_metadata("never-seen") is None
     assert db.get_game_variant_metadata("never-seen") is None
+
+
+# ---------------------------------------------------------------------------
+# What counts as artwork
+# ---------------------------------------------------------------------------
+
+
+def test_artwork_is_identified_by_its_bytes_not_its_content_type():
+    """The UGC blob store answers for most map artwork with
+    application/octet-stream - only some of it says image/jpeg. A gate that
+    trusted Content-Type therefore refused most maps their picture, which is
+    what this caught in production. Sniffing is also the stronger check: a file
+    only reaches the cache if it really is the format its extension claims.
+    """
+    from src.api.map_images import _sniff_extension
+
+    assert _sniff_extension(b"\xff\xd8\xff\xe0" + b"\x00" * 16) == ".jpg"
+    assert _sniff_extension(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16) == ".png"
+    assert _sniff_extension(b"RIFF" + b"\x00" * 4 + b"WEBP" + b"\x00" * 16) == ".webp"
+
+
+def test_non_images_are_refused_whatever_they_claim_to_be():
+    """These bytes reach a browser from our own origin if they are cached, so
+    anything unrecognised is dropped rather than stored on trust."""
+    from src.api.map_images import _sniff_extension
+
+    assert _sniff_extension(b"GIF89a" + b"\x00" * 16) is None
+    assert _sniff_extension(b"<!DOCTYPE html>") is None
+    assert _sniff_extension(b"") is None
+    # A truncated JPEG magic must not pass on a prefix match.
+    assert _sniff_extension(b"\xff\xd8") is None
