@@ -581,6 +581,32 @@ class HaloStatsDBv2:
         """)
 
         # ============================================================
+        # Table 14: XUID -> Gamertag - names for people we hold no STATS for.
+        #
+        # Deliberately not `players`. That table means "somebody we track", and
+        # it is what /api/players/search scans on every keystroke; folding
+        # ~300k match-roster names into it would flood search with profiles
+        # carrying no games and more than double the scan.
+        #
+        # This exists so a match scoreboard can name everyone in the lobby.
+        # The bot already learns these names in bulk (resolve_xuids_batch, 100
+        # ids a request) and keeps them in xuid_gamertag_cache.json, but a 600k
+        # -entry JSON file is not something the read API can join against - so
+        # the ones that matter are mirrored here, where it can.
+        #
+        # A row here is a NAME, never a claim that we have their stats. The API
+        # marks such participants untracked so the website does not link them
+        # to a player page that would 404.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS xuid_gamertags (
+                xuid TEXT PRIMARY KEY,
+                gamertag TEXT NOT NULL,
+                resolved_at TEXT NOT NULL
+            )
+        """)
+
+        # ============================================================
         # Indexes for performance
         # ============================================================
         # The two CSR tables above deliberately get none: both primary keys
@@ -909,6 +935,26 @@ class HaloStatsDBv2:
         """, (game_variant_asset_id, public_name, resolution_status, now, version_id))
         if commit:
             conn.commit()
+
+    def upsert_xuid_gamertags(self, mapping: Dict[str, str], commit: bool = True) -> int:
+        """Bulk-store xuid -> gamertag names. Returns how many rows were written.
+
+        INSERT OR REPLACE: a gamertag change should overwrite, and nothing has
+        a foreign key onto this table.
+        """
+        if not mapping:
+            return 0
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        rows = [(str(x), g, now) for x, g in mapping.items() if x and g]
+        cursor.executemany("""
+            INSERT OR REPLACE INTO xuid_gamertags (xuid, gamertag, resolved_at)
+            VALUES (?, ?, ?)
+        """, rows)
+        if commit:
+            conn.commit()
+        return len(rows)
 
     # =========================================================================
     # CSR (skill.svc)
