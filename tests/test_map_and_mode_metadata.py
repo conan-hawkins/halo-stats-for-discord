@@ -345,3 +345,51 @@ def test_a_truncated_image_is_refused():
     webp = b"RIFF" + (24).to_bytes(4, "little") + b"WEBP" + b"\x00" * 24
     assert _looks_complete(webp, ".webp")
     assert not _looks_complete(webp[:31], ".webp")
+
+
+# ---------------------------------------------------------------------------
+# Naming a match roster
+# ---------------------------------------------------------------------------
+
+
+def test_unresolvable_xuids_round_trip(tmp_path):
+    """Ids the profile service answers for and does not know.
+
+    Recorded so repeated runs converge: the batch endpoint returns 200 and just
+    omits an id it cannot place, which is indistinguishable from a transient
+    miss unless it is written down - and about half the roster's long tail is
+    this, so without it every future run re-asks the same dead accounts.
+    """
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    assert db.mark_xuids_unresolvable([]) == 0
+    db.mark_xuids_unresolvable(["dead-1", "dead-2"])
+
+    rows = {r[0] for r in db._get_connection().execute("SELECT xuid FROM xuid_unresolvable")}
+    assert rows == {"dead-1", "dead-2"}
+
+    # Re-marking is a no-op rather than an error, so a re-run cannot fail on it.
+    db.mark_xuids_unresolvable(["dead-1"])
+    assert db._get_connection().execute(
+        "SELECT count(*) FROM xuid_unresolvable"
+    ).fetchone()[0] == 2
+
+
+def test_names_and_tombstones_are_separate(tmp_path):
+    """A name row always has a name. The dead go in their own table rather than
+    as a NULL gamertag, so nothing reading xuid_gamertags has to handle one."""
+    db = HaloStatsDBv2(str(tmp_path / "stats.db"))
+
+    db.upsert_xuid_gamertags({"alive-1": "RealPlayer"})
+    db.mark_xuids_unresolvable(["dead-1"])
+
+    conn = db._get_connection()
+    assert conn.execute(
+        "SELECT gamertag FROM xuid_gamertags WHERE xuid = 'alive-1'"
+    ).fetchone()[0] == "RealPlayer"
+    assert conn.execute(
+        "SELECT count(*) FROM xuid_gamertags WHERE gamertag IS NULL"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT count(*) FROM xuid_gamertags WHERE xuid = 'dead-1'"
+    ).fetchone()[0] == 0

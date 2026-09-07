@@ -23,9 +23,15 @@ Cheap, because HaloAPIClient.resolve_xuids_batch is cache-first and resolves
 written as it completes, and ids already named are excluded by the query, so
 a second run picks up exactly where the first stopped.
 
-Ids Xbox itself will not resolve - deleted or banned accounts - simply stay
-absent. That is an answer, not a failure, and the website must render it as
-such rather than inventing a name.
+Ids Xbox itself will not resolve - deleted or banned accounts - are recorded in
+xuid_unresolvable and never asked about again. That is an answer, not a
+failure: the website renders them as a dash rather than inventing a name, and
+this job stops spending requests on them. About half of the roster's long tail
+is this, so the distinction is what lets repeated runs actually converge
+instead of re-asking the same dead accounts forever.
+
+A request that never got an answer - a 429, a DNS blip - is different, and is
+simply left for the next run.
 """
 
 from __future__ import annotations
@@ -65,15 +71,23 @@ class ParticipantBackfillResult:
     unnamed_before: int = 0
     attempted: int = 0
     resolved: int = 0
-    unresolvable: int = 0
+    # Answered for and unknown: deleted or banned. Recorded, never retried.
+    dead: int = 0
+    # Not answered for at all - a 429, a DNS blip, a dropped connection. Left
+    # for the next run, because nothing was learned about them.
+    skipped: int = 0
 
 
 def _unnamed_participants(conn, limit: int) -> List[str]:
-    """Participant xuids with no name in either table.
+    """Participant xuids with no name, and not already known to be unnameable.
 
     Ordered by how many scoreboards they appear on, so a bounded run buys the
     most visible names first - the same "most-played first" reasoning as the
     map backfill.
+
+    xuid_unresolvable is what lets this converge. Without it the long tail of
+    deleted accounts - about half of what remains - is re-requested on every
+    run, forever, and the count can never reach zero.
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -82,8 +96,10 @@ def _unnamed_participants(conn, limit: int) -> List[str]:
         FROM match_participants mp
         LEFT JOIN players p ON p.xuid = mp.xuid
         LEFT JOIN xuid_gamertags xg ON xg.xuid = mp.xuid
+        LEFT JOIN xuid_unresolvable xu ON xu.xuid = mp.xuid
         WHERE (p.xuid IS NULL OR p.gamertag IS NULL)
           AND xg.xuid IS NULL
+          AND xu.xuid IS NULL
         GROUP BY mp.xuid
         ORDER BY appearances DESC
         LIMIT ?
@@ -125,11 +141,23 @@ async def backfill_participant_gamertags(
         # Written per batch, so an interrupted run keeps everything it learned.
         written = cache.db.upsert_xuid_gamertags(mapping)
         result.resolved += written
-        result.unresolvable += len(chunk) - len(mapping)
+
+        # Ids the endpoint ANSWERED for and did not know, as opposed to ids a
+        # failed request never asked about. Only the client can tell those
+        # apart - it adds the former to _unresolvable_xuids when a 200 comes
+        # back without them - and the difference is the whole game here: one
+        # is permanent and one is worth retrying. Reaching into that set is
+        # deliberate; the alternative is re-deriving it from the same 200s the
+        # client has already parsed.
+        dead = [x for x in chunk if x in client._unresolvable_xuids]
+        if dead:
+            cache.db.mark_xuids_unresolvable(dead)
+        result.dead += len(dead)
+        result.skipped += len(chunk) - len(mapping) - len(dead)
 
         print(
-            f"[PARTICIPANTS] {result.resolved}/{result.attempted} named "
-            f"({result.unresolvable} did not resolve)"
+            f"[PARTICIPANTS] {result.resolved}/{result.attempted} named, "
+            f"{result.dead} do not exist, {result.skipped} deferred to a later run"
         )
 
     return result
@@ -146,5 +174,6 @@ if __name__ == "__main__":
     outcome = asyncio.run(backfill_participant_gamertags(limit=args.limit))
     print(
         f"Attempted {outcome.attempted} unnamed participants: "
-        f"{outcome.resolved} named, {outcome.unresolvable} did not resolve."
+        f"{outcome.resolved} named, {outcome.dead} do not exist (recorded, "
+        f"never retried), {outcome.skipped} deferred to a later run."
     )

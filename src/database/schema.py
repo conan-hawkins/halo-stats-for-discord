@@ -608,6 +608,30 @@ class HaloStatsDBv2:
         """)
 
         # ============================================================
+        # Table 15: Unresolvable XUIDs - ids the profile service answers for
+        # and does not know. Deleted accounts, banned ones, and whatever else
+        # leaves a roster entry behind with nobody attached.
+        #
+        # Separate from xuid_gamertags rather than a NULL row in it, because
+        # that table's promise is "this xuid has this name" and a nullable
+        # gamertag would quietly weaken it for every reader.
+        #
+        # The point is convergence. The batch endpoint returns 200 and simply
+        # omits an id it cannot place, which is indistinguishable from a
+        # transient miss unless somebody writes it down - so without this,
+        # resolve_participant_gamertags retries the same dead accounts on every
+        # future run forever. Measured on the long tail of the roster: about
+        # HALF of what is left is this, so it is half of every future run's
+        # requests.
+        # ============================================================
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS xuid_unresolvable (
+                xuid TEXT PRIMARY KEY,
+                checked_at TEXT NOT NULL
+            )
+        """)
+
+        # ============================================================
         # Indexes for performance
         # ============================================================
         # The two CSR tables above deliberately get none: both primary keys
@@ -937,6 +961,26 @@ class HaloStatsDBv2:
         """, (game_variant_asset_id, public_name, resolution_status, now, version_id))
         if commit:
             conn.commit()
+
+    def mark_xuids_unresolvable(self, xuids: List[str], commit: bool = True) -> int:
+        """Record ids the profile service answered for but did not know.
+
+        INSERT OR IGNORE: the first answer stands. Re-checking one later is a
+        deliberate act (delete the row), not something a routine re-run should
+        do by accident.
+        """
+        if not xuids:
+            return 0
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.executemany(
+            "INSERT OR IGNORE INTO xuid_unresolvable (xuid, checked_at) VALUES (?, ?)",
+            [(str(x), now) for x in xuids if x],
+        )
+        if commit:
+            conn.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else len(xuids)
 
     def upsert_xuid_gamertags(self, mapping: Dict[str, str], commit: bool = True) -> int:
         """Bulk-store xuid -> gamertag names. Returns how many rows were written.
