@@ -393,3 +393,69 @@ def test_names_and_tombstones_are_separate(tmp_path):
     assert conn.execute(
         "SELECT count(*) FROM xuid_gamertags WHERE xuid = 'dead-1'"
     ).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Converging the participant backfill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_until_converged_stops_when_a_pass_stops_gaining(monkeypatch):
+    """One pass never finishes the job - roughly half of each batch is deferred
+    by a 429 - so passes are chained. The stop condition is a pass that names
+    almost nobody, because another one will not rescue it."""
+    from src.jobs import resolve_participant_gamertags as job
+
+    gains = [10533, 5567, 2700, 700, 1900, 0]
+    calls = []
+
+    async def fake_pass(db_path=None, limit=0):
+        r = job.ParticipantBackfillResult()
+        r.unnamed_before = 21800
+        r.resolved = gains[len(calls)]
+        calls.append(limit)
+        return r
+
+    monkeypatch.setattr(job, "backfill_participant_gamertags", fake_pass)
+
+    passes = await job.backfill_until_converged(limit=300000, min_gain=200)
+
+    # Six passes: the last one gained 0, which is below min_gain.
+    assert [p.resolved for p in passes] == gains
+    assert len(calls) == 6
+
+
+@pytest.mark.asyncio
+async def test_until_converged_is_bounded(monkeypatch):
+    """A throttled endpoint must not be able to spin here forever, even if
+    every pass keeps gaining just enough to look productive."""
+    from src.jobs import resolve_participant_gamertags as job
+
+    async def always_productive(db_path=None, limit=0):
+        r = job.ParticipantBackfillResult()
+        r.unnamed_before = 50000
+        r.resolved = 9999
+        return r
+
+    monkeypatch.setattr(job, "backfill_participant_gamertags", always_productive)
+
+    passes = await job.backfill_until_converged(max_passes=3, min_gain=1)
+
+    assert len(passes) == 3
+
+
+@pytest.mark.asyncio
+async def test_until_converged_stops_when_nothing_is_left(monkeypatch):
+    """An empty selection ends it immediately rather than burning max_passes on
+    a database that has nothing to name."""
+    from src.jobs import resolve_participant_gamertags as job
+
+    async def nothing_left(db_path=None, limit=0):
+        return job.ParticipantBackfillResult()  # unnamed_before defaults to 0
+
+    monkeypatch.setattr(job, "backfill_participant_gamertags", nothing_left)
+
+    passes = await job.backfill_until_converged(max_passes=8)
+
+    assert len(passes) == 1
