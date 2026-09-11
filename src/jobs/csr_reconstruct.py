@@ -379,19 +379,35 @@ def _history_matches(db_path: str, xuids: Sequence[str], a: str, b: str
     db.execute("PRAGMA query_only=ON")
     try:
         ph = ",".join("?" * len(xuids))
-        ids = ",".join("?" * len(HARVEST_IDS))
+        # The ladder filter is applied in PYTHON below, deliberately, and must
+        # stay OUT of this SQL. Adding `AND m.playlist_id IN (...)` makes the
+        # planner drive from the matches side and the query stops being about
+        # these players at all:
+        #
+        #   with it     SEARCH m USING INDEX idx_matches_playlist_start
+        #               SEARCH pm USING COVERING INDEX ...player_match_1
+        #   without it  SEARCH pm USING COVERING INDEX ...player_match_1 (xuid=?)
+        #               SEARCH m USING INDEX sqlite_autoindex_matches_1 (match_id=?)
+        #
+        # The first form walks all 6.5M launch-era Arena matches per batch rather
+        # than these 200 players' own history: measured, one batch had not
+        # finished in 32 minutes. The second is two index lookups per match the
+        # players actually played. csr_season_end omits the predicate for exactly
+        # this reason, which is why its phase 1 is fast.
         rows = db.execute(
             f"""SELECT pm.xuid, m.match_id, m.playlist_id, m.start_time
                   FROM player_match pm
                   JOIN matches m ON m.match_id = pm.match_id
                  WHERE pm.xuid IN ({ph})
-                   AND m.playlist_id IN ({ids})
                    AND m.start_time >= ? AND m.start_time < ?""",
-            (*xuids, *HARVEST_IDS, a, b)).fetchall()
+            (*xuids, a, b)).fetchall()
     finally:
         db.close()
+    harvested = set(HARVEST_IDS)
     out: Dict[str, Tuple[str, str, List[str]]] = {}
     for xuid, mid, pid, started in rows:
+        if pid not in harvested:
+            continue
         out.setdefault(mid, (pid, started, []))[2].append(str(xuid))
     return out
 
