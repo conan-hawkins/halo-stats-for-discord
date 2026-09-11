@@ -443,7 +443,13 @@ async def harvest_from_history(db_path: str, out_path: str, start: str, end: str
     asked = {r["match_id"] for r in out.execute("SELECT match_id FROM history_asked")}
     asked |= {r["match_id"] for r in out.execute("SELECT match_id FROM recon_unavailable")}
 
-    players = [x for x in _affected_players(db_path, limit_players) if x not in done]
+    # The cap is applied AFTER dropping finished players, never as a SQL LIMIT.
+    # A LIMIT would re-select the same first N players on every run - they stay
+    # in _affected_players until --merge gives them a derived row - so a chunked
+    # run would skip all N as already done and harvest nobody, forever.
+    players = [x for x in _affected_players(db_path) if x not in done]
+    if limit_players:
+        players = players[:limit_players]
     print(f"[RECON-H] {len(players):,} players to harvest ({len(done):,} already "
           f"done), {len(asked):,} matches already asked, concurrency={concurrency}")
 
@@ -793,7 +799,10 @@ def main() -> int:
                          " The roster-driven default can only see the 0.1%% of"
                          " launch-era matches that have a stored roster.")
     ap.add_argument("--limit-players", type=int,
-                    help="cap the player list; use with --dry-run")
+                    help="harvest at most this many unfinished players, then exit."
+                         " Spartan tokens are validated once at startup and are"
+                         " not renewed mid-run, so a long harvest must be driven"
+                         " as repeated short chunks rather than one process.")
     ap.add_argument("--merge", action="store_true",
                     help="publish season rows into the live DB (own table, not player_csr_season)")
     args = ap.parse_args()
