@@ -15,6 +15,7 @@ the matches and take the best CSR seen.
     python -m src.jobs.csr_reconstruct --dry-run     # counts only
     python -m src.jobs.csr_reconstruct               # harvest
     python -m src.jobs.csr_reconstruct --aggregate   # build season rows
+    python -m src.jobs.csr_reconstruct --from-history   # harvest held matches
 
 WHY IT IS BUILT THIS WAY
 
@@ -110,6 +111,7 @@ class ReconResult:
     observations: int = 0
     unavailable: int = 0
     failed: int = 0
+    players_done: int = 0
     per_month: Dict[str, int] = field(default_factory=dict)
 
 
@@ -201,6 +203,22 @@ def _open_output(path: str) -> sqlite3.Connection:
             started TEXT NOT NULL,
             seen_at TEXT NOT NULL
         );
+        -- One row per player the history-driven harvest has finished.
+        -- Keyed on the XUID rather than a batch index: the population shrinks
+        -- as players gain season rows, so an index is not a stable identity
+        -- across runs but a player is.
+        CREATE TABLE IF NOT EXISTS history_progress (
+            xuid TEXT PRIMARY KEY,
+            matches INTEGER NOT NULL,
+            done_at TEXT NOT NULL
+        );
+        -- Matches the history harvest has already put a request for. This is
+        -- what collapses 597,280 (player, match) pairs into 554,486 requests;
+        -- a match only lands here once it actually answered.
+        CREATE TABLE IF NOT EXISTS history_asked (
+            match_id TEXT PRIMARY KEY,
+            asked_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS recon_season (
             xuid TEXT NOT NULL,
             ladder_id TEXT NOT NULL,
@@ -269,6 +287,236 @@ def _matches_with_rosters(db: sqlite3.Connection, a: str, b: str
     return out
 
 
+# Players per read batch in the history-driven harvest. Same bound, and the
+# same reason, as csr_season_end.PLAYER_BATCH: every batch opens the live DB,
+# reads it, and closes it, so this caps how long any one read snapshot lives.
+HISTORY_PLAYER_BATCH = 200
+
+
+def _recap_rows(client: HaloAPIClient, got: List[Dict], ladder: str, mid: str,
+                started: str) -> List[Tuple]:
+    """Observation rows for one match's skill payload.
+
+    Shared by both harvests so a recap is read in exactly one place. -1 is "not
+    ranked yet" and 0/0 is an unranked match; neither is a rank. But the
+    placement counters alongside them ARE meaningful, so a -1 entry is kept
+    when it can say WHY.
+    """
+    rows: List[Tuple] = []
+    for entry in got:
+        xuid = client._unwrap_player_id(entry)
+        res = entry.get("Result") if isinstance(entry, dict) else None
+        if not xuid or not isinstance(res, dict):
+            continue
+        recap = res.get("RankRecap") or {}
+        post_block = recap.get("PostMatchCsr") or {}
+        pre = (recap.get("PreMatchCsr") or {}).get("Value")
+        post = post_block.get("Value")
+        left = post_block.get("MeasurementMatchesRemaining")
+        total = post_block.get("InitialMeasurementMatches")
+        pre = pre if isinstance(pre, int) and pre > 0 else None
+        post = post if isinstance(post, int) and post > 0 else None
+        placement = isinstance(left, int) and isinstance(total, int) and total > 0
+        if pre is None and post is None and not placement:
+            continue
+        rows.append((str(xuid), ladder, mid, started, pre, post,
+                     left if placement else None,
+                     total if placement else None))
+    return rows
+
+
+def _affected_players(db_path: str, limit: Optional[int] = None) -> List[str]:
+    """The players the roster-driven harvest could never reach.
+
+    They hold a CSR record on a harvested playlist - so the site opens a panel
+    and shows them an all-time peak - while having no season series at all,
+    official or reconstructed. That is exactly the "Ranked in this playlist
+    before, but not in any season we have data for" case, and it is 8,973
+    players: 25% of everyone ranked in Arena.
+
+    Driven from player_playlist_csr rather than from matches, because the
+    launch-era window holds 6.5M of the latter and this is a question about
+    players, not about matches.
+    """
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+    db.execute("PRAGMA query_only=ON")
+    try:
+        # player_csr_season_derived is created by this job's own --merge, so the
+        # very first run predates it. Absent means nothing is reconstructed yet,
+        # which excludes nobody.
+        has_derived = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            "   AND name='player_csr_season_derived'").fetchone() is not None
+        ph = ",".join("?" * len(HARVEST_IDS))
+        derived_clause = (
+            "   AND NOT EXISTS (SELECT 1 FROM player_csr_season_derived d"
+            "                    WHERE d.xuid = c.xuid)" if has_derived else "")
+        sql = (f"SELECT DISTINCT c.xuid FROM player_playlist_csr c"
+               f" WHERE c.playlist_asset_id IN ({ph})"
+               f"   AND NOT EXISTS (SELECT 1 FROM player_csr_season s"
+               f"                    WHERE s.xuid = c.xuid)"
+               f"{derived_clause}"
+               f" ORDER BY c.xuid")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return [str(r[0]) for r in db.execute(sql, HARVEST_IDS)]
+    finally:
+        db.close()
+
+
+def _history_matches(db_path: str, xuids: Sequence[str], a: str, b: str
+                     ) -> Dict[str, Tuple[str, str, List[str]]]:
+    """{match_id: (ladder_id, started, [xuids we know played it])} for a batch.
+
+    This is the whole point of the history-driven harvest. player_match already
+    records which tracked players played which match, indexed by
+    idx_player_match_xuid, so a player's own launch-era ranked history costs one
+    index walk and no network at all. The roster-driven harvest could only see
+    matches carrying a match_participants row - 8,278 of 6,515,918 - and so
+    never asked about 99.9% of the history we already hold.
+    """
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
+    db.execute("PRAGMA query_only=ON")
+    try:
+        ph = ",".join("?" * len(xuids))
+        ids = ",".join("?" * len(HARVEST_IDS))
+        rows = db.execute(
+            f"""SELECT pm.xuid, m.match_id, m.playlist_id, m.start_time
+                  FROM player_match pm
+                  JOIN matches m ON m.match_id = pm.match_id
+                 WHERE pm.xuid IN ({ph})
+                   AND m.playlist_id IN ({ids})
+                   AND m.start_time >= ? AND m.start_time < ?""",
+            (*xuids, *HARVEST_IDS, a, b)).fetchall()
+    finally:
+        db.close()
+    out: Dict[str, Tuple[str, str, List[str]]] = {}
+    for xuid, mid, pid, started in rows:
+        out.setdefault(mid, (pid, started, []))[2].append(str(xuid))
+    return out
+
+
+async def harvest_from_history(db_path: str, out_path: str, start: str, end: str,
+                               concurrency: int, dry_run: bool = False,
+                               limit_players: Optional[int] = None) -> ReconResult:
+    """Harvest recaps for matches we already hold, driven by the player.
+
+    Progress is keyed on the XUID, never on a batch index. The population
+    shrinks as players gain season rows, so a batch index means something
+    different on every run - the instability csr_backfill's chunk_index comment
+    warns about - whereas a player either has been harvested or has not.
+
+    A match already requested is never requested again, which is what collapses
+    597,280 (player, match) pairs into 554,486 requests. A player who shared a
+    match with an earlier batch loses that one observation; measured overlap is
+    7.2%, so their peak still comes from ~93% of their history and a second
+    request to recover it is not worth the rate limiter.
+    """
+    result = ReconResult()
+    out = _open_output(out_path)
+
+    # Matches past the last season window belong to a season nothing aggregates,
+    # so fetching them spends requests for nothing. DEFAULT_END deliberately
+    # overshoots for the roster harvest's validation pass; here it is waste.
+    if end > S2_START:
+        print(f"[RECON-H] clamping end {end} -> {S2_START}: beyond the last "
+              f"season window, so nothing would aggregate it")
+        end = S2_START
+
+    done = {r["xuid"] for r in out.execute("SELECT xuid FROM history_progress")}
+    asked = {r["match_id"] for r in out.execute("SELECT match_id FROM history_asked")}
+    asked |= {r["match_id"] for r in out.execute("SELECT match_id FROM recon_unavailable")}
+
+    players = [x for x in _affected_players(db_path, limit_players) if x not in done]
+    print(f"[RECON-H] {len(players):,} players to harvest ({len(done):,} already "
+          f"done), {len(asked):,} matches already asked, concurrency={concurrency}")
+
+    client: Optional[HaloAPIClient] = None
+    if not dry_run:
+        client = HaloAPIClient()
+        if not await client.ensure_valid_tokens():
+            raise RuntimeError("no valid Spartan tokens - start the bot once first")
+
+    sem = asyncio.Semaphore(concurrency)
+
+    for i in range(0, len(players), HISTORY_PLAYER_BATCH):
+        chunk = players[i : i + HISTORY_PLAYER_BATCH]
+        found = _history_matches(db_path, chunk, start, end)
+        todo = {m: v for m, v in found.items() if m not in asked}
+        result.matches_seen += len(todo)
+
+        per_player: Dict[str, int] = {}
+        for mid, (_pid, _st, who) in found.items():
+            for x in who:
+                per_player[x] = per_player.get(x, 0) + 1
+
+        if dry_run:
+            # Counted against the same dedup set the real run uses, so the
+            # reported total IS the request count rather than a pair count.
+            asked |= set(todo)
+            for mid, (_pid, st, _who) in todo.items():
+                result.per_month[st[:7]] = result.per_month.get(st[:7], 0) + 1
+            result.players_done += len(chunk)
+            print(f"[RECON-H] {i:>6}: {len(chunk)} players -> {len(todo):,} new "
+                  f"matches   total={result.matches_seen:,}")
+            continue
+
+        rows: List[Tuple] = []
+        gone: List[Tuple] = []
+        answered: List[str] = []
+        failed_mids: set = set()
+
+        async def one(mid: str, ladder: str, started: str, who: List[str]) -> None:
+            async with sem:
+                status, got = await _skill_status(
+                    client, f"{client.SKILL_URL}/hi/matches/{mid}/skill", who)
+            result.requests += 1
+            if status == 404:
+                # Permanently gone, not a fault. Recorded so it is never asked
+                # again by either harvest.
+                gone.append((mid, started, datetime.now().isoformat()))
+                return
+            if got is None:
+                # A transient failure must NOT become "this player had no CSR".
+                # The match stays unasked and the player stays unfinished.
+                failed_mids.add(mid)
+                return
+            rows.extend(_recap_rows(client, got, ladder, mid, started))
+            answered.append(mid)
+
+        await asyncio.gather(*(one(m, v[0], v[1], v[2]) for m, v in todo.items()))
+
+        now = datetime.now().isoformat()
+        settled = set(answered) | {g[0] for g in gone}
+        asked |= settled
+        # A player is finished only when every one of their matches settled, so
+        # a blip leaves them to be retried rather than silently truncating the
+        # history their peak is drawn from.
+        stalled = {x for m in failed_mids for x in found[m][2]}
+        batch_done = [x for x in chunk if x not in stalled]
+
+        with out:
+            out.executemany(
+                "INSERT OR REPLACE INTO csr_observation VALUES (?,?,?,?,?,?,?,?)", rows)
+            out.executemany(
+                "INSERT OR REPLACE INTO recon_unavailable VALUES (?,?,?)", gone)
+            out.executemany("INSERT OR REPLACE INTO history_asked VALUES (?,?)",
+                            [(m, now) for m in settled])
+            out.executemany("INSERT OR REPLACE INTO history_progress VALUES (?,?,?)",
+                            [(x, per_player.get(x, 0), now) for x in batch_done])
+
+        result.observations += len(rows)
+        result.unavailable += len(gone)
+        result.failed += len(failed_mids)
+        result.players_done += len(batch_done)
+        print(f"[RECON-H] {i:>6}: {len(chunk)} players, {len(todo):,} matches -> "
+              f"{len(rows):,} observations"
+              f"{f'  ({len(gone)} gone/404)' if gone else ''}"
+              f"{f'  ({len(failed_mids)} FAILED, left open)' if failed_mids else ''}"
+              f"   total={result.observations:,}")
+
+    return result
+
 async def harvest(db_path: str, out_path: str, start: str, end: str,
                   concurrency: int, dry_run: bool = False) -> ReconResult:
     result = ReconResult()
@@ -332,28 +580,7 @@ async def harvest(db_path: str, out_path: str, start: str, end: str,
             if got is None:
                 failed += 1
                 return
-            for entry in got:
-                xuid = client._unwrap_player_id(entry)
-                res = entry.get("Result") if isinstance(entry, dict) else None
-                if not xuid or not isinstance(res, dict):
-                    continue
-                recap = res.get("RankRecap") or {}
-                post_block = recap.get("PostMatchCsr") or {}
-                pre = (recap.get("PreMatchCsr") or {}).get("Value")
-                post = post_block.get("Value")
-                left = post_block.get("MeasurementMatchesRemaining")
-                total = post_block.get("InitialMeasurementMatches")
-                # -1 is "not ranked yet" and 0/0 is "unranked match"; neither is
-                # a rank. But the placement counters alongside them ARE
-                # meaningful, so a -1 row is kept when it can say WHY.
-                pre = pre if isinstance(pre, int) and pre > 0 else None
-                post = post if isinstance(post, int) and post > 0 else None
-                placement = isinstance(left, int) and isinstance(total, int) and total > 0
-                if pre is None and post is None and not placement:
-                    continue
-                rows.append((str(xuid), ladder, mid, started, pre, post,
-                             left if placement else None,
-                             total if placement else None))
+            rows.extend(_recap_rows(client, got, ladder, mid, started))
 
         await asyncio.gather(*(one(*m) for m in batch))
         result.failed += failed
@@ -545,6 +772,12 @@ def main() -> int:
                     help=f"shared with the live bot - keep it low (default {DEFAULT_CONCURRENCY})")
     ap.add_argument("--dry-run", action="store_true", help="count matches, fetch nothing")
     ap.add_argument("--aggregate", action="store_true", help="build season rows from observations")
+    ap.add_argument("--from-history", action="store_true",
+                    help="harvest matches we already hold, driven by player_match."
+                         " The roster-driven default can only see the 0.1%% of"
+                         " launch-era matches that have a stored roster.")
+    ap.add_argument("--limit-players", type=int,
+                    help="cap the player list; use with --dry-run")
     ap.add_argument("--merge", action="store_true",
                     help="publish season rows into the live DB (own table, not player_csr_season)")
     args = ap.parse_args()
@@ -555,6 +788,22 @@ def main() -> int:
 
     if args.aggregate:
         aggregate(out_path, db_path)
+        return 0
+
+    if args.from_history:
+        r = asyncio.run(harvest_from_history(
+            db_path, out_path, args.start, args.end, args.concurrency,
+            args.dry_run, args.limit_players))
+        print("\n" + "=" * 62)
+        print(f"  players harvested   : {r.players_done:,}")
+        print(f"  matches to request  : {r.matches_seen:,}")
+        print(f"  requests issued     : {r.requests:,}")
+        print(f"  observations stored : {r.observations:,}")
+        print(f"  recap gone (404)    : {r.unavailable:,} (permanent, not retried)")
+        print(f"  FAILED matches      : {r.failed:,} (their players left open; re-run)")
+        if args.dry_run:
+            for m in sorted(r.per_month):
+                print(f"    {m}  {r.per_month[m]:,}")
         return 0
 
     if args.merge:
